@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# generated Amazon data - never commit
+*.csv
+raw_*.json
+forecast_snapshots/
+output/
