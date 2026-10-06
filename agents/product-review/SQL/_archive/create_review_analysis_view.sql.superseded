@@ -1,0 +1,209 @@
+-- ============================================================================
+-- dbo.vw_review_analysis
+--
+-- Adds three things to dbo.sentiment_analysis_reviews that Power BI needs
+-- but the raw table doesn't have in a usable shape:
+--   resolved_sku       -- one clean SKU per review, regardless of source
+--   review_date_parsed -- review_date as a real DATE, not free text
+--   product_region     -- the SKU's catalog region, derived from its prefix
+--
+-- DELIBERATELY THIN otherwise: this view does NOT also pull in Family/
+-- Category. Power BI already has Map_Master Product Table loaded as a real
+-- dimension with its own relationships -- the plan is for Power BI to join
+-- natively to that table using resolved_sku, not to duplicate that join
+-- here in SQL too.
+--
+-- === resolved_sku ===
+-- RESOLUTION RULES:
+--   Trustpilot product reviews -> product_sku (trimmed, uppercased)
+--   Amazon product reviews     -> bridge table's product_code, falling back
+--                                 to the review's own model_number only when
+--                                 the bridge table has no answer for that
+--                                 ASIN (decision #4, "Option A")
+--   Service reviews (any source) -> NULL, always -- there's no product to resolve
+--
+-- WHY THE BRIDGE TABLE IS COLLAPSED TO ONE ROW PER ASIN FIRST:
+-- dbo.amazon_asin_sku_map has one row per (ASIN, Market) -- the same ASIN
+-- can have a different regional SKU code per market (e.g. D25100 for UK vs
+-- E25100 for DE/ES). Joining against it directly, un-collapsed, would fan
+-- out and duplicate review rows. Since region-per-REVIEWER is still out of
+-- scope (see decision #6 -- there's no reliable way to tell which market a
+-- given reviewer bought from), which specific market's code gets picked
+-- here no longer matters for resolved_sku itself: every regional variant of
+-- the same product resolves to the identical Family/Category in the master
+-- product table anyway. So this view just takes any one non-null
+-- product_code per ASIN.
+--
+-- NOT YET FULLY POPULATED FOR HISTORICAL DATA: model_number is NULL for the
+-- 2,933 reviews processed before that field was added to the loader (see
+-- decision #2/#7) -- so resolved_sku will show NULL for some existing Amazon
+-- rows until that backfill runs, even where the bridge table alone doesn't
+-- have an answer either. This isn't a bug in the view; it's a data-readiness
+-- gap that #7 closes.
+--
+-- === review_date_parsed ===
+-- review_date is free text on the raw table, in genuinely different shapes
+-- per source:
+--   Trustpilot -> clean ISO 8601 ("2024-01-24T22:26:50.628Z"), always --
+--                 verified against all 872 current rows, zero exceptions.
+--   Amazon     -> messy: two English orderings ("26 January 2025" and
+--                 "July 15, 2025"), German ("9. August 2026"), Spanish
+--                 ("9 de agosto de 2026") -- one date per language per the
+--                 marketplace it was scraped from (UK/US=English, DE=German,
+--                 ES=Spanish) -- AND ~6% of rows have Amazon's on-page
+--                 boilerplate concatenated directly onto the date with no
+--                 separator ("22 June 2021Reviewed in the United Kingdom on
+--                 22 June 2021", or the German "Bewertet in ... am ...").
+--                 The boilerplate is stripped by cutting the string at
+--                 whichever trigger phrase appears (CROSS APPLY below), then
+--                 TRY_PARSE is attempted in en-US, de-DE, es-ES in turn,
+--                 first non-null match wins. Verified against all 666
+--                 current Amazon rows this parses every single one
+--                 correctly (565 en / 87 de / 14 es), matching the known
+--                 UK+US/DE/ES marketplace split exactly.
+-- TRY_PARSE/TRY_CONVERT return NULL on anything that still doesn't match
+-- rather than erroring, so a future row in an unseen shape or language just
+-- shows a blank date -- it won't break the view.
+-- review_date (the original raw text) is kept as-is alongside the new
+-- parsed column, not replaced -- useful to fall back on if a date ever
+-- shows up blank and you want to see why.
+--
+-- === product_region ===
+-- IMPORTANT DISTINCTION FROM THE REJECTED "REVIEWER TERRITORY" IDEA:
+-- This is NOT where the reviewer is located -- that question was already
+-- investigated and correctly rejected (decision #6): review_country is
+-- unreliable, and Trustpilot has no location signal at all. product_region
+-- answers a different, product-level question instead: "which catalog
+-- edition of this SKU is this?" -- using Daylight's own documented SKU
+-- prefix convention (D=UK, E=EU, U=US, A=Australia), read directly off
+-- resolved_sku. This is a fact about the product, not a claim about the
+-- person who reviewed it, and it's meant for product-level views (e.g. "3.
+-- Sector-wise share for each SKU") -- not for filtering individual reviews
+-- by where the reviewer supposedly lives.
+-- Computed in an outer SELECT over a `base` CTE, rather than repeating the
+-- resolved_sku CASE expression a second time, since SQL Server won't let a
+-- SELECT list reference another alias defined in that same SELECT list.
+-- ============================================================================
+
+CREATE OR ALTER VIEW dbo.vw_review_analysis AS
+WITH amazon_sku_resolved AS (
+    SELECT
+        asin,
+        MAX(product_code) AS product_code   -- any non-null value; regional
+                                              -- variants are interchangeable
+                                              -- for Family/Category purposes
+    FROM dbo.amazon_asin_sku_map
+    WHERE product_code IS NOT NULL
+    GROUP BY asin
+),
+base AS (
+    SELECT
+        r.uid,
+        r.review_id,
+        r.review_type,
+        r.review_source,
+        r.rating,
+        r.product_name,
+        r.product_sku,
+        r.product_asin,
+        r.model_number,
+        r.review_country,
+        r.title,
+        r.review_text,
+        r.reviewer_name,
+        r.review_date,
+        r.verified_purchase,
+        r.sentiment,
+        r.confidence,
+        r.primary_sector AS review_sector,   -- renamed per decision #5 --
+                                              -- avoids colliding with the
+                                              -- existing SECTOR_FULL-based
+                                              -- "Sector" filter already in
+                                              -- the Power BI model
+        r.primary_aspect,
+        r.key_themes,
+        r.analysis_error,
+        r.loaded_at,
+        CASE
+            WHEN r.review_type = 'product' AND r.review_source = 'trustpilot'
+                THEN UPPER(LTRIM(RTRIM(r.product_sku)))
+            WHEN r.review_type = 'product' AND r.review_source = 'amazon'
+                THEN COALESCE(a.product_code, r.model_number)
+            ELSE NULL
+        END AS resolved_sku,
+        CASE
+            WHEN r.review_source = 'trustpilot'
+                THEN TRY_CONVERT(DATE, r.review_date, 127)   -- 127 = ISO 8601
+            WHEN r.review_source = 'amazon'
+                THEN COALESCE(
+                    TRY_PARSE(d.clean_date AS DATE USING 'en-US'),
+                    TRY_PARSE(d.clean_date AS DATE USING 'de-DE'),
+                    TRY_PARSE(d.clean_date AS DATE USING 'es-ES')
+                )
+            ELSE NULL
+        END AS review_date_parsed
+    FROM dbo.sentiment_analysis_reviews AS r
+    LEFT JOIN amazon_sku_resolved AS a
+        ON r.review_source = 'amazon' AND r.product_asin = a.asin
+    CROSS APPLY (
+        -- Strips Amazon's "Reviewed in X on <date>" / German "Bewertet in X
+        -- am <date>" boilerplate when concatenated directly onto the date
+        -- with no separator, by cutting at whichever trigger phrase is
+        -- found. No-op for rows that don't have it; safely NULL if
+        -- review_date itself is NULL.
+        SELECT LEFT(r.review_date,
+            CASE
+                WHEN CHARINDEX('Reviewed in', r.review_date) > 0
+                    THEN CHARINDEX('Reviewed in', r.review_date) - 1
+                WHEN CHARINDEX('Bewertet in', r.review_date) > 0
+                    THEN CHARINDEX('Bewertet in', r.review_date) - 1
+                ELSE LEN(ISNULL(r.review_date, ''))
+            END) AS clean_date
+    ) AS d
+)
+SELECT
+    uid, review_id, review_type, review_source, rating, product_name,
+    product_sku, product_asin, model_number, review_country, title,
+    review_text, reviewer_name, review_date, verified_purchase, sentiment,
+    confidence, review_sector, primary_aspect, key_themes, analysis_error,
+    loaded_at, resolved_sku, review_date_parsed,
+    CASE LEFT(resolved_sku, 1)
+        WHEN 'D' THEN 'UK'
+        WHEN 'E' THEN 'EU'
+        WHEN 'U' THEN 'US'
+        WHEN 'A' THEN 'Australia'
+        ELSE NULL   -- e.g. the PB0006 bundle SKU, or any unresolved SKU --
+                    -- an honest blank rather than a guessed region
+    END AS product_region
+FROM base;
+GO
+
+-- ============================================================================
+-- Verification query -- run this after creating/updating the view above.
+-- Expect: Trustpilot close to 100% resolved (871/872, per the one known
+-- bundle-SKU exception); Amazon SKU resolution depends on whether #7's
+-- backfill has run yet. Dates should resolve near-100% on both sides.
+-- product_region will trail sku_resolved slightly, by exactly the bundle-SKU
+-- exception -- it has a resolved_sku but no recognised region prefix.
+-- ============================================================================
+SELECT
+    review_source,
+    COUNT(*)                                      AS total_product_reviews,
+    COUNT(resolved_sku)                           AS sku_resolved,
+    COUNT(*) - COUNT(resolved_sku)                AS sku_unresolved,
+    COUNT(review_date_parsed)                     AS date_resolved,
+    COUNT(*) - COUNT(review_date_parsed)          AS date_unresolved,
+    COUNT(product_region)                         AS region_resolved,
+    COUNT(resolved_sku) - COUNT(product_region)    AS region_unresolved
+FROM dbo.vw_review_analysis
+WHERE review_type = 'product'
+GROUP BY review_source;
+
+-- Sanity check: which resolved_sku values did NOT map to a region, and how
+-- many rows each affects -- should be a very short list (the known PB0006
+-- bundle SKU, plus anything genuinely unexpected worth a second look).
+SELECT resolved_sku, COUNT(*) AS review_count
+FROM dbo.vw_review_analysis
+WHERE resolved_sku IS NOT NULL AND product_region IS NULL
+GROUP BY resolved_sku
+ORDER BY review_count DESC;

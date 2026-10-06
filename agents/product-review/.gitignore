@@ -1,0 +1,22 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# MSAL token cache -- holds SharePoint sign-in tokens, as sensitive as .env
+.sp_token_cache.json
+
+# Generated output — regenerable by running the pipeline; the checkpoint in
+# particular can carry review text and shouldn't sit in git history.
+Trustpilot_Result/*.json
+Trustpilot_Result/*.jsonl
+*.log
+multi_source_sentiment_per_review.json
+multi_source_sentiment_analysis.json
+
+# Raw review exports — same review-text concern as above.
+Reviews/
+
+# SSH private keys — never belongs in git history.
+*.pem
