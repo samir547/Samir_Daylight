@@ -1,397 +1,333 @@
-# Daylight Demand Planning — Prophet Forecast
+# Demand Planning Agent — Monthly Item Forecast
 
-A demand-planning forecasting system for **The Daylight Company** (UK lighting
-manufacturer — lamps, magnifiers, therapy lights). It trains a
-[Facebook Prophet](https://facebook.github.io/prophet/) model for each
-**Item × BDM** (Business Development Manager) combination on historical sales,
-predicts monthly demand for a held-out validation window and a forward forecast
-window, and then **benchmarks the model against the BDMs' own manual forecasts**
-(and a naive baseline) to answer one question: *does the AI beat human judgment?*
+Forecasts monthly unit demand for **The Daylight Company** (UK lighting
+manufacturer: lamps, magnifiers, therapy lights) at **item-code** grain, six
+months ahead, and writes the result to Azure SQL for Power BI.
 
-| | |
-|---|---|
-| **Active products** | ~250 |
-| **Forecastable series** (Item × BDM with ≥ 24 months history) | ~310 |
-| **History available** | 101 months (Jan 2018 – May 2026) |
-| **Models** | Facebook Prophet (Phase 1).|
-| **Output** | CSVs (predictions, accuracy, benchmark) + optional plots + optional write-back to Azure SQL |
+It is a hybrid forecaster: each item is classified by its demand pattern and
+routed to the model that suits it (Facebook Prophet, or one of two trailing
+averages). Items with too little history or no usable signal get **no forecast**
+by design, and the reason is recorded.
+
+> **Read this first if you are taking the project over:**
+> [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) explains the design, why each model was
+> chosen, what is good and bad about the data, and the **open issues**.
+> This README covers setup, running, operating and the outputs.
 
 ---
 
-## Table of Contents
+## At a glance
 
-1. [Prerequisites](#1-prerequisites)
-2. [Setup — Virtual Environment](#2-setup--virtual-environment)
-3. [Install Dependencies](#3-install-dependencies)
-4. [Configuration](#4-configuration)
-5. [Running the Script](#5-running-the-script)
-6. [Output Files](#6-output-files)
-7. [Understanding the Results](#7-understanding-the-results)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Architecture Reference](#9-architecture-reference)
-10. [Data Pipeline](#10-data-pipeline)
-11. [Project Structure](#11-project-structure)
-12. [.gitignore](#12-gitignore)
+| | |
+|---|---|
+| **Scope** | Non-Amazon sales (direct / wholesale / distributor channels). **Amazon is excluded** — see [Scope and caveats](#scope-and-caveats). |
+| **Grain / horizon** | One forecast per `item_code` per month, 6 months ahead (BDM is *not* a modelling dimension) |
+| **History used** | Jan 2018 onward, monthly |
+| **Models** | Prophet (Smooth / Erratic demand with ≥ 24 months history) · Naive-3mo and Naive-12mo trailing averages (Lumpy / Intermittent demand) · *Blocked* (no forecast) |
+| **Latest run** (anchor month 2026-09) | 202 items forecast (Prophet 154 · Naive-3mo 23 · Naive-12mo 25); 64 of 266 routed items blocked (24%) |
+| **Source of truth** | `dbo.forecast_training_data` (rebuilt from `dbo.INVOICES_TEMP` by this repo) |
+| **Destination** | `dbo.forecast_output`, `dbo.forecast_accuracy`, view `dbo.vw_forecast_output_latest` → Power BI |
+| **Runs** | Monthly, unattended, via `run_forecast_cycle.sh` (Linux VM + cron) |
+| **Stack** | Python 3.10+, Prophet, pandas, SQLAlchemy + pyodbc, Azure SQL |
+
+### Accuracy in one paragraph
+
+Scored on a held-out six-month window against a "same month last year" baseline
+(like-for-like, 895 item-months): Prophet WAPE **50.9%** vs **62.2%** baseline
+(n = 799); Naive-12mo 57.3% vs 59.9%; Naive-3mo 76.5% vs 106.3% (n = 28, low
+confidence). The forecast leans about **10% low** overall, as does the baseline.
+WAPE is the metric to use — MAPE explodes on low-volume items. Full results and
+caveats: [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md#7-evaluation).
+
+### Scope and caveats
+
+- **Amazon sales are excluded.** Rows in `INVOICES_TEMP` for Amazon are *sell-in*
+  (bulk replenishment orders to Amazon's warehouses), not consumer demand, and
+  they corrupt seasonality learning. The correct Amazon demand signal is Vendor
+  Central sell-out, handled by a separate workstream (`agents/amazon-*`). The
+  Power BI series from this agent should be labelled **"excl. Amazon"**.
+- **The BDM benchmark is currently not like-for-like.** The BDM manual forecast
+  sheet includes Amazon volume (≈ 24% of the Apr–Sep 2026 BDM plan); this
+  pipeline's actuals and forecasts do not. Do not read the BDM win-rates in
+  `benchmark_comparison.csv` as a verdict. The prior-year comparison *is*
+  like-for-like. See [open issues](HOW_IT_WORKS.md#9-open-issues-and-challenges).
+- **~24% of routed items get no forecast** (retired, too little history, too few
+  sales events, or demand that has moved to Amazon). They are listed with the
+  reason, not silently dropped.
+
+---
+
+## Documentation map
+
+| Document | Audience | Contents |
+|---|---|---|
+| `README.md` (this file) | Operators, new developers | Setup, running, monthly operation, configuration, outputs, troubleshooting |
+| [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) | Engineers, analysts, reviewers | Pipeline step by step, model-selection rationale and evidence, data quality, evaluation, **open issues** |
+| `database/` | DBAs | Table build SQL, schema, output view, diagnostics |
+| Module docstrings | Developers | Every `preprocessing/`, `models/` and `analysis/` file documents its own reasoning and limits at the top — read them before changing behaviour |
 
 ---
 
 ## 1. Prerequisites
 
-- **Python 3.10 or higher**
-- **ODBC Driver 17 for SQL Server** (required by `pyodbc`). Driver 18 also works
-  — just match the version in your `.env`.
-  - **Windows:** Download and install from Microsoft —
-    <https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server>
-  - **macOS:**
-    ```bash
-    brew install microsoft/mssql-release/msodbcsql17
-    ```
-  - **Linux (Ubuntu/Debian):**
-    ```bash
-    curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-    curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
-    sudo apt-get update
-    sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17 unixodbc-dev
-    ```
-- **Access to Azure SQL Server** `DAYHANSA_SQL1` with read permissions (and write
-  permissions only if you intend to use `--write-db`).
+- **Python 3.10+**
+- **ODBC Driver 18 for SQL Server** (Driver 17 also works — set `DB_DRIVER`).
+  - Ubuntu/Debian: `sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev`
+    (after adding Microsoft's package repository — see
+    <https://learn.microsoft.com/en-us/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server>)
+  - Windows: <https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server>
+  - macOS: `brew install microsoft/mssql-release/msodbcsql18`
+- **Azure SQL access** to `DAYHANSA_SQL1` on `daylight-powerbi-db-1.database.windows.net`.
+  Read access for forecasting; **write/DDL access** for `--write-db` and for the
+  training-table rebuild. The machine's outbound IP must be allow-listed on the
+  Azure SQL firewall.
+- A C++ toolchain if `pip install prophet` has to compile (Windows: Microsoft C++
+  Build Tools; macOS: `brew install gcc`; or `conda install -c conda-forge prophet`).
 
----
+## 2. Setup
 
-## 2. Setup — Virtual Environment
-
-Clone the repo, `cd` into the `prophet_forecast/` folder, then create and
-activate a virtual environment.
-
-**Windows (PowerShell):**
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-> If activation is blocked, run once:
-> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
-
-**Windows (Command Prompt):**
-```bat
-python -m venv venv
-venv\Scripts\activate.bat
-```
-
-**macOS / Linux:**
 ```bash
+cd agents/demand-planning
 python3 -m venv venv
-source venv/bin/activate
-```
-
-**Verify it's active:** your shell prompt should now be prefixed with `(venv)`.
-You can also confirm with `python -c "import sys; print(sys.prefix)"` — the path
-should point inside the `venv` folder.
-
-**Deactivate when done:**
-```bash
-deactivate
-```
-
----
-
-## 3. Install Dependencies
-
-With the virtual environment active:
-
-```bash
+source venv/bin/activate            # Windows PowerShell: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+cp .env.example .env                # Windows: copy .env.example .env
+# edit .env — see "Configuration" below
 ```
 
-### Notes on installing Prophet
+> **Git Bash on Windows:** the activation script must be *sourced*:
+> `source venv/Scripts/activate`.
 
-Prophet compiles a Stan model and needs a C++ toolchain. `cmdstanpy` is pulled in
-automatically as a Prophet dependency.
+## 3. Configuration
 
-- **Windows:** If `pip install prophet` fails, install the
-  [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-  (select the "Desktop development with C++" workload), then retry. As a
-  fallback you can install the older Stan backend first:
-  ```bash
-  pip install pystan==2.19.1.1
-  pip install prophet
-  ```
-- **macOS:** You may need a compiler first:
-  ```bash
-  brew install gcc
-  pip install prophet
-  ```
-- **Conda alternative (any OS):** the most reliable route if pip keeps failing:
-  ```bash
-  conda install -c conda-forge prophet
-  ```
+### 3a. Credentials — environment only
 
----
+Credentials come from `.env` (git-ignored) or the process environment. **There
+are no defaults for `DB_NAME`, `DB_USER` or `DB_PASSWORD`**: a missing value
+fails fast with a clear error rather than connecting with a baked-in login.
+Offline runs (`--cached`) never touch the database.
 
-## 4. Configuration
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `DB_SERVER` | no | `daylight-powerbi-db-1.database.windows.net` | |
+| `DB_NAME` | **yes** | — | `DAYHANSA_SQL1` |
+| `DB_USER` | **yes** | — | |
+| `DB_PASSWORD` | **yes** | — | Never commit. Rotate if ever exposed. |
+| `DB_DRIVER` | no | `ODBC Driver 18 for SQL Server` | |
+| `DB_PORT` | no | `1433` | |
+| `FORECAST_OUTPUT_DIR` | no | `./output` | Where CSVs are written. The cron script sets a per-run folder. |
 
-### 4a. Database credentials (`.env` file)
+### 3b. `config.py` — the settings that matter
 
-Copy the template and fill in your credentials:
-
-**Windows:**
-```bat
-copy .env.example .env
-```
-**macOS / Linux:**
-```bash
-cp .env.example .env
-```
-
-`.env.example` template:
-```env
-DB_SERVER=daylight-powerbi-db-1.database.windows.net
-DB_NAME=DAYHANSA_SQL1
-DB_USER=your_username_here
-DB_PASSWORD=your_password_here
-DB_DRIVER=ODBC Driver 17 for SQL Server
-DB_PORT=1433
-```
-
-> ⚠️ **`.env` is git-ignored and must never be committed.** It holds live
-> database credentials. Only `.env.example` (with placeholders) is tracked.
-
-### 4b. `config.py` settings
-
-All tunable parameters live in `config.py`. The defaults are correct for the
-current POC — change them only deliberately.
-
-**Date windows** (`YYYY-MM` strings)
-
-| Setting | Default | Meaning |
+| Setting | Value | Meaning |
 |---|---|---|
-| `TRAIN_START` / `TRAIN_END` | `2018-01` → `2025-10` | Training period |
-| `TEST_START` / `TEST_END` | `2025-11` → `2026-04` | Held-out validation (model never sees this during fit) |
-| `FORECAST_START` / `FORECAST_END` | `2026-05` → `2026-10` | Forward forecast delivered to BDMs |
+| `TEST_END` | hand-set fallback anchor | The *fallback* window for runs **without** `--auto-window`. All other window constants are offsets from it. `--auto-window` overrides it in memory from the data. |
+| `TRAIN_END` / `TEST_START` / `FORECAST_START` / `FORECAST_END` | `TEST_END` −6 / −5 / +1 / +6 | Derived — never edit directly |
+| `TRAIN_START` | `2018-01` | |
+| `GROUP_COLS` | `["item_code"]` | Modelling grain |
+| `MIN_TRAIN_MONTHS` | `24` | Calendar months of history Prophet needs (two yearly cycles) |
+| `CROSTON_MIN_OCCURRENCES` | `10` | Minimum sales months for the naive routes. **Provisional / unvalidated** — see open issues |
+| `ACTIVE_SINCE` | hand-bumped (`2025-06` at last edit) | Active = on the BDM sheet **and** traded at/after this month. **Bump by hand monthly** (keep ≈ 14 months before `TEST_END`) or long-dead items stay in scope |
+| `PROPHET_PARAMS` | `yearly_seasonality=3`, multiplicative, `changepoint_prior_scale=0.05`, `seasonality_prior_scale=10`, `interval_width=0.95` | Each deviation from Prophet defaults is justified with evidence in the file's comments |
+| `CHANGEPOINT_PRIOR_KNOWN_CHANGEOVER` | `0.25` | Looser trend prior for pooled families with a confirmed changeover date |
+| `SB_ADI_THRESHOLD` / `SB_CV2_THRESHOLD` | `1.32` / `0.49` | Standard Syntetos-Boylan cut-offs |
+| `NAIVE_WINDOW_MONTHS` / `NAIVE_BAND_RATIOS` | 3 and 12 / empirical p10–p90 ratios | Naive routes |
+| `AMAZON_CHANNELS` | `["Amazon"]` | Channel values excluded from training |
+| `CHANNEL_MISMATCH_*` | ≥ 90% Amazon share, < 60 non-Amazon units/yr, ≥ 300 total units/yr | Items whose demand has migrated to Amazon get no forecast |
+| `BENCHMARK_START` / `BENCHMARK_END` | static default; rolled by `--auto-window` | Window over which the BDM comparison is scored |
 
-**Forecasting grain** — `GROUP_COLS` defines what counts as one time series:
+## 4. Running
 
-| Value | Effect |
-|---|---|
-| `["item_code", "bdm_name"]` | **Default / recommended** — one model per product × BDM. Required for the BDM benchmark. |
-| `["item_code"]` | One model per product (all BDMs combined). Rolls up demand but **disables the BDM benchmark**, which joins on Item × BDM. |
-| `[]` | Single total-demand model — testing only; not supported by the benchmark or plotting steps. |
+### 4a. Monthly production cycle (what cron calls)
 
-**Prophet parameters** (`PROPHET_PARAMS`)
+```bash
+./run_forecast_cycle.sh
+```
 
-| Parameter | Default | Why |
+It does exactly two things, in order, and stops on the first failure:
+
+1. `python database/build_training_data.py` — drops and rebuilds
+   `dbo.forecast_training_data` from `dbo.INVOICES_TEMP`.
+2. `python main.py --auto-window --require-roll --write-db` — rolls the
+   train/test/forecast windows onto the latest *complete* month, fits and routes
+   every item, and appends the result to Azure SQL.
+
+Each run keeps its CSVs in `output/runs/<timestamp>/` and its console log in
+`logs/cycle_<date>.log`.
+
+| Exit code | Meaning | Action |
 |---|---|---|
-| `seasonality_mode` | `multiplicative` | Seasonal swings scale with volume |
-| `changepoint_prior_scale` | `0.05` | Conservative trend flexibility |
-| `yearly_seasonality` | `True` | Strong annual patterns in the data |
-| `weekly_seasonality` / `daily_seasonality` | `False` | Data is monthly — not applicable |
-| `interval_width` | `0.95` | 95% confidence bands (`yhat_lower` / `yhat_upper`) |
+| `0` | Cycle complete | — |
+| `1` | A step failed (DB error, exception) | Read the log; nothing partial is written (the DB write is one transaction) |
+| `2` | Bad flag combination | `--write-db` is refused together with `--item`, `--cached` or `--pilot` so a partial run can never be published |
+| `3` | No newer complete month than `config.TEST_END` | Normal if the source table has not been refreshed yet; nothing forecast, nothing written |
 
-See the [Prophet docs](https://facebook.github.io/prophet/docs/quick_start.html)
-for deeper tuning guidance.
+Example crontab (06:30 on the 5th, after the upstream invoice refresh finishes —
+that refresh is **not** owned by this repo):
 
-**Scope**
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `MIN_TRAIN_MONTHS` | `24` | Minimum months of history per series (two full yearly cycles, the minimum to detect yearly seasonality). Series below this are skipped. |
-| `ACTIVE_SINCE` | `2025-06` | A product is "active" if it's on the BDM sheet **and** has training activity at/after this month. |
-| `PILOT_RATING` | `A` | Rating the `--pilot` flag restricts to. |
-| `BENCHMARK_START` / `BENCHMARK_END` | `2026-01` → `2026-04` | Overlap between the test window and the BDM forecast year, where Prophet and BDM are compared. |
-
----
-
-## 5. Running the Script
-
-Run from the `prophet_forecast/` folder with the virtual environment active.
-
-**Basic run** — load from DB, train all ~310 series:
-```bash
-python main.py
+```cron
+MAILTO=you@example.com
+30 6 5 * *  /opt/demand-planning/run_forecast_cycle.sh
 ```
 
-**Pilot run** — A-rated products only (~50–80 series). **Recommended for your first run:**
-```bash
-python main.py --pilot
-```
+**Monthly checklist (manual steps that remain):**
 
-**Cached run** — skip the DB query and reuse previously downloaded data in `output/`:
-```bash
-python main.py --cached
-```
+1. Confirm `INVOICES_TEMP` has been refreshed for the closed month.
+2. Bump `ACTIVE_SINCE` in `config.py` (≈ 14 months before the new anchor).
+3. After the run: check the exit code, then run
+   `database/diagnostics/forecast_output_checks.sql` in SSMS.
+4. Optionally bump `TEST_END` to the new anchor so manual runs default to it.
 
-**With component plots** — save trend/seasonality charts per series:
-```bash
-python main.py --plots
-```
+### 4b. Ad-hoc / development runs
 
-**Write results back to Azure SQL** (creates `dbo.forecast_output` /
-`dbo.forecast_accuracy` if they don't exist, then appends):
 ```bash
-python main.py --write-db
+python main.py                          # fallback window from config.py, loads from the DB
+python main.py --auto-window            # roll the window to the latest complete month
+python main.py --cached                 # reuse CSVs in output/ (no DB access)
+python main.py --pilot                  # A-rated items only (fast validation)
+python main.py --plots                  # also save Prophet component plots
+python main.py --cached --item A25090 --plots   # one item, fast debugging (repeatable)
+python main.py --auto-window --write-db # publish (normally done by the cron script)
+python -m analysis.window_proposal      # show the window --auto-window would choose
 ```
-
-**Combine flags:**
-```bash
-python main.py --pilot --plots          # Pilot with plots
-python main.py --cached --plots         # Cached data with plots
-python main.py --cached --write-db      # Cached data, write to DB
-```
-
-### CLI flags reference
 
 | Flag | Effect |
 |---|---|
-| `--pilot` | Restrict scope to A-rated items only |
-| `--cached` | Load from cached CSVs in `output/` instead of the database |
-| `--plots` | Save Prophet component plots to `output/plots/` |
-| `--write-db` | Append results to `dbo.forecast_output` / `dbo.forecast_accuracy` |
+| `--auto-window` | Derive TRAIN/TEST/FORECAST (and benchmark window) from the newest complete month |
+| `--require-roll` | With `--auto-window`: exit 3 instead of re-forecasting if the window did not move |
+| `--write-db` | Append to `dbo.forecast_output` / `dbo.forecast_accuracy` (one transaction, schema-checked first) |
+| `--cached` | Skip the database; use cached CSVs |
+| `--pilot` | A-rated items only |
+| `--item CODE` | Fit only these items (repeatable) |
+| `--plots` | Save component plots to `output/plots/` |
 
-### Expected runtime
+### 4c. First DB publish / schema changes
 
-| Run | Approx. time |
+`--write-db` creates the output tables if missing, then checks that existing
+tables have exactly the expected columns. If an older version of
+`dbo.forecast_output` or `dbo.forecast_accuracy` exists with different columns,
+the check fails with the offending column names — **drop the old tables once**
+and rerun (they are recreated). Application code never auto-runs DDL for views:
+apply `database/views/vw_forecast_output_latest.sql` yourself.
+
+## 5. Outputs
+
+### 5a. Files (per run folder)
+
+| File | Contents |
 |---|---|
-| Pilot (~50–80 series) | 1–2 minutes |
-| Full run (~310 series) | 3–5 minutes |
-| Add `--plots` | +2–3 minutes |
+| `forecast_<start>_<end>.csv` | The forward forecast: `ds, yhat, yhat_lower, yhat_upper, item_code, model, family_key, split_method, split_ratio, ratio_basis, family`. File name derives from the window, so it cannot go stale. |
+| `test_validation.csv` | Same shape plus `actual` for the held-out test window |
+| `model_metrics.csv` | Per-item MAE / RMSE / MAPE / WAPE / bias, `n_train_months`, `n_test_months`, `changepoint_segment`. **Prophet items only** |
+| `benchmark_comparison.csv` | Model vs BDM vs prior-year per item-month, with `winner`. *BDM side includes Amazon — see caveats* |
+| `model_routing.csv` | Every item's demand category, route and block reason. **Not written by `main.py`** — produce it with `python -m analysis.model_routing_report` |
+| `successor_split_ratios.csv` | How pooled family forecasts were split back to item codes (test ratio and forward ratio) |
+| `excluded_channel_mismatch.csv` | Items dropped because their demand moved to Amazon, with the figures |
+| `excluded_amazon_rows.csv` | Amazon rows removed from training (audit) |
+| `region_ambiguity_log.csv` | (item, BDM) pairs that mapped to several regions and were collapsed (written by `database/build_training_data.py`) |
+| `unmatched_family_log.csv` | In-scope items with no Product Family |
+| `raw_data.csv`, `bdm_forecasts.csv`, `active_products.csv`, `master_product.csv`, `successor_map.csv` | Cached inputs used by `--cached` |
 
-> The first DB run downloads and caches the raw data to `output/raw_data.csv`
-> (plus `bdm_forecasts.csv` and `active_products.csv`). Subsequent `--cached`
-> runs skip the database entirely.
+### 5b. Database objects
 
----
-
-## 6. Output Files
-
-All written to `output/` (git-ignored).
-
-| File | What it is |
+| Object | Notes |
 |---|---|
-| **`raw_data.csv`** | Cached copy of the training data pulled from the DB. Used by `--cached`. (Also caches `bdm_forecasts.csv` and `active_products.csv`.) |
-| **`test_validation.csv`** | Prophet predictions vs actuals for the test window (Nov 2025 – Apr 2026). Columns: `ds, actual, yhat, yhat_lower, yhat_upper, item_code, bdm_name`. |
-| **`forecast_may_oct_2026.csv`** | Forward 6-month predictions (May – Oct 2026). Columns: `ds, yhat, yhat_lower, yhat_upper, item_code, bdm_name`. |
-| **`model_metrics.csv`** | Per-series accuracy summary. Columns: `item_code, bdm_name, n_train_months, n_test_months, mae, rmse, mape_pct, wape_pct, bias_pct`. |
-| **`benchmark_comparison.csv`** | Prophet vs BDM vs Naive for Jan – Apr 2026. Columns: `item_code, bdm_name, bdm_code, region, rating, month, actual, prophet_forecast, bdm_forecast, naive_forecast, prophet_mape, bdm_mape, naive_mape, winner`. |
-| **`plots/`** | Prophet component plots (trend + seasonality decomposition) per series — only written with `--plots`. |
+| `dbo.INVOICES_TEMP` | Source invoice lines. **`Date` is a string** (parsed in the build) |
+| `dbo.forecast_training_data` | Item × BDM × Region × Month, rebuilt by `build_training_data.py` (DROP + SELECT INTO) |
+| `dbo.BDM` | Manual BDM forecasts (wide Jan–Dec → one row per month); also the active-product list and region authority |
+| `dbo.CUSTOMERS`, `dbo.Territory` | BDM attribution and channel |
+| `dbo.product_successor_map`, `dbo.product_successor_review` | Retired → successor code pairings and confirmed changeover dates |
+| `dbo.[MASTER RODUCT TABLE]` | Product Family (**the table name has a typo in the live database; code uses it as is**) |
+| `dbo.forecast_output` | **Append-only**; columns `item_code, family, year_month, yhat, yhat_lower, yhat_upper, model, run_kind, run_date` |
+| `dbo.forecast_accuracy` | **Append-only**; `item_code, family, model, mae, rmse, mape_pct, n_train_months, n_test_months, run_date` |
+| `dbo.vw_forecast_output_latest` | Rows of the newest `run_date` for the three delivered models. **This is what Power BI reads** ("Forecast Qty (Prophet)", Global – Demand Planning page) |
 
----
+Because `forecast_output` is append-only and the view takes `MAX(run_date)`, **a
+bad batch becomes "the current forecast" immediately.** To roll back, delete
+that `run_date`'s rows from `forecast_output` and `forecast_accuracy`.
 
-## 7. Understanding the Results
+## 6. Reading the results
 
-**Key metrics**
+- **WAPE** — `Σ|actual − forecast| / Σ actual`. Volume-weighted; use this.
+- **MAPE** — mean percentage error; unreliable for small or intermittent
+  quantities (an error against an actual of 2 can be thousands of percent).
+  Quote the median, never the mean.
+- **Bias** — `Σ(forecast − actual) / Σ actual`. Negative = under-forecasting.
+- **`model`** column — which forecaster produced the row. Naive-3mo rows are
+  low-confidence (small sample, strong under-forecast bias in testing).
+- **`yhat_lower` / `yhat_upper`** — 95% interval for Prophet. For the naive
+  routes it is a fixed empirical band (p10/p90 ratios), *not* a model-derived
+  prediction interval.
+- **`n_test_months`** — a MAPE built from 1–3 months is weak evidence.
+- **`ratio_basis`** — `forward` for pooled-family items split back to item codes
+  using the freshest sales mix; `na` otherwise.
 
-- **MAPE** (Mean Absolute Percentage Error) — `|actual − forecast| / actual`,
-  averaged across the test months. **Lower is better.** Rough guide:
-  - `< 20%` — good for A-rated products
-  - `< 30%` — acceptable for B/C-rated products
-  - Rows where the actual is zero are excluded (MAPE is undefined there).
-- **WAPE** (Weighted APE) — `Σ|actual − forecast| / Σ actual`. More robust than
-  MAPE when some months have small or zero actuals.
-- **Bias** — `Σ(forecast − actual) / Σ actual`. Positive = the model
-  systematically **over**-forecasts; negative = **under**-forecasts.
+## 7. Repository layout
 
-**`winner` column** (in `benchmark_comparison.csv`) — for each series-month, the
-method with the lowest MAPE among the three. `prophet` means the model beat the
-BDM's manual forecast (and the naive baseline) for that series-month. The console
-summary aggregates this into win-rates overall and by rating, region, and BDM.
+```
+agents/demand-planning/
+├── main.py                       # entry point / orchestration
+├── config.py                     # all tunables, each with its justification
+├── run_forecast_cycle.sh         # the monthly cron entry point
+├── requirements.txt, .env.example, .gitignore, .gitattributes
+├── data/
+│   ├── queries.py                # SQL as named constants
+│   └── loader.py                 # connection, loading, schema-checked transactional write
+├── preprocessing/
+│   ├── prepare.py                # aggregation to item × month
+│   ├── scope.py                  # active / forecastable / Amazon / channel-mismatch filters
+│   ├── family_pool.py            # successor-family pooling and split-back
+│   ├── family.py                 # Product Family reporting tag (unrelated to successor families)
+│   ├── demand_classification.py  # Syntetos-Boylan classification
+│   ├── model_routing.py          # the routing ladder (Prophet / Naive / Blocked)
+│   └── feature_extraction.py
+├── models/
+│   ├── prophet_model.py          # per-series Prophet fit and prediction
+│   └── naive_model.py            # trailing-average routes
+├── evaluation/
+│   ├── metrics.py                # MAE / RMSE / MAPE / WAPE / bias
+│   ├── benchmark.py              # model vs BDM vs prior-year
+│   └── plots.py
+├── analysis/                     # window selection, completeness, diagnostics, experiments
+├── database/
+│   ├── forecast_training_data.sql, build_training_data.py
+│   ├── schema.sql, views/, diagnostics/, migrations/, seed/, tables/
+└── HOW_IT_WORKS.md
+```
 
-**`yhat_lower` / `yhat_upper`** — the 95% confidence interval. If actuals
-generally fall inside this band, the model's uncertainty is well-calibrated; if
-actuals routinely fall outside it, the model is over-confident.
-
----
+`analysis/` scripts are read-only diagnostics and experiments (they change no
+config and write no database rows). `month_completeness.py` and
+`window_proposal.py` are the exceptions in that **production calls them**.
+Several experiment scripts read cached CSVs from `output/` and document their
+conclusions in their own docstrings. There is no automated unit-test suite for
+this agent; correctness has been established by the experiments, run-to-run
+reconciliation checks and manual review (see open issues).
 
 ## 8. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| **`ODBC Driver 17 for SQL Server not found`** | Install the driver (see [Prerequisites](#1-prerequisites)). If you installed Driver **18**, set `DB_DRIVER=ODBC Driver 18 for SQL Server` in `.env`. |
-| **Prophet installation fails on Windows** | Install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) ("Desktop development with C++"), or use `conda install -c conda-forge prophet`. |
-| **`DB_NAME is not set`** | You haven't created `.env`. Copy `.env.example` → `.env` and fill in the credentials. |
-| **`Login failed for user`** | Wrong credentials in `.env`, or the Azure SQL firewall is blocking your IP. Add your IP under the server's *Networking* settings. |
-| **`No models were fitted`** | Check `MIN_TRAIN_MONTHS` (should be `24`) and that `GROUP_COLS` includes `item_code`. With `--pilot`, confirm A-rated items actually have ≥ 24 months of history. |
-| **Memory issues on large runs** | Run `--pilot` first, or narrow the date window / scope in `config.py`. |
-| **Prophet convergence warnings** | Usually harmless — the model still produces valid predictions. They are suppressed by default. |
+| `DB_NAME / DB_USER / DB_PASSWORD is not set` | `.env` missing or incomplete; copy `.env.example` |
+| `Can't open lib 'ODBC Driver 18…'` | Install the driver, or set `DB_DRIVER` to the version you have |
+| `Login failed` / connection timeout | Wrong credentials, or this machine's IP is not on the Azure SQL firewall |
+| `ModuleNotFoundError: sqlalchemy` | Wrong Python — activate the venv first (`source venv/bin/activate`) |
+| Exit code 3 | No new complete month. Check that `INVOICES_TEMP` was refreshed and that the build step ran |
+| Exit code 2 | `--write-db` used with `--item/--cached/--pilot`, or `--require-roll` without `--auto-window` |
+| Schema check fails on `forecast_output` | Old table layout — drop it once (see 4c) |
+| `model_metrics.csv not found` warning from model routing | Diagnostic only. Occurs because each cycle writes to a fresh run folder; it only affects the "currently fitted" cross-check column |
+| Prophet install fails | Install a C++ toolchain, or use conda-forge |
+| Convergence warnings | Usually harmless; suppressed by default |
+| A forecast looks near zero for an item that is clearly selling | Run `python -m analysis.model_routing_report` and check `successor_split_ratios.csv`: it is usually a pooled successor family whose split gave the item ~0 share (see open issues) |
 
----
+## 9. Security and handover checklist
 
-## 9. Architecture Reference
-
-For the full system design — data model, training-data SQL, BDM allocation
-approach, and the Phase 2 roadmap (Azure AutoML, Amazon integration, business-event
-adjustments) — see:
-
-**`daylight-demand-planning-agent-architecture-v4.html`**
-
----
-
-## 10. Data Pipeline
-
-The Python script does **not** rebuild series from raw invoices on every run. It
-reads from a pre-built, validated staging table.
-
-```
-INVOICES_TEMP (329,810 invoice rows, Jan 2018 – May 2026)
-        │  enriched with:
-        │    • CUSTOMERS  → BDM attribution (~95% coverage)
-        │    • Territory  → BDM codes
-        │    • BDM        → authoritative region
-        ▼
-dbo.forecast_training_data  (49,269 rows; grain: Item × BDM × Region × Month)
-        │  refreshed every 2 months in production (DROP + recreate)
-        ▼
-main.py  →  reads forecast_training_data + BDM forecasts + active-product list
-```
-
-- **Source of truth for training:** `dbo.forecast_training_data` (clean,
-  pre-aggregated). The script reads this directly — **not** raw `INVOICES_TEMP`.
-- **BDM benchmark forecasts:** `dbo.BDM` (manual monthly forecasts for 2026,
-  unpivoted from wide Jan–Dec columns to one row per month).
-- **Active-product allow-list:** items on the BDM sheet that still have recent
-  trading activity (`year_month >= 2025-06`).
-
----
-
-## 11. Project Structure
-
-```
-prophet_forecast/
-├── .env                          # DB credentials (NOT committed)
-├── .env.example                  # Template for .env
-├── requirements.txt              # Python dependencies
-├── config.py                     # Configuration (dates, params, scope)
-├── main.py                       # Entry point / orchestration
-├── data/
-│   ├── queries.py                # SQL queries as named constants
-│   └── loader.py                 # DB connection, loading, validation, write-back
-├── preprocessing/
-│   ├── scope.py                  # POC scope filtering (active / forecastable / pilot)
-│   └── prepare.py                # Date conversion, aggregation, metadata map
-├── models/
-│   └── prophet_model.py          # Prophet training + prediction (per series)
-├── evaluation/
-│   ├── metrics.py                # MAPE, WAPE, Bias, MAE, RMSE
-│   ├── benchmark.py              # Prophet vs BDM vs Naive comparison
-│   └── plots.py                  # Component plots (reuses fitted models)
-└── output/                       # Generated outputs (git-ignored)
-    ├── raw_data.csv
-    ├── test_validation.csv
-    ├── forecast_may_oct_2026.csv
-    ├── model_metrics.csv
-    ├── benchmark_comparison.csv
-    └── plots/
-```
-
----
-
-## 12. .gitignore
-
-The following must stay out of version control:
-
-```gitignore
-.env
-output/
-venv/
-__pycache__/
-*.pyc
-.DS_Store
-```
+- Credentials are environment-only; `.env` is git-ignored. **Rotate the database
+  password before go-live** if it has ever been in a repository, ticket or chat.
+- Use a dedicated SQL login with only the rights needed (read on source tables;
+  create/insert on the two output tables; drop/create on `forecast_training_data`).
+- The VM's outbound IP must be allow-listed on the Azure SQL firewall.
+- Confirm who owns the upstream `INVOICES_TEMP` refresh — this agent depends on
+  it and cannot trigger it.
+- Review [open issues](HOW_IT_WORKS.md#9-open-issues-and-challenges) before
+  presenting numbers to stakeholders.

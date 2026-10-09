@@ -1,470 +1,506 @@
-# How the Forecasting System Works
+# How the Demand Planning Agent Works
 
-A plain-English walkthrough of what happens when `main.py` runs, kept in sync
-with the code on `feature/tuning-prophet-settings`. Numbers below are from the
-last real run (`output/`, ~1 week old at time of writing) — not simulated.
+Design, rationale, data and open issues for the monthly item-level forecast.
+Written so that a team that has never seen this project can operate it, defend
+its numbers, and know where it is weak. Operating instructions are in
+[`README.md`](README.md).
 
----
+Figures labelled **"latest run"** come from the run anchored on **2026-09** (train
+to 2026-03, test 2026-04 → 2026-09, forecast 2026-10 → 2027-03). They will
+change every month; re-derive rather than trusting them
+(`python -m analysis.window_proposal`, and the run's CSVs).
 
-## The Big Picture
+**Contents**
 
-The system looks at **~8 years of past sales** (Jan 2018 onward) to learn how
-each **product** sells — when it peaks, when it dips, whether it's growing or
-declining. It then predicts the next 6 months for each product.
-
-**This is different from the original design in one important way: BDM is no
-longer part of the forecasting grain.** Each product gets ONE model, fitted on
-its demand summed across every BDM who sells it. BDM survives only as
-reporting context (whose sheet do we compare against), not as something the
-model is fitted per. See "Why BDM was dropped from the grain" below.
-
-Think of it like this: if you looked at 8 years of monthly sales for a desk
-lamp — across all the salespeople who sell it — and noticed it always spikes
-in October and drops in May, you'd reasonably predict next October will spike
-too. That's what the system does, for **187 products** at once (last run),
-with mathematical precision instead of gut feel.
-
----
-
-## The date windows move — they are not hard-coded dates
-
-Every window in `config.py` is a fixed offset from `TEST_END`, and `TEST_END`
-itself is **not** "today's date" — it's the most recent *complete* month found
-in `forecast_training_data`, determined by `analysis/month_completeness.py`
-(a month with a partial upstream pull, e.g. running well below seasonal
-expectation, is treated as not-yet-complete and skipped).
-
-| Window | Last run's value | Offset from TEST_END |
-|---|---|---|
-| Training start | 2018-01 | fixed |
-| Training end | 2025-12 | -6 |
-| Test (accuracy check) start | 2026-01 | -5 |
-| Test (accuracy check) end | 2026-06 | anchor |
-| Forward forecast start | 2026-07 | +1 |
-| Forward forecast end | 2026-12 | +6 |
-
-The window has already rolled forward twice since this pipeline was built —
-most recently 2026-08-03, when it moved +2 months because 2026-07 in the
-extract was only 46% of seasonal expectation (partial pull, below the 60%
-completeness threshold) and 2026-06 was used as the anchor instead. **If
-you're reading this doc later and the dates above look stale, that's expected
-— re-derive with `python -m analysis.window_proposal` rather than trusting
-this table.**
+1. [The problem and the shape of the answer](#1-the-problem-and-the-shape-of-the-answer)
+2. [Architecture and data flow](#2-architecture-and-data-flow)
+3. [Data sources](#3-data-sources)
+4. [The data: what is good, what is bad, how it is handled](#4-the-data-what-is-good-what-is-bad-how-it-is-handled)
+5. [The pipeline, step by step](#5-the-pipeline-step-by-step)
+6. [Why these models: the evidence](#6-why-these-models-the-evidence)
+7. [Evaluation](#7-evaluation)
+8. [Operating model and failure modes](#8-operating-model-and-failure-modes)
+9. [Open issues and challenges](#9-open-issues-and-challenges)
+10. [Glossary](#10-glossary)
 
 ---
 
-## What Happens Step by Step
+## 1. The problem and the shape of the answer
 
-### Step 1 — Load the Data
+Daylight sells roughly 250 active products (item codes) through regional teams
+(UK, EU, USA, Australia). Each Business Development Manager (BDM) produces a
+manual yearly forecast per product. The goal is an **automated, repeatable
+monthly forecast** that supplies a statistical view of demand alongside the BDM
+view — not to replace the BDMs. The client's stated priority is **volume-weighted
+accuracy (WAPE)**, not winning item-by-item against the BDMs.
 
-The script connects to Azure SQL and pulls five things, each cached locally to
-`output/*.csv` so re-runs with `--cached` skip the DB entirely:
+What the system produces: for each forecastable item, six monthly quantities
+(`yhat`) with a lower/upper band, tagged with the model that produced them and
+the item's Product Family, appended to Azure SQL for Power BI.
 
-| Source | Cached as | Last run |
-|---|---|---|
-| `forecast_training_data` (monthly qty per item/BDM/region) | `raw_data.csv` | 49,634 rows, 731 distinct items |
-| BDM manual forecast sheet | `bdm_forecasts.csv` | 9,254 rows, 286 items |
-| Active-product allow-list | `active_products.csv` | 265 items |
-| Master product table (→ Product Family) | `master_product.csv` | 1,426 items |
-| `product_successor_map` (retired → replacement codes) | `successor_map.csv` | 91 pairings: 71 retired codes → 78 successor codes |
+What it deliberately does **not** do:
 
-`forecast_training_data` is already monthly-aggregated (item × BDM × region ×
-month) — it is **not** the ~330K-row invoice-line table. Don't conflate the
-two when quoting row counts.
-
----
-
-### Step 1b — Detect and Exclude Channel-Mismatch Items
-
-Before anything else is filtered, every item's trailing-12-month sales are
-checked for a specific failure pattern: **real demand that has moved almost
-entirely into Amazon, the channel this pipeline deliberately excludes from
-training (Step 2).** For an item like that, forecasting the non-Amazon
-remainder isn't a tuning problem — there's too little real signal left in the
-channel being trained on, even though the item's total demand is real and
-ongoing.
-
-An item is excluded if, in the trailing 12 months ending at `TEST_END`, ALL
-THREE hold:
-
-| Condition | Threshold |
+| Not covered | Why |
 |---|---|
-| Amazon share of total volume | >= 90% |
-| Non-Amazon volume remaining | < 60 units/year |
-| Total (all-channel) volume | >= 300 units/year |
+| Amazon demand | Amazon rows in the invoice data are sell-in (replenishment), not consumer demand. Handled by a separate Amazon forecast workstream on Vendor Central sell-out data. |
+| Retired products | No forecast needed; their demand is carried by their successors (see pooling). |
+| Items with too little history or too few sales events | Blocked, with a recorded reason, rather than given a number that would be a guess. |
+| Per-BDM forecasts | BDM is sales-credit attribution (who earns commission), not a demand driver. Splitting an item's demand by BDM models an accounting split. BDM remains reporting context only. |
+| Price, promotion, stock-out or event effects | Not modelled (no such inputs are loaded). |
 
-The third condition is what keeps this from catching genuinely low-volume or
-declining products — those should still get a low forecast, not be silently
-suppressed. Only items with real, substantial demand that's simply invisible
-to this pipeline's trained channel get excluded.
+## 2. Architecture and data flow
 
-**Discovered from `U35108`** (Slimline 3 Table Lamp, USA): 99.6% Amazon
-share, only 11 non-Amazon units/year against 2,971 total. Prior to this fix,
-Prophet was fitting a trend against those 11 remaining units while predicting
-off a 2018–2023 baseline from before the channel shift — producing a 9,794%
-test-window MAPE that had nothing to do with model tuning. Investigation also
-found `U35108`'s nominal "successor" (`U35109`) is not a stand-in for this
-demand — it's a separate, genuinely independent product with its own real
-wholesale volume, already correctly forecasted under a different pooled
-family (`U35107`). Substituting one for the other would have been wrong in
-the other direction.
+```
+   dbo.INVOICES_TEMP  (raw invoice lines; refreshed by an EXTERNAL process)
+          │  + CUSTOMERS (BDM attribution), Territory (channel, BDM code), BDM (region)
+          ▼
+   database/build_training_data.py    DROP + rebuild  dbo.forecast_training_data
+          │                            (item × BDM × region × month; qty + txn count)
+          ▼
+   main.py  ───────────────────────────────────────────────────────────────────────
+     1  load   training data · BDM forecasts · active products · master product ·
+               successor map                                     (cached as CSV)
+     2  window --auto-window: latest COMPLETE month → all windows (month_completeness)
+     3  detect channel-mismatch items (demand moved to Amazon)          → Blocked
+     4  drop Amazon-channel rows
+     5  aggregate to item × month  (BDM and region dropped from the grain here)
+     6  pool retired + successor codes into "families" for training
+     7  scope: active list → ≥ 24 months history → (optional) A-rated only
+     8  classify each item's demand (Syntetos-Boylan) and route it
+               Prophet │ Naive-3mo │ Naive-12mo │ Blocked
+     9  fit/compute  Prophet per series · trailing average per series
+    10  split family forecasts back to real item codes (two ratios — see §5.7)
+    11  tag Product Family; score test window; compare with BDM and prior-year
+    12  write CSVs; --write-db → one transaction (schema check + both inserts)
+          ▼
+   dbo.forecast_output / dbo.forecast_accuracy   (append-only, run_date stamped)
+          ▼
+   dbo.vw_forecast_output_latest  (MAX(run_date))  →  Power BI
+```
 
-Excluded items get **no forecast at all** until Amazon-inclusive forecasting
-exists for them (see the shelved Amazon-forecasting workstream) — not a
-suppressed or substituted number. Every run logs exactly which items were
-excluded and why to `output/excluded_channel_mismatch.csv`, with the actual
-Amazon share and volume figures, so this is auditable rather than a silent
-gap. On the run that surfaced this fix, exactly one currently-active item
-(`U35108`) met the threshold; a second item (`U25201`, same "moved to Amazon"
-pattern) was also caught but was already excluded from scope for an unrelated
-reason (not on the active-product list), confirming the check generalises
-rather than being hand-tuned to one SKU.
+Everything between steps 6 and 10 that involves "families" is a **detour around
+the fit**: before step 6 and after step 10 the data is plain item-code grain, so
+scope filtering, benchmarking and the CSV writers never see the machinery.
+
+## 3. Data sources
+
+| Source | Used for | Notes |
+|---|---|---|
+| `dbo.INVOICES_TEMP` | Raw sales | Over 330,000 invoice lines (mid-2026). **`Date` and `Qty` are strings.** Refreshed by a process outside this repo. |
+| `dbo.CUSTOMERS` | BDM attribution (customer → BDM) and channel | ~95% of invoice lines attribute to a BDM; the rest become `Unattributed` |
+| `dbo.Territory` | BDM code, channel (`Amazon` etc.) | `CUSTOMERS.BDM = Territory.Department` |
+| `dbo.BDM` | BDM manual forecasts (wide Jan–Dec per planning year), rating (A–E, N), region, and the active-product list | Holds more than one planning year at once (2026 and 2027) |
+| `dbo.[MASTER RODUCT TABLE]` | Product Family (reporting tag) | Table name is misspelled in the live DB |
+| `dbo.product_successor_map` / `product_successor_review` | Old → new code pairings, status, confirmed changeover date | Many-to-many; see §5.5 |
+| `dbo.forecast_training_data` | **The modelling input**, built by `database/forecast_training_data.sql` | ~51k rows, ~740 item codes, Jan 2018 → current month |
+
+Item codes are filtered at build time to the product prefixes `DN`, `A`, `D`,
+`E`, `U` (excluding `DISCOUNT`, `Shipping Charge`, `SHIP` and non-positive
+quantities). The first letter encodes the region (D = UK, E = EU, U = USA,
+A = Australia).
+
+## 4. The data: what is good, what is bad, how it is handled
+
+### 4.1 What is good
+
+- **Long, consistent history.** Monthly data from Jan 2018 — about eight and a
+  half years, enough for two or more full yearly cycles on most mature items.
+  This is what makes seasonal modelling possible at all.
+- **A seasonal pattern worth modelling.** There is a repeatable annual shape on
+  regular items, including a hard Apr–Jun trough (genuine months in that
+  trough routinely run at 52–70% of their own trailing median). Prophet's yearly
+  seasonality earns its keep on those items.
+- **Channel is tagged.** Amazon rows carry `channel = 'Amazon'` from the
+  Territory table across all Amazon BDM codes, so exclusion needs no per-code
+  list and self-maintains as codes are added.
+- **Good BDM attribution coverage (~95%)** and an authoritative region source.
+- **Successor map exists.** Product changeovers are recorded, with status and (for
+  the forecast-relevant families) confirmed changeover dates, which allows
+  demand continuity to be recovered across a code change.
+- **A manual benchmark exists** (the BDM sheet), including ratings, for the same
+  items.
+
+### 4.2 What is bad, and what the pipeline does about it
+
+| Problem | Effect if ignored | Handling | Residual risk |
+|---|---|---|---|
+| **`INVOICES_TEMP.Date` is a string** with inconsistent formats | Wrong months, silent loss of rows | Build parses the last 10 characters as day/month/year (style 103), falling back to ISO. Same rule as the Power BI model. | Strings that fit neither parse become NULL months. Check for unparseable dates after each upstream refresh. |
+| **The newest month is usually partial** (the upstream pull runs part-way through a month) | Training on a fabricated cliff at the most recent point — exactly where trend fitting is most sensitive | `analysis/month_completeness.py` compares each month with the same month a year earlier, normalised for growth (a trailing-median test fails because Apr–Jun is a genuine trough). A month below a 0.60 ratio is treated as incomplete and the window anchors on the previous month. | The threshold is calibrated on one known partial month (0.46) vs the worst genuine month (0.70). A new type of truncation could slip between. |
+| **Amazon sell-in mixed with consumer sales** | Lumpy replenishment orders corrupt seasonality | Rows with `channel='Amazon'` removed before aggregation (logged to `excluded_amazon_rows.csv`). | **Those units are invisible to this forecast**, and the BDM sheet still counts them (§9, issue 1). |
+| **Items whose demand migrated to Amazon** (e.g. U35108: 99.5% Amazon, 13 non-Amazon units of 2,597 in 12 months) | Prophet fits a trend to a handful of units and predicts from a pre-migration baseline (9,794% MAPE seen) | `detect_channel_mismatch()`: excluded when Amazon share ≥ 90% **and** non-Amazon volume < 60/yr **and** total volume ≥ 300/yr. The third condition stops it suppressing genuinely small or declining products. Excluded items get no forecast and are listed with their figures. | Items just under the thresholds still get a forecast on thin data. |
+| **Product changeovers split history across codes** | A successor starts from zero history and fails the 24-month rule although the *demand* is years old | Successor-family pooling (§5.5) | Depends on map quality and on correct split-back (§9, issues 2 and 9). |
+| **Ambiguous region** (the same item/BDM pair appears under two regions in `dbo.BDM`; only BDM 'SW' on a few SKUs) | A join fan-out inflated those series exactly 2× | Region lookup collapsed to one row per (item, BDM) using `MIN(Region)`; every collapsed pair is logged to `region_ambiguity_log.csv` | The chosen region is a **resolved ambiguity, not a verified fact**. Forecasts are unaffected (region is not a model input) but region-level reporting needs business confirmation. |
+| **Unattributed sales (~5%)** | None for forecasting | Grain has no BDM, so these are fully included | — |
+| **Erratic and intermittent demand** | MAPE in the thousands of percent; Prophet seasonality fitted to noise | Demand classification and routing (§5.6); WAPE as primary metric | Intermittent items remain inherently hard to forecast |
+| **Short and uneven history** | Seasonal fit on < 4 cycles can overfit | 24-month minimum; low Fourier order (§6.1); history-length experiment (§6.5) | 24% of fitted items are scored on < 6 test months |
+| **Product Family missing for ~34% of the wider master table** (mostly Australian A-prefix SKUs) | Gaps in grouped reporting | Tagged `Unknown`, never dropped or guessed; coverage within the fitted scope is logged | Reporting by family is incomplete for some SKUs |
+| **Rating "N"** appears on the BDM sheet beside A–E; meaning undocumented | Unclear reporting dimension | Carried through unchanged | Needs a definition from the client before rating is used in client-facing reporting |
+| **Training-table total differs by +2 units for one month** (June, 1,762 vs 1,760 expected in a reconciliation) | Negligible | Noted | Cause not investigated |
+| **Training table is rebuilt with DROP + SELECT INTO** | The table briefly does not exist during the rebuild; a concurrent reader would fail | Run the cycle at a quiet time | Not atomic |
+
+### 4.3 Net assessment
+
+The data is **good enough to forecast the regular, established, non-Amazon part
+of the range** — which is most of the volume — and **not good enough to forecast
+the long tail** (new, intermittent or channel-migrated items) with any
+confidence. The pipeline's design principle is therefore *say less rather than
+say something wrong*: block, label and log instead of guessing.
 
 ---
 
-### Step 2 — Exclude Amazon Channel Rows
+## 5. The pipeline step by step
 
-Before anything else, rows where `channel == 'Amazon'` are stripped out and
-saved to `output/excluded_amazon_rows.csv` for inspection.
+### 5.1 The date windows roll; they are not hard-coded
 
-**Why:** these are bulk replenishment orders Daylight ships *to* Amazon's
-fulfilment centres, not consumer purchases — lumpy, irregular, and they
-corrupt Prophet's seasonality learning if left in. The filter matches on
-`channel`, not on BDM code, so it self-maintains as new Amazon BDM codes get
-added. (Phase 2 will replace this signal with Vendor Central sell-out data.)
+Every window is a fixed offset from one anchor, `TEST_END`:
 
-**Last run: 5,761 rows / 312 distinct items excluded.**
+| Window | Offset | Latest run |
+|---|---|---|
+| Training | `2018-01` → `TEST_END` −6 | 2018-01 → 2026-03 |
+| Test (held-out accuracy check) | −5 → 0 | 2026-04 → 2026-09 |
+| Forward forecast | +1 → +6 | 2026-10 → 2027-03 |
 
----
+With `--auto-window`, the anchor is the **newest complete month** in
+`forecast_training_data` as judged by `analysis/month_completeness.py` — not
+`MAX(year_month)` and not the calendar date. The BDM benchmark window is rolled
+at the same time, from the months the BDM sheet actually covers. `config.TEST_END`
+is only the fallback for runs without `--auto-window` and the reference
+`--require-roll` compares against. **This is a design fact worth stating
+plainly:** the models are trained only to `TRAIN_END`, six months before the
+anchor, so the forward forecast is produced by models that have **not seen the
+most recent six months of actuals**; those months are used to score the model
+and to estimate family split mixes, not to fit it (see open issue 8).
 
-### Step 3 — Aggregate to the Modelling Grain (item × month)
+### 5.2 Load
 
-Raw rows are summed to one row per `item_code` per month. **`bdm_code` and
-`region` are dropped here** — this is where the BDM grain disappears. A
-separate lookup (`series_metadata()`) captures item→region from the raw rows
-first, purely for reporting breakdowns later; it never re-enters the model.
+Five inputs, each cached to CSV so `--cached` runs never touch the database:
+training data, BDM forecasts, active products, master product table, successor
+map. `forecast_training_data` is already monthly-aggregated; it is not the raw
+invoice table, so quote its row counts separately.
 
-#### Why BDM was dropped from the grain (2026-07)
+### 5.3 Exclusions
 
-BDM is sales-credit attribution — which salesperson gets commission — not a
-demand driver. Forecasting "D25090 × Sarah Whyld" separately from
-"D25090 × everyone else" was modelling an accounting split, not a different
-demand pattern. An item's demand is now summed across all its BDMs into one
-series. This is a real design change from an earlier version of this
-pipeline, not a bug — if you're comparing against old output files (anything
-with a `bdm_name` column at the forecast/metrics grain), those are from
-before this change.
+1. **Channel mismatch** is detected *first*, because the Amazon filter below
+   removes the rows needed to detect it (§4.2).
+2. **Amazon channel rows** are removed (latest run: 6,013 rows across 319 items,
+   logged for audit).
 
----
+### 5.4 Aggregation to the modelling grain
 
-### Step 4 — Successor-Family Pooling (a detour around the fit, not a rewrite of it)
+Rows are summed to one row per `item_code` per month. `bdm_code` and `region` are
+dropped here. A side lookup keeps item → region purely for reporting.
 
-**The problem:** when a product is discontinued and replaced, the successor
-code starts its own sales history at zero. `MIN_TRAIN_MONTHS = 24` then
-excludes it — even though the *demand* has years of history under the old
+### 5.5 Successor-family pooling
+
+**Problem.** When a product is replaced, the new code starts at zero history and
+fails the 24-month rule even though its demand has a long history under the old
 code.
 
-**The fix:** retired codes and their successors are temporarily pooled into
-one series for training, then split back into real item codes afterward.
-Family membership is resolved as **connected components** over the old↔new
-map — not "one retired code → its successors" — because the map is a
-many-to-many relation (13 successor codes are each reachable from two
-different retired codes in the current data). A family is eligible for
-pooling only if at least one of its *current* codes is on the active-product
-list.
+**Solution.** The retired code and its successors are summed into one series for
+the fit, then the family forecast is split back to real item codes.
 
-**Last run: 91 map rows resolved into 59 eligible pooled families**, replacing
-those members' individual series for the fit only. Everything before this
-step and after the split-back (Step 8) is plain item-level data — this
-machinery is invisible to scope filtering, benchmarking, and the CSV writers.
+- Families are resolved as **connected components** of the old ↔ new map, because
+  the map is many-to-many (13 successor codes are reachable from two retired
+  codes). Resolving "one retired code → its successors" would count shared
+  history twice and emit two forecast rows for one item.
+- A family is eligible only if at least one *current* code is on the active list.
+- Pairings with status "Old code still selling" (the changeover has not happened)
+  and one explicitly excluded old code (`D35040`, an unconfirmed data issue) are
+  not pooled.
+- **Two split ratios**, never one: a `test_ratio` from actuals up to `TRAIN_END`
+  for anything scored on the test window, and a `forward_ratio` from the freshest
+  actuals for the real forecast. Using one ratio for both lets the split "peek" at
+  how demand divided during the test months and flatters accuracy (this was found
+  as identical bias numbers across all codes of a family and is eliminated by the
+  two-ratio design).
+- Ratios come from each code's own recent actuals (trailing six months, at least
+  three post-changeover months of sales per code). Otherwise the split is equal
+  and flagged `split_method = equal_fallback`. Single-successor families are
+  assigned the full family forecast (`split_method = na`).
+- 76 item codes belong to pooled families in the latest run.
 
-**Splitting the family forecast back out uses TWO different ratios, not one:**
+*Note: "Product Family" (`family.py`, a reporting label from the master table) is
+unrelated to a "successor family" (`family_pool.py`). The code keeps them apart
+as `family` and `family_key`.*
 
-| Ratio | Observed from | Used for |
+### 5.6 Scope, classification and routing
+
+**Scope.** Active-product allow-list → at least 24 months of history before the
+test window (judged on the pooled series for pooled items) → optionally A-rated
+only (`--pilot`).
+
+**Classification** (`demand_classification.py`) — Syntetos-Boylan on the series
+as it is actually fitted (the pooled family series for pooled items), on data to
+`TRAIN_END` only:
+
+| | CV² < 0.49 | CV² ≥ 0.49 |
 |---|---|---|
-| `test_ratio` | Actuals up to `TRAIN_END` only | Anything scored on the test window (`test_validation.csv`, `model_metrics.csv`) |
-| `forward_ratio` | Freshest actuals available, no cutoff | The genuine forward forecast |
+| **ADI < 1.32** | Smooth | Erratic |
+| **ADI ≥ 1.32** | Intermittent | Lumpy |
 
-Using one ratio for both would let the split "peek" at how demand actually
-divided during the test months, quietly flattering test-window accuracy. This
-was caught in an earlier version of the output: 6 of 14 split families showed
-an *identical* `bias_pct` across every one of their codes — the tell that the
-observation window and the scored window were the same months. Under the
-two-ratio fix that number is 0.
+ADI = months of tenure ÷ months with sales (1.0 = sells every month); tenure runs
+from the first sale, so a recent launch is not penalised for years it did not
+exist. CV² is computed over non-zero months. Fewer than four non-zero months is
+reported as *Insufficient Data to Classify*, not guessed. Items within 10% of a
+cut-off carry `near_threshold = True` — flagged, never re-routed.
+`decline_ratio` (mean of the last 24 months ÷ the 24 before) records the trend.
 
-A family whose codes don't individually have at least 3 post-changeover months
-of sales falls back to an equal split and is flagged (`split_method =
-equal_fallback`) rather than trusting a mix inferred from one or two months.
+**Routing** (`model_routing.py`). First matching gate wins:
 
----
-
-### Step 5 — Scope Filtering
-
-With families pooled, three filters run in order:
-
-1. **Active-product allow-list** — must be on `active_products.csv` (or be an
-   eligible pooled family_key).
-2. **Forecastable series** — at least `MIN_TRAIN_MONTHS = 24` months of
-   history strictly before the test window (two full yearly cycles, the
-   minimum to detect yearly seasonality).
-3. **(Optional, `--pilot` flag only)** — restrict to A-rated items for a fast
-   validation run.
-
-**Last run, without `--pilot`: 187 series survived scoping** — 111 as
-standalone items, plus the 59 pooled families (which expand back to 76 item
-codes after Step 8's split).
-
----
-
-### Step 6 — Assign Each Series to a Changepoint Segment
-
-Every fitted series gets ONE of two `changepoint_prior_scale` values — a
-strict two-way branch, no per-item tuning:
-
-| Segment | Value | Applies to |
+| # | Condition | Result |
 |---|---|---|
-| Standard | 0.05 | Everything by default |
-| Known changeover | **0.25** | A pooled family whose successor-review record carries a *confirmed* `estimated_changeover` date |
+| 1 | Retired code | Blocked — "retired, no forecast needed" |
+| 2 | Not on active list | Blocked — "not currently active" |
+| 3 | Channel mismatch | Blocked — "needs Amazon sell-out data" |
+| 4 | No sales history | Blocked |
+| 5 | Too few months to classify | Blocked — "insufficient history to classify yet" |
+| 6 | Smooth / Erratic | **Prophet** if the fit series has ≥ 24 calendar months, else Blocked ("insufficient calendar history") |
+| 7 | Lumpy / Intermittent | **Naive-3mo** if `decline_ratio` < 1, otherwise **Naive-12mo**, provided ≥ 10 months with sales; else Blocked ("insufficient sale occurrences") |
 
-**Why:** at 0.05, a real sustained level shift (a genuine changeover) gets
-regularised away as noise — the model keeps predicting the old level while
-actual sales run somewhere else. `analysis/trend_audit.py` found this exact
-signature in 38 of the 68 worst-performing series. `0.25` was chosen over
-looser values by `analysis/changepoint_experiment.py` under rolling-origin CV:
-it beat 0.05 on 19/22 known-changeover families (median MAPE -30.7%) but only
-29/43 on series *without* a confirmed changeover — not enough of an edge to
-loosen the prior everywhere, hence the segmentation rather than a global
-change.
+Gates 6 and 7 block for temporary reasons and are re-evaluated every run, so
+items leave the blocked set on their own as data accrues. An unknown trend
+(`decline_ratio` undefined) routes to the 12-month window on purpose.
 
-**⚠️ A finding from this engagement's own data, worth knowing before you read
-too much into the segmentation:** right now, *every one* of the 59 pooled
-families also has a confirmed changeover date — `successor_map.csv` has zero
-rows with a blank date. That means the "known changeover" segment and "is
-pooled at all" are currently the exact same 59 families — the segmentation
-isn't actually discriminating *within* the pooled population yet, it's just
-splitting pooled vs. singleton. That's not a bug; the logic is built to
-diverge (a pooled family without a confirmed date would stay on the standard
-prior) — it just hasn't been exercised by the data so far. If a future
-successor-map update adds an undated pooled family, expect this to change.
+### 5.7 Models
 
----
-
-### Step 7 — Train a Model for Each Series
-
-One Prophet model per fitted series (family_key or plain item_code):
+**Prophet** — one model per fitted series:
 
 ```python
-Prophet(
-    yearly_seasonality      = 3,             # Fourier order — NOT the library default (True = 10)
-    weekly_seasonality      = False,
-    daily_seasonality       = False,
-    seasonality_mode        = "multiplicative",
-    changepoint_prior_scale = 0.05 or 0.25,  # segment-dependent, see Step 6
-    seasonality_prior_scale = 10.0,
-    interval_width           = 0.95,
-)
+Prophet(yearly_seasonality=3, weekly_seasonality=False, daily_seasonality=False,
+        seasonality_mode="multiplicative", seasonality_prior_scale=10.0,
+        changepoint_prior_scale=0.05,   # 0.25 for known-changeover families
+        interval_width=0.95)
 ```
 
-**`yearly_seasonality = 3` is a deliberate departure from Prophet's default.**
-The default (`True` → 10 Fourier term pairs, 20 free parameters) overfits at
-monthly resolution when fit against only 6–8 repeats of a yearly cycle — it
-produces seasonal swings of hundreds of percent that are invisible at daily
-resolution but absurd at monthly. Order 3 was validated by
-`analysis/seasonality_experiment.py` under rolling-origin CV: it beat order 10
-on 102/152 series by MAPE and 121/152 by WAPE (median -10.2% MAPE). It's a
-single global value, not tuned per product.
+Each model predicts the test and forward windows in one call; negative values are
+clipped to zero. Fitting is about half a second per series.
 
-**Training time:** ~0.5 sec/series. For 187 series, the full training loop
-runs in under 2 minutes.
+**Naive routes** — one flat level per series: the mean monthly quantity over the
+last 3 or 12 calendar months to `TRAIN_END`, zeros included, applied to every
+test and forward month. The band is `level × (0.13, 2.60)` for Naive-3mo and
+`level × (0.30, 3.48)` for Naive-12mo — the empirical p10/p90 of
+actual ÷ forecast across this population's cross-validation folds. **It is not a
+prediction interval** and is not comparable to Prophet's. Naive-12mo's band rests
+on thinner evidence (12 of its 22 originally routed items had standalone fold
+data; the rest are pooled families the experiment never tested).
 
----
+**Split-back.** Family forecasts become item-level rows using the ratios of §5.5.
+In the test frame each item's `actual` is its *own* observed sales, never a
+ratio-scaled share of the family total (splitting a measured fact would invent
+data).
 
-### Step 8 — Generate Predictions, Split Family Forecasts Back to Item Level
+### 5.8 Benchmarking
 
-Each model predicts the test window + forward window together in one call.
-Negative predictions (impossible — you can't sell -5 lamps) are clipped to
-zero.
+On the months where the test window overlaps the BDM sheet, each item-month is
+compared across three numbers: the item's model forecast, the BDM manual forecast
+**summed across every BDM who forecasts that item**, and a prior-year baseline
+(same item, same month a year earlier). The lowest MAPE wins the item-month.
+See §7 and open issue 1 for why the BDM leg is currently not like-for-like.
 
-Family-keyed predictions are then split back to real item codes using the
-ratios from Step 4 — singletons and one-for-one renames pass straight
-through unchanged; multi-way splits get one row per current code per month,
-scaled by that code's share.
+### 5.9 Output and write
 
-For the **test** frame specifically, each item's `actual` is replaced with
-that item's *own* observed sales (not a ratio-scaled slice of the family
-total) wherever it's available — splitting a measured fact would invent data
-and make the accuracy numbers meaningless.
-
-**Last run: forward forecast = 1,122 rows (187 items × 6 months).**
-
----
-
-### Step 9 — Tag Product Family (reporting only)
-
-A `family` column (e.g. "Slimline", "Wafer 1") is joined onto every output
-frame from the master product table, purely for grouping in reports — it
-never enters the model. Item codes with no master-product row get tagged
-`Unknown` rather than dropped or guessed, so any coverage gap stays visible.
-
-**Note — this is a different "family" from Step 4.** `family.py`'s Product
-Family is a reporting label from the master table. `family_pool.py`'s
-successor family is the training-pooling mechanism. They are unrelated
-concepts that happen to share the word "family" — the codebase deliberately
-keeps them namespaced apart (`family_key` vs. `family`) and so does this doc.
-
-**Last run: 187/187 (100%) of fitted series matched to a known Product
-Family** — the ~34% "Unknown" coverage gap that exists in the wider master
-table (mostly AU A-prefix SKUs) didn't affect any item actually in this run's
-scope.
+CSVs are written per run (README §5a). With `--write-db`, the output tables are
+created if absent, their columns are validated against the expected layout, and
+both inserts happen in **one transaction** — a failure leaves nothing behind.
+`--write-db` is refused when combined with `--item`, `--cached` or `--pilot`.
 
 ---
 
-### Step 10 — Compare Against BDM and a Naive Baseline
+## 6. Why these models: the evidence
 
-For the overlap between the test window and the BDM sheet's forecast year
-(2026-01 to 2026-04), the script compares three numbers per item-month:
+The guiding rule was that every non-default choice is justified by a
+rolling-origin cross-validation run **inside the training window** (so the test
+window is never used to choose settings) and that the experiment code stays in
+the repo so the decision can be re-checked.
 
-- **Prophet's prediction**
-- **The BDM manual forecast — summed across every BDM who forecasts that
-  item**, not one arbitrary BDM's number. This changed alongside the grain
-  change in Step 3: since Prophet no longer produces a per-BDM number, the
-  correct comparator is the sales team's *total* demand call for the item,
-  not a single BDM's slice of it. **Per-BDM win-rate breakdowns are gone as a
-  result** — the model doesn't produce a number to break out that way anymore.
-- **A naive baseline** — same item, same month, one year prior.
+### 6.1 Prophet for regular demand
 
-Whichever has the lowest MAPE for that item-month wins. Results are
-summarized by product rating (A–E) and region.
+*Why Prophet:* monthly data with a real yearly cycle plus occasional level shifts
+is exactly what a trend + seasonality decomposition handles, it tolerates gaps,
+and it produces an interval. It needs at least two yearly cycles to have a
+seasonality to find, hence `MIN_TRAIN_MONTHS = 24`.
 
----
+*Defaults that were changed, and why:*
 
-### Step 11 — Save Everything
-
-| File | What's inside |
-|---|---|
-| `test_validation.csv` | Item-level predictions vs. actuals, test window |
-| `forecast_{start}_{end}.csv` | Forward forecast — filename derived from `config.FORECAST_START/END`, not hard-coded, so it can't silently go stale as the window rolls |
-| `model_metrics.csv` | Per-item MAE / RMSE / MAPE / WAPE / bias, plus `changepoint_segment` and family-pooling trace columns |
-| `benchmark_comparison.csv` | Prophet vs. BDM vs. naive, with winner |
-| `excluded_amazon_rows.csv` | Rows dropped in Step 2, for audit |
-| `successor_split_ratios.csv` | Both ratios (test + forward) per pooled family/item, for audit |
-| `unmatched_family_log.csv` | In-scope item codes with no Product Family match (empty last run) |
-
-Last run's actual filename was `forecast_2026-07_2026-12.csv` — if you see a
-file called `forecast_may_oct_2026.csv` anywhere, it's from a stale run or an
-old cached copy, not this pipeline as it stands today.
-
----
-
-## Accuracy by Product Rating — Last Run
-
-Verified by joining `model_metrics.csv` to the rating on `bdm_forecasts.csv`
-(all 187 fitted series matched — 0 unmatched).
-
-| Rating | n series | Median MAPE | Mean MAPE | Median WAPE | Mean WAPE | Median Bias |
-|---|---|---|---|---|---|---|
-| A | 40 | 58.5% | 344.3% | 49.3% | 285.7% | +8.0% |
-| B | 34 | 62.1% | 142.2% | 56.0% | 58.2% | -2.5% |
-| C | 46 | 73.2% | 99.2% | 56.8% | 62.8% | -15.5% |
-| D | 11 | 100.0% | 229.6% | 100.0% | 151.6% | -35.7% |
-| E | 34 | 100.0% (1 undefined) | 345.5% | 81.5% | 330.6% | -11.4% |
-| N | 22 | 96.2% | 222.7% | 64.3% | 81.3% | -14.1% |
-
-**Report the median, not the mean, when this goes in front of Samir.** Every
-rating's mean is dragged far above its median by one or two extreme
-single-series misses — most visibly rating A, where the mean (344.3%) bears no
-resemblance to the median (58.5%).
-
-**The A-rating mean is wrecked by one item: `U35108`.** MAPE 9,794%. Its raw
-test-window numbers:
-
-| Month | Actual | Prophet forecast |
+| Setting | Choice | Evidence |
 |---|---|---|
-| 2026-01 | 2 units | 263 |
-| 2026-02 | 2 units | 222 |
-| 2026-06 | 3 units | 163 |
+| `yearly_seasonality` | **3** Fourier pairs (default `True` = 10) | The default is 20 free parameters against 6–8 repeats of a yearly cycle; sampled daily it swings −969% to +1,588% around trend on an item like DN1380. Order 3 beat order 10 on **102 / 152** series by CV MAPE, **121 / 152** by CV WAPE, median MAPE −10.2%. One global value, not tuned per item. |
+| `seasonality_mode` | multiplicative (kept) | Additive beat it on only 73 / 152 series — a coin flip — and did not reduce the swing. |
+| `seasonality_prior_scale` | 10 (kept) | Tighter priors only helped in combination with per-item Fourier order, i.e. per-series tuning, which was out of scope. |
+| `changepoint_prior_scale` | 0.05 standard; **0.25** for families with a confirmed changeover date | A trend audit found 38 of the 68 worst-fitted series had zero changepoints clearing the threshold with the fitted trend >30% from recent actuals: the 0.05 prior was regularising a real level shift away. 0.25 beat 0.05 on **19 / 22** known-changeover families (median MAPE −30.7%; 20 / 22 by WAPE) but only 29 / 43 elsewhere — not enough to loosen it everywhere, hence segmentation. 0.25 was preferred to 0.50 (tied at 19 / 22) because 0.50 is the edge of the tested grid and its worst regression was +127% vs +72%. |
 
-Demand for this item has collapsed to near-zero, but it's tagged
-`changepoint_segment = standard` — no confirmed successor record is pulling it
-into the loosened-prior segment. This is a strong candidate to cross-check
-against the 104 declining products with no confirmed successor, rather than a
-random miss to tune away.
+*Caveat:* every pooled family currently has a confirmed changeover date, so the
+"known changeover" segment is identical to "pooled" — the segmentation is not yet
+discriminating within the pooled population.
 
-**An unresolved data question: rating "N."** `bdm_forecasts.csv` carries a
-sixth rating value alongside A–E, covering 22 of the 187 fitted series. Its
-meaning isn't documented anywhere in this codebase — confirm with Samir's team
-before "rating" is used as a client-facing reporting dimension.
+### 6.2 Trailing averages for Lumpy / Intermittent demand
 
-**The four previously-flagged erratic SKUs, current numbers:**
+Prophet has nothing useful to say about a series that is mostly zeros, and
+before routing existed the pipeline discovered this only indirectly (thin series
+were silently dropped). The obvious specialist is Croston / TSB. It was tested
+properly — Croston Classic, Optimized, SBA and TSB, by rolling-origin CV on the
+standalone Lumpy + Intermittent population, WAPE primary — and **none earned an
+implementation**: a plain trailing average beat every variant. The apparent edge
+of Croston-type models was mostly "react faster to recent months", which a
+3-month average already does without the machinery.
 
-| Item | Rating | MAPE | WAPE | Test months |
-|---|---|---|---|---|
-| A25090 | A | 87.6% | 52.8% | 5 |
-| DN1380 | C | 112.7% | 82.0% | 6 |
-| U35070 | D | 874.1% | 89.8% | 3 |
-| UN91171 | E | 95.4% | 98.0% | 6 |
+Re-run inside trend subgroups, the best window differs: **short (3 months) on
+declining items, long (12 months) on stable, growing and unknown-trend items.**
+That split is the whole content of the Naive-3mo vs Naive-12mo choice.
 
-WAPE reads far more reasonably than MAPE for all four — consistent with the
-Syntetos-Boylan finding that these are volume-weighted-tolerable but
-percentage-hostile: the wrong shape of error for a MAPE-based read to
-characterise fairly.
+### 6.3 Why classify and route at all
 
-**Test-window completeness is uneven, and nothing downstream currently flags
-it:**
+Before routing, Prophet was applied to everything that cleared 24 months and
+everything else got no forecast, with no record of why. Routing makes the
+decision explicit, per item, with a stated reason, and lets the pipeline give a
+low-confidence number to items that previously got none.
 
-| Test months available | n series |
-|---|---|
-| 6 (full) | 142 |
-| 5 | 16 |
-| 4 | 12 |
-| 3 | 6 |
-| 2 | 4 |
-| 1 | 6 |
-| 0 (MAPE undefined) | 1 |
+### 6.4 Why pool successor families
 
-45 of 187 series (24%) are scored on fewer than 6 months. A MAPE built from
-1–3 months carries materially less statistical weight than one from 6, and
-while `n_test_months` is present as a column in `model_metrics.csv`, it isn't
-surfaced anywhere as a reliability signal today. Treat single- and
-double-month MAPEs with real caution — U35070 above is one of them (3 months).
+Without pooling, every successor with under 24 months of its own history is
+dropped although its demand is years old. Pooling recovers them. The cost is the
+split-back step and the assumptions in it (§9, issues 2 and 9).
+
+### 6.5 Experiments run but not adopted
+
+| Experiment (`analysis/…`) | Question | Outcome |
+|---|---|---|
+| `croston_experiment.py` | Which Croston-family model, and how many occurrences does it need? | No variant beat a trailing average → Naive routes (§6.2) |
+| `seasonality_experiment.py` | Is the default seasonal fit overfitting? | Yes → order 3 adopted (§6.1) |
+| `changepoint_experiment.py`, `trend_audit.py` | Why is the trend rigid on the worst series? | Prior too tight on known level shifts → segmented 0.25 adopted |
+| `split_ratio_window_compare.py` | Would an occurrence-based ratio window improve family splits? | **Negative.** The constraint is pre-boundary sales *volume*, not window length (the affected codes had one non-zero month each). Reverted; script kept as the record and no longer runs on current code. |
+| `history_length_experiment.py` | Does the global seasonality overfit short-history series? | Exploratory; not adopted |
+| `erratic_naive_experiment.py` | Does a trailing average beat Prophet on Erratic items (Australia first)? | Exploratory; not adopted |
+| `ets_sarima_experiment.py` | Do ETS or short-period SARIMA close ground on shortlists of short-cycle and trend-divergent items? | Discovery only; nothing adopted |
+| `model_tournament.py` | Does per-item model selection beat the fixed routing rule? Includes a deliberate safeguard against selection noise (the best of seven models on ~6 folds always looks good). | Discovery only; nothing adopted |
+
+The conclusions of the last four were not written up beyond their docstrings;
+re-run the scripts to reproduce the numbers. The client also intends to
+benchmark Azure's own forecasting services (Azure ML) against this approach in a
+later phase.
 
 ---
 
-## Summary
+## 7. Evaluation
 
-```
-DB pull (5 tables, cached to output/*.csv)
-        │
-        ▼
-   Exclude Amazon channel rows
-        │
-        ▼
-   Aggregate to item × month  (BDM + region dropped from the grain here)
-        │
-        ▼
-   Pool retired-code + successor families for training (detour, not a rewrite)
-        │
-        ▼
-   Scope: active-product list → 24mo-history filter → (optional A-rated only)
-        │
-        ▼
-   Assign changepoint segment (known-changeover family → looser prior)
-        │
-        ▼
-   Train one Prophet model per item / pooled family
-        │
-        ├──► Test window: split back to item level → check accuracy →
-        │                  compare vs BDM (summed) and naive baseline
-        │
-        └──► Forward window: split back to item level → tag Product Family →
-                              deliver to Power BI
-```
+### 7.1 Method
 
-**Last run: 187 fitted series (111 standalone items + 76 item-level rows split
-from 59 pooled successor families), covering 265 active products, in under 2
-minutes of training time.** Median per-series test-window MAPE / WAPE were
-80.5% / 59.4% — high enough, and skewed enough by low-volume/erratic SKUs and a
-handful of partial test windows, that raw aggregate numbers shouldn't go to
-Samir unsegmented. See "Accuracy by Product Rating" above for the breakdown by
-rating, the specific outlier (`U35108`) inflating rating A's mean, and the
-test-window-completeness caveat that applies to 24% of fitted series.
+- **Held-out test window** of six months before the anchor; models never see it
+  during fitting.
+- **Metrics:** WAPE (primary, volume-weighted), MAPE (secondary — undefined at
+  zero actuals and explosive at small ones), signed bias. Report medians, not
+  means: single items such as U35108 once produced a 9,794% MAPE and dragged an
+  entire rating's mean far above its median.
+- **Like-for-like comparison against the prior-year baseline** on item-months
+  where both exist.
+- **Out-of-sample scoring** of a *delivered* forward forecast against actuals
+  that arrive later: `python -m analysis.oos_scoring` (excludes partial months).
+  This is the only completely clean accuracy read and should be run each month
+  for the previous cycle.
+
+### 7.2 Latest results (test window 2026-04 → 2026-09, non-Amazon scope)
+
+| Route | Item-months | Model WAPE | Prior-year WAPE | Model bias | Prior-year bias | Model beats prior-year |
+|---|---|---|---|---|---|---|
+| **Prophet** | 799 | **50.9%** | 62.2% | −10.0% | −11.0% | 53.7% |
+| Naive-12mo | 68 | 57.3% | 59.9% | −18.2% | −31.2% | 50.0% |
+| Naive-3mo | 28 | 76.5% | 106.3% | −69.8% | −0.7% | 42.9% |
+| **Overall** | 895 | **51.3%** | 62.3% | −10.6% | −11.8% | 53.1% |
+
+### 7.3 How to read them
+
+- **Prophet is clearly better than "same as last year"** — about 11 points of
+  WAPE on 89% of rows. This is the evidence that supports publishing.
+- **Naive-12mo is roughly the prior-year baseline** — expected, since it is
+  essentially a smoothed version of it. Neutral.
+- **Naive-3mo is low-confidence:** 28 item-months, a −69.8% bias (it systematically
+  under-forecasts). Show it, but do not present it as a firm plan.
+- **The whole forecast leans about 10% low.** The baseline leans the same way, so
+  it is largely genuine growth the history does not capture, plus the
+  six-month-stale training cut-off (§5.1, issue 8). Say so when presenting.
+- **Absolute accuracy is moderate.** A WAPE near 50% at item-month level reflects a
+  noisy, partly intermittent book. Accuracy aggregated to Product Family or
+  region was **not measured** here; it is expected to be better than item level
+  (errors partly cancel) and should be measured before it is promoted as the
+  planning view.
+- **Rating** (A–E from the BDM sheet) is a useful cut to report by. In earlier
+  runs, median error was lowest on A/B items (median MAPE ≈ 58–62%) and highest
+  on D/E (≈ 100%), where low volume dominates. Re-derive it from
+  `benchmark_comparison.csv` and `model_metrics.csv` for the current run.
+
+### 7.4 What these results do not show
+
+- **BDM comparison is not valid** until issue 1 is resolved. Earlier win-rate
+  statistics against the BDM (including the Australian regression finding below)
+  were computed with the Amazon mismatch in place and should be treated as
+  directional only.
+- **No out-of-sample read yet for the latest forward forecast** — that needs
+  actuals for 2026-10 onward.
+- Sample sizes for the naive routes are small.
+
+---
+
+## 8. Operating model and failure modes
+
+| Aspect | Behaviour |
+|---|---|
+| **Cadence** | Monthly, after the upstream invoice refresh. `run_forecast_cycle.sh` = rebuild training table → `main.py --auto-window --require-roll --write-db`. |
+| **Atomicity** | The two inserts and the schema check share one transaction. A crash leaves the output tables untouched. The *training-table rebuild* is not atomic (DROP + SELECT INTO). |
+| **Append-only outputs** | Each run adds a `run_date` batch; `vw_forecast_output_latest` returns the newest. A bad batch is immediately "current". Roll back by deleting that `run_date` from both tables. |
+| **Re-run protection** | `--require-roll` stops the run (exit 3) when the newest complete month is not later than `config.TEST_END`. It compares against a *static* value — see issue 7. |
+| **Fail-fast** | Missing credentials, unreadable data, bad flag combinations and schema mismatch all stop the run with a distinct exit code before anything is written. |
+| **Staleness of inputs** | The month-completeness check stops a partial month becoming the anchor. If the upstream refresh did not happen, `--require-roll` exits 3 only while `config.TEST_END` is current; once it lags the data, the run proceeds and appends a duplicate batch (issue 7). |
+| **Manual step each month** | Bump `ACTIVE_SINCE`; verify the output with `database/diagnostics/forecast_output_checks.sql`. |
+| **Failure notifications** | None built in; use cron `MAILTO` or wrap the script in your monitoring. |
+| **Secrets** | Environment only. |
+
+---
+
+## 9. Open issues and challenges
+
+Ordered by how much they should influence a decision to rely on the numbers.
+"Decision" means a business/stakeholder call, not an engineering task.
+
+| # | Issue | Impact | Status / suggested next step |
+|---|---|---|---|
+| 1 | **BDM benchmark is not like-for-like.** The BDM sheet includes Amazon; the model's actuals and forecasts exclude it. Amazon is ≈ 24% of the Apr–Sep BDM plan (≈ 24.6k vs 76.1k non-Amazon units). `evaluation/benchmark.py` sums BDM across all codes with no Amazon filter. | Any "model vs BDM" claim is invalid; BDM wins are overstated | **Parked by decision** — Amazon and non-Amazon are treated as separate concerns. Fix: exclude Amazon BDM codes from the BDM leg, or add Amazon to the model scope. Meanwhile label the Power BI series "excl. Amazon" and never place it unfiltered beside the BDM measure. |
+| 2 | **Single-successor pooled families can forecast ~0 despite live demand** (seen on the Aura Ring family D35450 / E35450 / U35450, e.g. D35480 forecast ≈ 0 vs actuals of 12–40/month; ~5 of 52 single-successor pairings). The split-back assumes a single current code receives the whole family (`family_pool.py`, `len(current) == 1` branch). | Items appear to have stopped selling in Power BI | **Open and unverified in this version.** Run the near-zero / over-forecast item check before relying on pooled families; fix the single-successor assumption (e.g. reconcile with the old code's remaining sales). |
+| 3 | **24% of routed items get no forecast** (64 of 266): retired, short history, too few sale events, or Amazon-migrated. | Gaps in coverage; planners may read blank as zero | By design, with reasons. Surface the blocked list and reasons in Power BI so absence is not misread. |
+| 4 | **Under-forecast bias of ~10% overall; Naive-3mo −70%.** | Consistent shortfall against actuals | See issue 8 (stale training cut-off). Naive-3mo should be shown as low-confidence. |
+| 5 | **Phase 0 sign-offs pending with the client (Samir)**: (a) *Australia regression* — AU Prophet win-rate vs BDM was 30.5% (n = 59), the lowest region; hybrid routing already moved 40% of AU items off Prophet; the remainder are ~82% Erratic and carry about half the volume of non-AU items — a demand-pattern mismatch, not a data-sparsity problem; (b) *adaptive vs fixed seasonality* — untouched; (c) *benchmark-window alignment* — deliberately unchanged. | Methodology not formally signed off | Needs client decision. Note the AU win-rate carries the issue-1 caveat. |
+| 6 | **`CROSTON_MIN_OCCURRENCES = 10` is provisional.** It was reasoned for a Croston fit; the route is now arithmetic, which needs no such floor. | Possibly blocks items that a trailing average could serve, or admits ones it should not | Decide whether an occurrence floor belongs on the naive route at all. Lowering it is a scope change. |
+| 7 | **`--require-roll` compares to the static `config.TEST_END`.** After a successful cycle that value is not advanced, so re-running when the source data has not changed passes the gate and **appends a duplicate batch**. | Harmless to Power BI (same content, newer `run_date`) but pollutes history | Not built. Guard against the last `run_date`'s anchor in `forecast_output`, or bump `TEST_END` after each cycle. |
+| 8 | **Models are trained only to `TRAIN_END`, six months before the anchor; the forward forecast never sees the latest six months of actuals.** (Naive levels are anchored at `TRAIN_END` as well.) | Likely contributes to the low bias; forecast reacts late to recent shifts | Deliberate trade-off for honest holdout scoring. Option: after scoring, refit on all data to the anchor for the delivered forecast (a design change that needs its own validation). |
+| 9 | **Pooled-family naive averaging (~9–11 naive-routed items) is an accepted but unvalidated extrapolation.** Family splits rest on thin post-changeover history for some codes (equal-split fallback is flagged). | Item-level split of family totals can be wrong even if the total is right | Treat the family total as more reliable than its item split. |
+| 10 | **`ACTIVE_SINCE` is bumped by hand.** | Items that stopped selling stay in scope and get meaningless forecasts if forgotten | Auto-rolling active filter deferred. |
+| 11 | **Region of some SKUs is a resolved ambiguity** (BDM 'SW'). | Region-level reporting may mis-assign those SKUs | Confirm true region with the business before using the stored `region`. |
+| 12 | **"Rating N" is undefined**; **~34% of the wider master table has no Product Family** (mostly Australian A-prefix SKUs). | Reporting dimensions incomplete | Obtain definitions / backfill from the client. |
+| 13 | **Test-window scoring is uneven**: 24% of fitted items are scored on fewer than six months. `n_test_months` exists but is not surfaced as a reliability flag. | Single-item MAPEs can mislead | Report medians and WAPE; add a reliability flag. |
+| 14 | **Upstream dependencies are outside this repo**: the `INVOICES_TEMP` refresh (and its string-typed dates), and the successor map's upkeep. | A stale or malformed refresh degrades every forecast | Agree ownership and a completion signal; add a post-refresh date-parse check. |
+| 15 | **No automated test suite** and the training-table rebuild is not atomic. Some experiment scripts no longer run on current code. | Regressions rely on manual review and reconciliation | Add unit tests for `model_routing`, `family_pool` split-back and `month_completeness`; consider a swap-table build. |
+| 16 | **Naive bands are fixed empirical ratios, not prediction intervals.** | Intervals for Naive routes are not comparable to Prophet's | Present as indicative ranges only. |
+| 17 | **Seasonal peak accuracy** (Q4 ramp) is a known weak spot across methods in the sister Amazon workstream; not separately measured here. | Peak-season misses are the costliest | Measure peak-month error explicitly in the next review. |
+| 18 | **Credentials**: a database password has been present in earlier project history and must be rotated before production. | Security | Rotate; use a least-privilege login. |
+| 19 | **Cosmetic**: the routing report warns `model_metrics.csv not found` when run against a fresh per-run folder. A 2-unit June discrepancy in training-table reconciliation is uninvestigated. | None material | Low priority. |
+| 20 | **Amazon is not forecast here.** The Amazon forecast (Vendor Central sell-out, separate agents) needs a `channel` discriminator before the two can be merged into one output. | Total-company demand view is incomplete | Pending the Amazon workstream. |
+
+---
+
+## 10. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Item code** | A product SKU (prefix indicates region: D = UK, E = EU, U = USA, A = AU) |
+| **BDM** | Business Development Manager; a salesperson who owns accounts and produces a manual forecast |
+| **Anchor / `TEST_END`** | The newest complete month; every window is an offset from it |
+| **Successor family / `family_key`** | A retired code plus its replacement code(s), pooled for training |
+| **Product Family / `family`** | A reporting label from the master product table (unrelated to the above) |
+| **SBC / Syntetos-Boylan** | A four-way demand classification using ADI and CV² |
+| **ADI** | Average demand interval: months of tenure ÷ months with sales |
+| **CV²** | Squared coefficient of variation of non-zero monthly quantities |
+| **Sell-in / sell-out** | Units Daylight ships *to* Amazon / units Amazon sells to consumers |
+| **WAPE** | Σ\|actual − forecast\| ÷ Σ actual; volume-weighted error |
+| **MAPE** | Mean absolute percentage error; unstable at small quantities |
+| **Bias** | Σ(forecast − actual) ÷ Σ actual; negative = under-forecast |
+| **Rolling-origin CV** | Repeated forecast-then-score at successive cut-offs inside the training window |
+| **Blocked** | An item the pipeline deliberately does not forecast, with a recorded reason |
