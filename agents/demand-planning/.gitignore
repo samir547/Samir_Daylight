@@ -1,0 +1,58 @@
+# ── Credentials ───────────────────────────────────────────────────────────────
+.env
+
+# ── Python virtual environments ───────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Python bytecode / cache ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Pipeline outputs (generated, not source) ──────────────────────────────────
+output/
+
+# ── Jupyter / IPython ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS artefacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Data files (raw uploads, not source) ──────────────────────────────────────
+*.xlsx
+*.xls
+*.csv
+*.pbix
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Generated artefacts / local tooling ───────────────────────────────────────
+# Plots and one-off backups are regenerated / disposable; per-run CSVs already
+# fall under *.csv (and output/ above). The post_run_analysis.md reports stay
+# tracked on purpose.
+*.png
+*.bak
+.claude/
+# Dated manual run folders (archive locally, not source)
+output_*/

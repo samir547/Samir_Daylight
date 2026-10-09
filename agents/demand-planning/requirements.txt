@@ -1,0 +1,55 @@
+# Core forecasting
+prophet>=1.1.5          # pip install prophet  (pulls in cmdstanpy automatically)
+
+# Intermittent-demand estimators (Croston / SBA / TSB).
+# Used by analysis/croston_experiment.py only — nothing in the fitting path
+# imports it yet.
+#
+# Import `statsforecast.models` directly and fit on numpy arrays, NOT the
+# `StatsForecast` dataframe wrapper: the wrapper goes through `utilsforecast`,
+# which pins pandas<3.0.0, and this project runs pandas 3.x. The model classes
+# themselves touch no pandas at all, so the pin is irrelevant as long as the
+# wrapper is left alone. Installing statsforecast will try to downgrade pandas to
+# 2.x — reinstall pandas afterwards; the resolver warns but nothing breaks.
+statsforecast>=2.1.0
+
+# FFORMA time-series features (STL trend/seasonal strength, spectral entropy,
+# ACF, lumpiness, stability, spikiness).
+# Used by preprocessing/feature_extraction.py only — nothing in the fitting path
+# imports it, and nothing routes on its output.
+#
+# Its own feature functions are called PER SERIES rather than through the batch
+# `tsfeatures()` entry point. That is not a style preference: below two seasonal
+# periods these functions return FABRICATED numbers rather than NaN (trend and
+# seasonal strength saturate at 1.0 on white noise; lumpiness/stability return a
+# literal 0), and the batch call offers no way to gate or count that. See
+# FEATURE 1 in that module's docstring for the measured table.
+#
+# Pulls in numba, llvmlite, arch, antropy and supersmoother. Installs cleanly
+# against pandas 3.x / numpy 2.x — unlike statsforecast above, it has no
+# utilsforecast pin to work around.
+tsfeatures>=0.4.5
+
+# Autocorrelation at lags 2/3/6 (preprocessing/feature_extraction.py). Already
+# an indirect dependency of tsfeatures; pinned here because it is imported
+# directly.
+statsmodels>=0.14.0
+
+# Data & DB
+pandas>=2.0.0
+numpy>=1.24.0
+sqlalchemy>=2.0.0
+pyodbc>=5.0.0           # needs "ODBC Driver 17 for SQL Server" installed on the machine
+
+# Metrics & viz
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+
+# Windows note:
+# If prophet fails to install, first run:
+#   pip install pystan==2.19.1.1   (older Stan backend)
+# OR ensure C++ build tools are installed for cmdstanpy.

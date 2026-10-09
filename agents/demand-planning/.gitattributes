@@ -1,0 +1,3 @@
+# The cron wrapper runs under bash on the Linux VM; CRLF line endings (Git for
+# Windows' default autocrlf) would break it with "\r: command not found".
+*.sh text eol=lf
