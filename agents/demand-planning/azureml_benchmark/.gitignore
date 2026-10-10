@@ -1,0 +1,4 @@
+# Generated snapshots (data, parquet, MLTable) are reproducible from a run folder
+# + the code at the commit recorded in each snapshot's manifest.json.
+snapshots/
+results/
