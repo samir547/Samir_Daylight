@@ -160,6 +160,42 @@ How it differs from the sales and inventory reports:
 - **Reading P-levels:** P80 = Amazon estimates an 80% probability that demand will not exceed that many units that week. The report has no P-level request option - Amazon always returns mean, P70, P80 and P90 together. Use `--levels` (e.g. `--levels p80`, or `--levels p70,p90`) to keep only some of those columns in the CSV; the raw JSON always holds all of them.
 - **Unverified parser:** field names follow Amazon's documentation but have not yet been checked against a live response. Compare the first raw JSON with the CSV. The forecast horizon (number of weeks) is not stated on the report page, so confirm it from the first pull.
 
+## Loading into SQL Server (`ingest_to_db.py`, `sp_api_month_to_date.py`)
+
+Both report types land in `DAYHANSA_SQL1` (connection settings `DB_*` in `.env`):
+`dbo.Daylight_sales_report` and `dbo.Daylight_inventory_report`, same columns as
+the CSVs plus `period_status`, `source_file` and `loaded_at`.
+
+**One row per marketplace, ASIN and month** (primary key `marketplace, asin, start_date`).
+Every load is an upsert on that key, so re-running anything never creates duplicates.
+`period_status` is `final` for a whole closed month and `month_to_date` for the current
+month (then `end_date` is the last day included). Rows of a loaded month that the new
+data no longer contains are removed.
+
+```powershell
+python ingest_to_db.py                 # load every CSV in data/ (history, backfills)
+python sp_api_month_to_date.py         # fetch + load the current month to date - run daily
+```
+
+`sp_api_month_to_date.py`, on every run, for each marketplace with credentials:
+1. **Current month:** Amazon rejects MONTH reports for an open month (FATAL), so it
+   fetches DAY reports from the 1st to the latest published day and rolls them up:
+   sales fields are summed; inventory `net_received_*` is summed and stock levels
+   (sellable, unsellable, aged 90+, open PO) take the last day's value.
+   `sell_through_rate` / `unhealthy_*` aren't in daily reports and stay NULL until the
+   month closes. Verified against September 2026 (US): matches Amazon's monthly figures.
+2. **Previous month:** until its final figures are in the table, requests the MONTH
+   report (available ~72h after month end), which replaces the month-to-date row.
+
+Amazon publishes each day ~3 days late (2026-10-11: through 10-08). The script asks for
+today − 3 days and steps back if that day isn't ready. DAY requests are capped at
+15 days, so a month takes up to 3 requests. Each run also saves what it loaded to
+`output/month_to_date/<type>_<YYYYMMDD>.csv`. Exit code is 1 if any marketplace failed,
+and a marketplace/month that failed part-way is not loaded at all.
+
+The database connection on this network drops on some payloads, so loads go in
+200-row chunks, each retried smaller on a fresh connection if it drops.
+
 ## Diagnostic probes
 
 - `probe_lookback.py` - finds the earliest month `GET_VENDOR_SALES_REPORT` will actually return data for (US credentials). Confirmed 2023-09 as of 2026-09; re-run periodically since the window rolls forward.
