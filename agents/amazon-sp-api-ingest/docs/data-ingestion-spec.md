@@ -6,6 +6,7 @@
 |---|---|---|
 | 2026-10-15 | The weekly job now loads **weekly (WEEK) rows** for the previous and current month, plus the previous month's MONTH row once Amazon publishes it. Before this change only closed months were loaded. Both grains are kept (D8). Sums must never mix grains (D9). A run with nothing new is logged as `no_data` and is not a failure (D10). Scheduling moves to **bash and cron on Ubuntu**, Wednesdays (D11). Forecast rules restated (D12). New scope covers a weekly history backfill and moving the two tables loaded on 2026-10-11 to the spec names. Amazon facts about weekly reports are marked "to be confirmed by probe (T0)". Vivek's daily month-to-date approach (`sp_api_month_to_date.py`) is superseded. **Why:** the business needs the in-progress month without waiting for it to close, and the VM turned out to be Ubuntu. | Approved by Krishna. Samir sign-off pending. |
 | 2026-10-15 (b) | Clarifications before implementation. `no_data` now also covers a load that inserts and updates nothing (D10). The previous month's MONTH row is re-requested on every run while it is still the previous month, so restatements are caught (D1). A forecast pulled again under the same generation date is compared with the stored version: identical means "no new version", different means replace (D5, section 8.4). Safety constant renamed `MONTH_SAFETY_DAY`. Database settings use the `DB_*` names already used by the demand-planning agent (O6 closed). Backfill acceptance is now "at least 36 months ending Sep 2026"; the existing Sep 2023 rows are kept. | Approved by Krishna. Samir sign-off pending. |
+| 2026-10-15 (c) | Both weekly jobs move from **Wednesday to Thursday** (06:00 and 07:00 UTC, still one forecast run per week). **Why:** on Thursday the previous week is 5 days old instead of 4, which gives more margin on Amazon's publishing lag. Wednesday was an arbitrary choice. Whether a 5-day-old week is reliably available is confirmed by the probe (T0). | Approved by Krishna. Samir sign-off pending. |
 
 ## 1. Purpose
 
@@ -43,7 +44,7 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 | D8 | Both grains are kept | **New.** Closed months keep both their WEEK rows and their MONTH row. A week belongs to the month in which its **Saturday** falls. A straddling week (for example Sep 27 to Oct 3) belongs to October. Weekly and monthly totals for the same month will differ slightly. This is expected. |
 | D9 | Never sum across period types | **New.** `period_type` is `WEEK` or `MONTH`. `DAY` is not used. Consumers read through views that return one grain at a time (section 7.3). A plain `SUM` over the base tables double-counts. |
 | D10 | No-data behaviour | **New.** "Nothing new" means one of: no week in the window is closed yet; Amazon reports the period as not available; or the load inserts 0 rows and updates 0 rows. A run that only updated existing rows is `success`. If there is nothing new for a marketplace (for example the newest week is not yet published), the job logs it, writes an `amazon_ingest_run` row with status `no_data`, changes nothing, deletes nothing, and exits 0. Genuine errors still fail with exit code 1: authentication failure, a 4xx other than "not available", 429 or 5xx after retries, or a parse failure. The code must not treat every HTTP error as "not published yet". Genuine errors never become `no_data`. |
-| D11 | Schedule and platform | **New.** The VM is **Ubuntu 24.04** (UK South, `vm-daylight-agents-01`), time zone UTC. Bash wrapper scripts and cron, not PowerShell and Task Scheduler. Both jobs run on **Wednesday**. Same-day retry on failure. No Thursday forecast run. Details in section 9.5. PowerShell instructions remain only for developer machines (section 6 and Appendix B). |
+| D11 | Schedule and platform | **New.** The VM is **Ubuntu 24.04** (UK South, `vm-daylight-agents-01`), time zone UTC. Bash wrapper scripts and cron, not PowerShell and Task Scheduler. Both jobs run on **Thursday** (changed from Wednesday on 2026-10-15: the previous week is then 5 days old, not 4). Same-day retry on failure. One forecast run per week, no second run. Details in section 9.5. PowerShell instructions remain only for developer machines (section 6 and Appendix B). |
 | D12 | Forecast | **New.** Weekly, one run per week. Versioned by `(marketplace, selling_program, forecast_generation_date)`. Replace-on-duplicate (D5). Raw JSON archived. One-time import of the US 2026-09-27 snapshot. A missed week cannot be recovered, so the wrapper retries within the same day, and the stale-version check (latest generation date older than 9 days) is the alert. Details in section 8. |
 
 ## 4. Scope
@@ -89,7 +90,7 @@ Nothing below is assumed. Each item must be answered by the read-only probe (T0)
 | Item to confirm | Answer |
 |---|---|
 | Does the **inventory** report accept `reportPeriod = WEEK` for this account? | To be confirmed by probe (T0) |
-| Publishing lag: how many days after a Saturday is that week available? | To be confirmed by probe (T0) |
+| Publishing lag: how many days after a Saturday is that week available? Specifically, is a 5-day-old week available on a Thursday (this decides whether the Thursday schedule stands, or moves to Friday)? | To be confirmed by probe (T0) |
 | Maximum window per WEEK request (number of weeks) | To be confirmed by probe (T0) |
 | Weekly lookback limit (how far back WEEK rows can be requested) | To be confirmed by probe (T0) |
 | Is the weekly inventory snapshot taken at the start or the end of the week? | To be confirmed by probe (T0) |
@@ -494,7 +495,7 @@ On 2026-10-11 two tables were loaded with different names and columns: `dbo.Dayl
 
 ### 8.1 Behaviour
 
-- One run per week (Wednesday, section 9.5). Each run pulls Amazon's latest forecast for each marketplace and stores it as one **version**. A version is identified by `(marketplace, selling_program, forecast_generation_date)`.
+- One run per week (Thursday, section 9.5). Each run pulls Amazon's latest forecast for each marketplace and stores it as one **version**. A version is identified by `(marketplace, selling_program, forecast_generation_date)`.
 - History is **append-only**: a new generation date creates a new version and never touches old ones.
 - **Decision D5:** if the pulled generation date already exists, compare the downloaded content with the stored version. If identical, write nothing (section 8.4). If different, replace that version. In one transaction: find the existing run row, delete its weekly rows, update the header (`pulled_at`, counts, `report_last_updated`), insert the new weekly rows. The `forecast_run_id` stays the same. This is the only place rows are deleted, and only for the version being replaced.
 - Each version holds about 48 weeks x about 75 to 80 ASINs, which is roughly 3,500 to 4,000 rows per marketplace per run. At six marketplaces and 52 runs a year that is about 1.2 million rows a year (estimate). Keep all versions; no purge.
@@ -574,7 +575,7 @@ Other rules:
 - "Not available" must be recognised by Amazon's specific response for that case (to be confirmed by probe, T0). Any other error is a failure.
 - Dashboards show the in-progress month from the weekly views, labelled with `is_partial` and `loaded_through`.
 
-Worked example (run on Wednesday 2026-10-21, assuming the newest published Saturday is 2026-10-17):
+Worked example (run on Thursday 2026-10-22, assuming the week ending Saturday 2026-10-17, 5 days earlier, is published):
 
 | Request | Window |
 |---|---|
@@ -632,17 +633,17 @@ Use a dedicated SQL login for the VM job with rights only on the `amazon_*` tabl
 
 | Job | When (UTC) | Wrapper |
 |---|---|---|
-| Sales and inventory refresh | Wednesday 06:00 | `run_weekly_sales_inventory.sh` |
-| Forecast pull | Wednesday 07:00 | `run_weekly_forecast.sh` |
+| Sales and inventory refresh | Thursday 06:00 | `run_weekly_sales_inventory.sh` |
+| Forecast pull | Thursday 07:00 | `run_weekly_forecast.sh` |
 
-There is no Thursday forecast run. Each wrapper retries a failed run within the same day: up to 3 attempts, 15 minutes apart. Exit code `2` (nothing could run, for example missing credentials) is not retried. Replace-on-duplicate (D5) and the idempotent upsert make retries harmless.
+Thursday, not Wednesday, so that the previous week is 5 days old when the job runs. There is no second forecast run in the week. Each wrapper retries a failed run within the same day: up to 3 attempts, 15 minutes apart. Exit code `2` (nothing could run, for example missing credentials) is not retried. Replace-on-duplicate (D5) and the idempotent upsert make retries harmless.
 
 Crontab entries (`crontab -e` for the service account):
 
 ```
 # m h dom mon dow  command
-0 6 * * 3  /path/to/agents/amazon-sp-api-ingest/run_weekly_sales_inventory.sh >> /path/to/agents/amazon-sp-api-ingest/logs/cron.log 2>&1
-0 7 * * 3  /path/to/agents/amazon-sp-api-ingest/run_weekly_forecast.sh        >> /path/to/agents/amazon-sp-api-ingest/logs/cron.log 2>&1
+0 6 * * 4  /path/to/agents/amazon-sp-api-ingest/run_weekly_sales_inventory.sh >> /path/to/agents/amazon-sp-api-ingest/logs/cron.log 2>&1
+0 7 * * 4  /path/to/agents/amazon-sp-api-ingest/run_weekly_forecast.sh        >> /path/to/agents/amazon-sp-api-ingest/logs/cron.log 2>&1
 ```
 
 Sketch of the wrapper (one per job; the flag that selects the weekly window is set in T3):
@@ -692,7 +693,7 @@ Suggested split: Varun (database rights) takes T2, T4, T5, T8; Vivek takes T1, T
 | T4 | Build `db.py`: connection, run log (including `no_data`), sales/inventory `MERGE` loader for WEEK and MONTH rows (no deletes), forecast version loader. Replaces `ingest_to_db.py`. | T2 | Loading the same data twice gives `rows_inserted = 0` and `rows_updated = 0` the second time; no `DELETE` on fact tables |
 | T5 | Build `load_csv_to_db.py` and load the T1 CSVs; import the 2026-09-27 US forecast as version 1 | T1, T2, T4 | Table row counts equal CSV row counts per marketplace; spot-check values against the CSV |
 | T6 | Bash wrappers (`run_weekly_sales_inventory.sh`, `run_weekly_forecast.sh`) with `--sink db`, exit codes, same-day retry and logs (section 9.5) | T3, T4 | A manual run writes run rows and data for all marketplaces; a forced failure in one marketplace does not stop the others and returns exit code 1; a "nothing new" run writes `no_data` and returns 0 |
-| T7 | Schedule both jobs with cron on the Ubuntu VM and write the runbook (venv, unixODBC and ODBC Driver 18, firewall, crontab, how to re-run a marketplace, how to read the run log) | T6, VM access | Jobs ran unattended on at least two Wednesdays; runbook committed |
+| T7 | Schedule both jobs with cron on the Ubuntu VM and write the runbook (venv, unixODBC and ODBC Driver 18, firewall, crontab, how to re-run a marketplace, how to read the run log) | T6, VM access | Jobs ran unattended on at least two Thursdays; runbook committed |
 | T8 | Add the data quality checks and views (section 11); produce the unmapped ASIN report | T2, T5 | Checks run after each load and write findings to `message` in the run log |
 | T9 | Unit and integration tests (section 11.2) | T3, T4 | Tests pass in CI or locally with one command |
 | T10 | Update `README.md`, `.env.example`, `.gitignore`; fix README text that is now stale (including the month-to-date section) | all | A new developer can follow the README alone |
@@ -727,7 +728,7 @@ Git workflow: one feature branch and one pull request per task; no data files, `
 
 ## 12. Open items to confirm
 
-O1 (VM operating system: Ubuntu 24.04, D11), O4 (schedule day: Wednesday, D11) and O6 (database variable names: `DB_*`, section 9.4) are answered and removed.
+O1 (VM operating system: Ubuntu 24.04, D11), O4 (schedule day: Thursday, changed from Wednesday on 2026-10-15, D11) and O6 (database variable names: `DB_*`, section 9.4) are answered and removed.
 
 | # | Item | Default if not answered |
 |---|---|---|
@@ -741,7 +742,7 @@ O1 (VM operating system: Ubuntu 24.04, D11), O4 (schedule day: Wednesday, D11) a
 | O11 | Does Samir need exact calendar "month so far" figures? A straddling week cannot be split without daily data. The design keeps weeks as weeks (D8). | Weeks as weeks |
 | O12 | Samir sign-off on the 2026-10-15 revision | Pending |
 | O13 | Tolerance for the weekly versus monthly reconciliation (section 11.1) | Report only, no threshold |
-| O14 | The exact times for the Wednesday runs (section 9.5) | 06:00 and 07:00 UTC |
+| O14 | The exact times for the Thursday runs (section 9.5) | 06:00 and 07:00 UTC |
 
 ## Appendix A. Amazon constraints quick reference
 
