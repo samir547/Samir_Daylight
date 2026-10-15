@@ -9,12 +9,13 @@
 | 2026-10-15 (c) | Both weekly jobs move from **Wednesday to Thursday** (06:00 and 07:00 UTC, still one forecast run per week). **Why:** on Thursday the previous week is 5 days old instead of 4, which gives more margin on Amazon's publishing lag. Wednesday was an arbitrary choice. Whether a 5-day-old week is reliably available is confirmed by the probe (T0). | Approved by Krishna. Samir sign-off pending. |
 | 2026-10-15 (d) | Weekly window narrowed (D1, D8, section 9.1). Each run now pulls WEEK rows for the **current** month's weeks, plus a **completion** pull of only those previous-month weeks that are **not yet stored**. It no longer re-pulls the previous and the current month. The completion need is read from stored data, not from the date. Without a database (`--sink csv`, `--dry-run`), all previous-month weeks are assumed missing, and the output says so. Closed-month WEEK rows stay as last loaded. The MONTH row is the authoritative figure for a closed month. Requests are chunked to `WEEK_MAX_WINDOW_WEEKS`. Worked examples for 2026-10-22, 2026-11-05 and 2026-11-12. Planning logic in `week_plan.py` with unit tests. **Why:** the probe (T0) found that WEEK requests are limited to 7 weeks and about 7 weeks of lookback, and the old window reached 8 weeks and about 60 days back roughly once a month. | Approved by Krishna (option 1). Samir sign-off pending. |
 | 2026-10-15 (e) | Section 5 weekly table filled in from the probe (T0). Weekly lookback measured again (US, sales): **6 weeks before the newest published week**, `WEEK_LOOKBACK_WEEKS = 6`. This is a separate limit from the 7-week `WEEK_MAX_WINDOW_WEEKS`. Completion weeks older than the lookback are **skipped and logged** ("skipped, outside lookback"), never failed. A run with only skipped weeks is `no_data` (section 9.1, O15 resolved). "Not available" is now defined by Amazon's actual response; the other FATALs stay failures. Worked example for a catch-up on 2026-11-26. **Why:** a catch-up after missed runs, or a run without a database late in a month, would otherwise request a week Amazon refuses and fail the run. | Approved by Krishna (O15 decision). Samir sign-off pending. |
+| 2026-10-15 (f) | **Weekly history backfill removed** from scope, procedure, acceptance criteria, work breakdown (T12) and Appendix B. New section 6.3: weekly rows accumulate from go-live. Up to 3 consecutive missed Thursdays lose nothing; from 4, weeks can be lost for good. A new stale weekly-data check (newest WEEK row older than 13 days) must alert before that, and must also run independently of the load. Note that the weekly lookback was measured only on a Thursday, so manual runs on other days may behave differently (section 9.1, T7 runbook). `--lag-only` now also checks both lookback edges. **Why:** Amazon serves only about 6 weeks of weekly history, so a backfill cannot build anything the scheduled runs do not. | Approved by Krishna (Gate 1). Samir sign-off pending. |
 
 ## 1. Purpose
 
 Daylight sells to Amazon as a 1P vendor, so Amazon Vendor Central reports are the real sell-out and stock signal for the Amazon channel. Today three scripts pull those reports to CSV by hand. The goal of this phase is to:
 
-1. Pull the full available history once: 36 months of monthly data, and weekly data as far back as Amazon allows.
+1. Pull the full available monthly history once: 36 months. There is no weekly history backfill; weekly rows accumulate from go-live (section 6.3).
 2. Store everything in Azure SQL so other agents and Power BI can use it.
 3. Keep sales and inventory current automatically, weekly, including the month in progress (through weekly rows).
 4. Keep every weekly Amazon demand forecast as a separate version so forecast accuracy can be measured over time.
@@ -54,7 +55,6 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 **In scope**
 
 - Historical pull for sales and inventory (36 months, MONTH rows) and a first forecast pull, all six marketplaces.
-- **Weekly history backfill** (WEEK rows) for sales and inventory, as far back as Amazon's weekly lookback allows. Per the probe (T0) that is only 7 weeks: the newest published week plus 6 earlier.
 - Database tables, views and load logic for sales, inventory, forecast versions, and an ingest run log.
 - Weekly scheduled refresh of sales and inventory, including **WEEK rows for the current month, plus any missing weeks of the previous month** (D1).
 - Weekly scheduled, versioned forecast load.
@@ -67,6 +67,7 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 - Azure Key Vault and managed identity.
 - Power BI datasets and dashboards.
 - Changes to the `amazon-demand-forecast` agent.
+- A weekly (WEEK) history backfill. Amazon only serves about 6 weeks back (section 5), so weekly rows start at go-live (section 6.3).
 - Row-level history of restated values (we log how many rows changed per run, nothing more).
 
 ## 5. Amazon API facts the design depends on
@@ -115,7 +116,7 @@ Data observations from existing files:
 
 ### 6.1 What it delivers
 
-CSV files for sales and inventory, covering the last 36 closed months (MONTH rows) and the available weekly history (WEEK rows) for each of the six marketplaces, plus one forecast snapshot per marketplace. These CSVs are used to validate the data and then load the database (requirement 2). CSVs and raw JSON are git-ignored and are never committed.
+CSV files for sales and inventory, covering the last 36 closed months (MONTH rows) for each of the six marketplaces, plus one forecast snapshot per marketplace. These CSVs are used to validate the data and then load the database (requirement 2). CSVs and raw JSON are git-ignored and are never committed.
 
 ### 6.2 Procedure — monthly history (developer machine, Windows PowerShell)
 
@@ -143,16 +144,13 @@ These commands are for a developer's Windows machine. The VM uses bash (section 
    ```
    Quote `--out` so PowerShell does not interpret `{mp}`. The `{mp}` placeholder produces one CSV per marketplace.
 
-### 6.3 Procedure — weekly history (developer machine, Windows PowerShell)
+### 6.3 Weekly rows: no history backfill
 
-This runs after the probe (T0) has answered the weekly questions in section 5. It mirrors the monthly procedure.
+There is **no weekly history backfill**. Amazon serves WEEK rows only back to 6 weeks before the newest published week (section 5), so there is no weekly history worth backfilling.
 
-- **Window:** as far back as the weekly lookback allows: the newest published week and the 6 before it (`WEEK_LOOKBACK_WEEKS = 6`), 7 weeks in all.
-- **Chunk size:** `WEEK_MAX_WINDOW_WEEKS = 7`, so the whole window is one request per report per marketplace.
-- Steps 1 to 4 are the same as section 6.2.
-- Run the sales and inventory scripts with the weekly option (Proposed flag `--period WEEK`; exact flags to be set in T3) and write to separate files, for example `output/daylight_sales_report_week_{mp}.csv` and `output/daylight_inventory_report_week_{mp}.csv`.
-- If the inventory report does not accept WEEK for this account (probe answer), the weekly history is sales only. Record this in section 5.
-- Failure handling is the same as section 6.5: re-run only the failed marketplace. If the oldest chunk fails, shorten the window by one chunk.
+- **Weekly rows accumulate from go-live.** The first scheduled run loads the current month's published weeks, plus any previous-month weeks still inside the lookback (section 9.1). From then on, each Thursday adds one week. Earlier periods exist only as MONTH rows.
+- **Missed runs can permanently lose weeks.** A run that catches up after up to 3 missed Thursdays loses nothing. From **4 consecutive missed Thursdays** a week can be lost. This happens when the last good run was the last Thursday of a month and every Thursday of the next month is missed, because completion only looks at the previous month (section 9.1). From 7 missed Thursdays, weeks are always lost, because they fall outside Amazon's lookback. A lost week cannot be recovered from Amazon. The MONTH row still covers that month.
+- **The stale-data check must alert well before that.** It alerts if a marketplace's newest stored WEEK row is more than 13 days old (Appendix C, section 11.1). That is one missed Thursday after the same-day retries, leaving about three weeks to fix the job before anything is lost.
 
 ### 6.4 What to expect (monthly history)
 
@@ -173,7 +171,6 @@ For each of the 6 marketplaces and for each of sales and inventory:
 
 - CSV exists, no `MISSING` warning.
 - Monthly: **at least 36 distinct months, ending Sep 2026**, and one `ALL` row per month.
-- Weekly: every week in the backfill window is present, with no gaps: 7 weeks, each with one `ALL` row.
 - Currency is the expected one (US USD, UK GBP, others EUR) on every row.
 - Spot-check two months of the `ALL` row (`shipped_units`, `shipped_revenue`) against Vendor Central's Business Reports UI. Small differences are possible because of the Pacific-time boundary. Anything larger than about 1% needs investigation.
 - One forecast snapshot per marketplace with 48 distinct `weeks_ahead` values per ASIN. UK and the four EU marketplaces have never run the forecast report. Compare the first raw JSON with the CSV before trusting it, as was done for US.
@@ -579,6 +576,7 @@ Other rules:
 - Re-running is always safe (idempotent upsert, no deletes).
 - "Not available" is recognised only by Amazon's specific response (section 5): processing status `FATAL` **and** `errorDetails` containing "The report data for the requested date range is not yet available". Any other error is a failure. That includes the other FATALs: "maximum length" (a window over `WEEK_MAX_WINDOW_WEEKS`) and "prohibited date range" (a week past the lookback the planner failed to clamp, or misaligned dates). It also includes authentication errors, other 4xx responses, and 429/5xx after retries.
 - Dashboards show the in-progress month from the weekly views, labelled with `is_partial` and `loaded_through`.
+- **The weekly lookback was measured only on a Thursday** (2026-10-15). It is unknown whether Amazon counts the 6 weeks from the newest published week, as the planner assumes, or as days back from today. On a Thursday the two give the same answer. A **manual run on another day may behave differently**: the oldest completion week could be refused as a "prohibited date range" (a `failed` run), even though the planner thought it was inside the lookback. If that happens, re-run on a Thursday. `probe_weekly_reports.py --lag-only` checks both lookback edges and can be run on any day to find out.
 
 Worked examples. They assume every earlier Thursday run succeeded and every week whose Saturday is at least 5 days old is published. Saturdays in October 2026 are 3, 10, 17, 24 and 31 (five); in November 7, 14, 21 and 28.
 
@@ -712,13 +710,13 @@ exit 1
 
 Rules for both wrappers: logs go under `logs/`; any failure gives a non-zero exit code; a run is stopped after 3 hours; a lock prevents two copies running at once. Add `logs/` and `archive/` to `.gitignore`.
 
-Alerting for this phase: the run table, the wrapper's exit code in `logs/cron.log`, and the stale-forecast query. Cron has no built-in failure status, so a notification channel (email or Teams webhook) is an open item (O3).
+Alerting for this phase: the run table, the wrapper's exit code in `logs/cron.log`, the stale-forecast query, and the stale weekly-data query (section 6.3). Cron has no built-in failure status, so a notification channel (email or Teams webhook) is an open item (O3).
 
 ---
 
 ## 10. Work breakdown
 
-Suggested split: Varun (database rights) takes T2, T4, T5, T8; Vivek takes T1, T3, T6, T7; T9 and T10 shared. T0, T11 and T12 to be assigned. Adjust as you see fit.
+Suggested split: Varun (database rights) takes T2, T4, T5, T8; Vivek takes T1, T3, T6, T7; T9 and T10 shared. T0 and T11 to be assigned. Adjust as you see fit.
 
 **Retired code.** Vivek's `sp_api_month_to_date.py` is retired; the daily approach is superseded by D1. `ingest_to_db.py` is to be rewritten to the spec loader (section 7.5): no `ensure_table` (DDL is run by hand), no deletes, no commits every 200 rows (one transaction per marketplace).
 
@@ -731,12 +729,11 @@ Suggested split: Varun (database rights) takes T2, T4, T5, T8; Vivek takes T1, T
 | T4 | Build `db.py`: connection, run log (including `no_data`), sales/inventory `MERGE` loader for WEEK and MONTH rows (no deletes), forecast version loader. Replaces `ingest_to_db.py`. | T2 | Loading the same data twice gives `rows_inserted = 0` and `rows_updated = 0` the second time; no `DELETE` on fact tables |
 | T5 | Build `load_csv_to_db.py` and load the T1 CSVs; import the 2026-09-27 US forecast as version 1 | T1, T2, T4 | Table row counts equal CSV row counts per marketplace; spot-check values against the CSV |
 | T6 | Bash wrappers (`run_weekly_sales_inventory.sh`, `run_weekly_forecast.sh`) with `--sink db`, exit codes, same-day retry and logs (section 9.5) | T3, T4 | A manual run writes run rows and data for all marketplaces; a forced failure in one marketplace does not stop the others and returns exit code 1; a "nothing new" run writes `no_data` and returns 0 |
-| T7 | Schedule both jobs with cron on the Ubuntu VM and write the runbook (venv, unixODBC and ODBC Driver 18, firewall, crontab, how to re-run a marketplace, how to read the run log) | T6, VM access | Jobs ran unattended on at least two Thursdays; runbook committed |
+| T7 | Schedule both jobs with cron on the Ubuntu VM and write the runbook (venv, unixODBC and ODBC Driver 18, firewall, crontab, how to re-run a marketplace, how to read the run log, the weekly stale-data alert and the 4-missed-Thursdays loss risk in section 6.3, and the note that the weekly lookback was measured only on a Thursday, so a manual run on another day may behave differently; section 9.1) | T6, VM access | Jobs ran unattended on at least two Thursdays; runbook committed |
 | T8 | Add the data quality checks and views (section 11); produce the unmapped ASIN report | T2, T5 | Checks run after each load and write findings to `message` in the run log |
 | T9 | Unit and integration tests (section 11.2) | T3, T4 | Tests pass in CI or locally with one command |
 | T10 | Update `README.md`, `.env.example`, `.gitignore`; fix README text that is now stale (including the month-to-date section) | all | A new developer can follow the README alone |
 | T11 | **Migrate the 2026-10-11 tables** (section 7.6): confirm no readers, back up, create spec tables by hand, reload, compare coverage | T2, T5 | Backup exists with matching row counts; readers confirmed; coverage check explained; old tables dropped only after sign-off |
-| T12 | **Weekly history backfill** (section 6.3) and load | T0, T3, T4 | Weekly coverage criteria in section 6.6 met; WEEK rows loaded for all marketplaces where Amazon supports them |
 
 Git workflow: one feature branch and one pull request per task; no data files, `.env` or logs committed (check `git status` before every commit).
 
@@ -752,7 +749,7 @@ Git workflow: one feature branch and one pull request per task; no data files, `
 - **Weekly versus monthly (informational):** for each closed month, compare the sum of WEEK `shipped_units` (weeks whose Saturday is in that month) with the MONTH row. Report the difference against a tolerance (value to be agreed; differences are expected, D8). Never fail the load on this.
 - **NULL profile:** count NULLs per inventory field, per marketplace and per period type, so gaps like DE Sep 2023 to Feb 2024 are visible.
 - **Forecast:** the checks in section 8.3.
-- **Freshness:** the stale-version query (Appendix C).
+- **Freshness:** the stale-version query for the forecast, and the stale weekly-data query for sales and inventory (Appendix C): newest WEEK `period_end` per marketplace older than 13 days. Section 6.3 explains why the weekly check must alert early. It must **also run independently of the load**, for example at the start of every scheduled job, because a job that does not run never reaches its post-load checks.
 
 ### 11.2 Tests
 
@@ -802,10 +799,6 @@ New-Item -ItemType Directory -Force output | Out-Null
 python sp_api_sales_report.py     --months 36 --marketplaces US,UK,DE,FR,IT,ES --out "output/daylight_sales_report_{mp}.csv"
 python sp_api_inventory_report.py --months 36 --marketplaces US,UK,DE,FR,IT,ES --out "output/daylight_inventory_report_{mp}.csv"
 python sp_api_forecast_report.py  --marketplaces US,UK,DE,FR,IT,ES --out-dir output/forecast_snapshots
-
-# Weekly history (after T0 and T3; flags and window to be set then)
-# python sp_api_sales_report.py     --period WEEK ... --out "output/daylight_sales_report_week_{mp}.csv"
-# python sp_api_inventory_report.py --period WEEK ... --out "output/daylight_inventory_report_week_{mp}.csv"
 ```
 
 ## Appendix C. Useful queries
@@ -853,6 +846,18 @@ SELECT marketplace, MAX(forecast_generation_date) AS latest_generation,
 FROM dbo.amazon_forecast_run
 GROUP BY marketplace
 HAVING DATEDIFF(day, MAX(forecast_generation_date), CAST(SYSUTCDATETIME() AS date)) > 9;
+
+-- Stale weekly data: newest WEEK row older than 13 days (one missed Thursday). Section 6.3:
+-- from 4 missed Thursdays weeks can be lost permanently, so this must alert early.
+SELECT 'sales' AS report, marketplace, MAX(period_end) AS newest_week_end,
+       DATEDIFF(day, MAX(period_end), CAST(SYSUTCDATETIME() AS date)) AS age_days
+FROM dbo.amazon_vendor_sales WHERE period_type = 'WEEK' GROUP BY marketplace
+HAVING DATEDIFF(day, MAX(period_end), CAST(SYSUTCDATETIME() AS date)) > 13
+UNION ALL
+SELECT 'inventory', marketplace, MAX(period_end),
+       DATEDIFF(day, MAX(period_end), CAST(SYSUTCDATETIME() AS date))
+FROM dbo.amazon_vendor_inventory WHERE period_type = 'WEEK' GROUP BY marketplace
+HAVING DATEDIFF(day, MAX(period_end), CAST(SYSUTCDATETIME() AS date)) > 13;
 
 -- How one week's forecast changed across versions
 SELECT version_no, forecast_generation_date, weeks_ahead, mean_units, p80_units

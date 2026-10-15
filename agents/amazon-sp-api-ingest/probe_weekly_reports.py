@@ -24,6 +24,13 @@ number of report requests small):
 Run (venv activated, in this folder):
     python probe_weekly_reports.py                 # US
     python probe_weekly_reports.py --marketplace DE
+    python probe_weekly_reports.py --lag-only      # newest week + the two lookback edges
+
+--lag-only also requests the single sales week WEEK_LOOKBACK_WEEKS back (expected
+DONE) and one week further (expected refused, "prohibited date range"), both
+counted from week_plan.latest_published_saturday(today). The lookback was only
+measured on a Thursday; running this on another day shows whether Amazon counts
+from the newest week (as week_plan assumes) or in days from today.
 """
 from __future__ import annotations
 
@@ -37,6 +44,7 @@ from pathlib import Path
 import requests
 
 import sp_api_sales_report as spapi
+import week_plan
 
 HERE = Path(__file__).parent
 SALES = "GET_VENDOR_SALES_REPORT"
@@ -306,15 +314,44 @@ def newest_week_verdict(today: date, sat: date, findings: dict) -> dict:
             "sales": sales, "inventory": inv, "verdict": verdict}
 
 
+def lookback_edges(p: Probe, today: date) -> dict:
+    """Request the single sales week WEEK_LOOKBACK_WEEKS before the newest published
+    Saturday (expected DONE) and the week before that (expected refused), as
+    week_plan computes them, and print both results."""
+    newest = week_plan.latest_published_saturday(today)
+    edges = []
+    for age, expected in ((week_plan.WEEK_LOOKBACK_WEEKS, "DONE"),
+                          (week_plan.WEEK_LOOKBACK_WEEKS + 1, "FATAL")):
+        s = newest - timedelta(days=7 * age)
+        r = p.run(f"b_sales_lookback_{age}w_{s}", SALES, "WEEK", s - timedelta(days=6), s)
+        refused_for_lookback = "prohibited date range" in (r.get("error") or "")
+        ok = r["outcome"] == expected and (expected == "DONE" or refused_for_lookback)
+        edges.append({"weeks_back": age, "week": [(s - timedelta(days=6)).isoformat(), s.isoformat()],
+                      "expected": "DONE" if expected == "DONE" else "FATAL (prohibited date range)",
+                      "outcome": r["outcome"], "as_expected": ok, "error": r.get("error")})
+    all_ok = all(e["as_expected"] for e in edges)
+    print(f"\nLookback edges ({today:%A}, counted from newest published Saturday {newest}):")
+    for e in edges:
+        print(f"  {e['weeks_back']} weeks back {e['week'][0]}..{e['week'][1]}: {e['outcome']} "
+              f"(expected {e['expected']}) {'OK' if e['as_expected'] else 'MISMATCH'}")
+    print("  Lookback is where week_plan expects it." if all_ok else
+          "  MISMATCH: the lookback is not where week_plan expects it on this day. "
+          "Check WEEK_LOOKBACK_WEEKS before relying on runs on this weekday.")
+    return {"weekday": today.strftime("%A"), "newest_published_saturday": newest.isoformat(),
+            "edges": edges, "as_expected": all_ok}
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--marketplace", default="US", help="One marketplace code (default US)")
     parser.add_argument("--lag-only", action="store_true",
-                        help="Only check the newest closed weeks for sales and inventory (2 to 6 requests): "
-                             "does WEEK work, and is the newest week available yet. Run it on a Thursday "
-                             "to re-check the schedule, or on another marketplace for a quick WEEK-support check.")
+                        help="Only check the newest closed weeks for sales and inventory, plus the two "
+                             "sales lookback edges (4 to 8 requests): does WEEK work, is the newest week "
+                             "available yet, and is the lookback where week_plan expects it. Run it on a "
+                             "Thursday at 06:00 UTC to re-check the schedule, or on another marketplace "
+                             "for a quick WEEK-support check.")
     parser.add_argument("--max-lookback-probes", type=int, default=4,
                         help="Extra single-week requests to narrow the lookback boundary (default 4)")
     args = parser.parse_args()
@@ -347,6 +384,7 @@ def main() -> int:
     findings["b_newest_week_check"] = newest_week_verdict(today, sat, findings)
     print(f"\nNewest closed week: {findings['b_newest_week_check']['verdict']}\n")
     if args.lag_only:
+        findings["b_lookback_edges"] = lookback_edges(p, today)
         return finish(p, findings, out_dir)
     if SALES not in newest:
         print("No WEEK sales report succeeded for the last 3 closed weeks - stopping here.")
