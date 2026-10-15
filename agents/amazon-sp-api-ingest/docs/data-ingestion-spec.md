@@ -11,6 +11,7 @@
 | 2026-10-15 (e) | Section 5 weekly table filled in from the probe (T0). Weekly lookback measured again (US, sales): **6 weeks before the newest published week**, `WEEK_LOOKBACK_WEEKS = 6`. This is a separate limit from the 7-week `WEEK_MAX_WINDOW_WEEKS`. Completion weeks older than the lookback are **skipped and logged** ("skipped, outside lookback"), never failed. A run with only skipped weeks is `no_data` (section 9.1, O15 resolved). "Not available" is now defined by Amazon's actual response; the other FATALs stay failures. Worked example for a catch-up on 2026-11-26. **Why:** a catch-up after missed runs, or a run without a database late in a month, would otherwise request a week Amazon refuses and fail the run. | Approved by Krishna (O15 decision). Samir sign-off pending. |
 | 2026-10-15 (f) | **Weekly history backfill removed** from scope, procedure, acceptance criteria, work breakdown (T12) and Appendix B. New section 6.3: weekly rows accumulate from go-live. Up to 3 consecutive missed Thursdays lose nothing; from 4, weeks can be lost for good. A new stale weekly-data check (newest WEEK row older than 13 days) must alert before that, and must also run independently of the load. Note that the weekly lookback was measured only on a Thursday, so manual runs on other days may behave differently (section 9.1, T7 runbook). `--lag-only` now also checks both lookback edges. **Why:** Amazon serves only about 6 weeks of weekly history, so a backfill cannot build anything the scheduled runs do not. | Approved by Krishna (Gate 1). Samir sign-off pending. |
 | 2026-10-15 (g) | **Catch-up widened** (D1, sections 6.3 and 9.1). A completion week is now **any** published week inside `WEEK_LOOKBACK_WEEKS` that is not yet stored, whatever month it is in. Before, only previous-month weeks were checked. Current-month weeks are still re-pulled every run, and the MONTH row rule is unchanged. Without a database, every week inside the lookback is assumed missing, and the output says so. A missing week is skipped (logged as "skipped, outside lookback") only when it lies between the newest stored week and the lookback edge. Up to **6** consecutive missed Thursdays now lose nothing; from 7 they do. Section 7.3 now points to the committed scripts `sql/001` to `sql/007` instead of carrying proposed DDL. `amazon_ingest_run.status` gets a CHECK constraint that includes `no_data`. Section 7.6: the spec tables are loaded **only** from the validated monthly CSVs (`load_csv_to_db.py`, as `period_type = 'MONTH'`). Rows are never copied from the old `Daylight_*` tables or their backups, because these hold month-to-date roll-ups labelled final. The only exception is the fallback `sql/008`, which copies only whole months closed at least `MONTH_SAFETY_DAY` days before the row was loaded. New check 3b in `sql/007` lists the suspect rows. **Why:** with the previous-month-only rule, 4 missed Thursdays could lose a week that Amazon still serves. | Requested by Krishna (Gate 2 feedback). Samir sign-off pending. |
+| 2026-10-15 (h) | **UK monthly backfill added** to section 6.2, 6.4 and Appendix B (`--months 36`, Oct 2023 to Sep 2026 with the day-5 margin). **UK was never loaded before**: the 2026-10-11 tables have no UK rows (Gate 2, `sql/007`). Section 6.6 records the Gate 2 coverage findings. The validated CSVs for US, DE, FR, IT and ES end at Aug 2026, so Sep 2026 comes from the first weekly run in October (its MONTH row), or from a one-month backfill if go-live slips into November. New post-load check in section 11.1: every marketplace has at least 36 distinct months, and any marketplace whose last month is before the last closed month is reported. Load step uses `load_csv_to_db.py`, which lists the files and month ranges and writes nothing without `--load`. | Requested by Krishna (Gate 2 passed). Samir sign-off pending. |
 
 ## 1. Purpose
 
@@ -31,7 +32,7 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 - Credentials come from `.env`, one refresh token per marketplace (see README, "Credentials per marketplace").
 - Marketplaces: **US, UK, DE, FR, IT, ES**. US, DE, FR, IT and ES share one Amazon app. UK has its own app.
 - Reports use `distributorView: MANUFACTURING`, `sellingProgram: RETAIL`, `reportPeriod: MONTH` (sales and inventory). This revision adds `reportPeriod: WEEK`.
-- Status of marketplaces: US, DE, FR, IT, ES have produced sales and inventory CSVs. UK is proven for one month only (Aug 2026). The forecast report has been run for US only (generation date 2026-09-27, 48 weeks).
+- Status of marketplaces: US, DE, FR, IT, ES have produced sales and inventory CSVs, validated, covering Sep 2023 to Aug 2026 (36 months each). UK is proven for one month only (Aug 2026) and has **never been loaded** into the database (no UK rows in the 2026-10-11 tables, Gate 2). The forecast report has been run for US only (generation date 2026-09-27, 48 weeks).
 - Existing table in the target database: `dbo.amazon_asin_sku_map` (columns `asin`, `market`, `product_code`, `family`, `product_description`, `loaded_at`). It maps an Amazon ASIN to Daylight's product code per marketplace. Example: ASIN `B002ZOEVEA` maps to `E53047` in DE and ES and `D53047` in UK.
 
 ## 3. Decisions already made
@@ -144,6 +145,18 @@ These commands are for a developer's Windows machine. The VM uses bash (section 
    python sp_api_forecast_report.py  --marketplaces US,UK,DE,FR,IT,ES --out-dir output/forecast_snapshots
    ```
    Quote `--out` so PowerShell does not interpret `{mp}`. The `{mp}` placeholder produces one CSV per marketplace.
+6. **UK monthly backfill.** UK has never been loaded (section 2). If the run in step 5 was not done for UK, run it for UK alone, sales and inventory. Run it after day 5 of the month (UTC): the day-5 margin (section 9.2) then makes `--months 36` end on the previous month. Run in October 2026, it requests **Oct 2023 to Sep 2026** in three chunks.
+   ```powershell
+   python sp_api_sales_report.py     --months 36 --marketplaces UK --out "output/daylight_sales_report_{mp}.csv"
+   python sp_api_inventory_report.py --months 36 --marketplaces UK --out "output/daylight_inventory_report_{mp}.csv"
+   ```
+   `--dry-run` first shows the three requested chunks without calling Amazon. The UK uses its own app (`SPAPI_CLIENT_ID_UK`, `SPAPI_CLIENT_SECRET_UK`, `SPAPI_REFRESH_TOKEN_UK`).
+7. **Load the CSVs** (section 7.6 step 4). First list and validate: this shows every file found, its marketplace, row count and first..last month, and writes nothing. Then load with `--load`:
+   ```powershell
+   python load_csv_to_db.py --csv-dir output
+   python load_csv_to_db.py --csv-dir output --load
+   ```
+   Every row is loaded as `period_type = 'MONTH'` after a whole-month check. Re-loading the same files changes nothing (0 inserted, 0 updated). After the load the script prints the month coverage per marketplace (section 11.1).
 
 ### 6.3 Weekly rows: no history backfill
 
@@ -157,6 +170,7 @@ There is **no weekly history backfill**. Amazon serves WEEK rows only back to 6 
 
 - As of 2026-10-06 the last closed month is September 2026, so `--months 36` covers **October 2023 to September 2026**, requested as three chunks: Oct 2023 to Dec 2024, Jan 2025 to Mar 2026, Apr 2026 to Sep 2026.
 - Request count: 6 marketplaces x 3 chunks x 2 reports = 36 report requests for sales and inventory, plus 6 for the forecast. The run is sequential. Allow one to two hours and keep the terminal open.
+- **UK alone** (step 6), run in October 2026 after day 5: **Oct 2023 to Sep 2026**, 3 chunks per report, 6 requests. Run on day 1 to 5 of a month, it ends one month earlier.
 - Raw JSON files (`raw_report_*.json`, `raw_inventory_*.json`) appear in the working folder. They are git-ignored and useful for debugging.
 
 ### 6.5 Failure handling
@@ -176,7 +190,14 @@ For each of the 6 marketplaces and for each of sales and inventory:
 - Spot-check two months of the `ALL` row (`shipped_units`, `shipped_revenue`) against Vendor Central's Business Reports UI. Small differences are possible because of the Pacific-time boundary. Anything larger than about 1% needs investigation.
 - One forecast snapshot per marketplace with 48 distinct `weeks_ahead` values per ASIN. UK and the four EU marketplaces have never run the forecast report. Compare the first raw JSON with the CSV before trusting it, as was done for US.
 
-**Known difference.** The rows already in the database (loaded 2026-10-11) start at **2023-09-01 for DE**, one month earlier than a pull made today would reach. The likely reason (unverified): the backfill ran in September 2026 with `--start-month 2023-09`, when Sep 2023 was still inside Amazon's lookback. **The Sep 2023 rows are kept; rows are never deleted.** Run the check below per marketplace. It shows the first and last month and the month count. Any marketplace with fewer than 36 months, or not ending Sep 2026, must be explained in writing or reloaded.
+**Known differences (Gate 2, `sql/007` on the 2026-10-11 tables).** These tables have **no UK rows at all**. DE, ES, FR and IT run from Sep 2023 to **Aug 2026** (36 months). US runs from Sep 2023 to **Sep 2026** (37 months). The only month-to-date rows are US, 2026-10-01 to 10-08 (50 sales and 63 inventory rows). Check 3b found no suspect "final" rows. None of these rows are copied (section 7.6).
+
+The validated CSVs to be loaded (US, DE, FR, IT, ES) all cover **Sep 2023 to Aug 2026**. The Sep 2023 rows are kept, because rows are never deleted. After the load, **every one of these five marketplaces, US included, ends at Aug 2026**: the US Sep 2026 row in the old table did not come from these CSVs. The post-load coverage check (section 11.1) will report them as behind the last closed month (Sep 2026) until one of these fills Sep 2026:
+
+- the **first weekly run in October 2026** (after day 5), which requests the previous month's MONTH row, Sep 2026, for every marketplace; or
+- if go-live slips into November or later, a short monthly backfill, because the weekly job then only requests the newer previous month: `--start-month 2026-09 --sink db` for each report (Sep 2026 through the last closed month).
+
+UK, after step 6, is expected to cover **Oct 2023 to Sep 2026**. Run the check below per marketplace. Any marketplace with fewer than 36 months, or not ending at the last closed month, must be explained in writing or reloaded.
 
 ```sql
 -- Monthly coverage per marketplace (run on the old table now, and on the new table after T5)
@@ -614,6 +635,7 @@ Git workflow: one feature branch and one pull request per task; no data files, `
 - **Weekly versus monthly (informational):** for each closed month, compare the sum of WEEK `shipped_units` (weeks whose Saturday is in that month) with the MONTH row. Report the difference against a tolerance (value to be agreed; differences are expected, D8). Never fail the load on this.
 - **NULL profile:** count NULLs per inventory field, per marketplace and per period type, so gaps like DE Sep 2023 to Feb 2024 are visible.
 - **Forecast:** the checks in section 8.3.
+- **Month coverage (post-load):** for each marketplace and report, count the distinct MONTH months. Report any marketplace with **fewer than 36**, and any whose **last month is before the last closed month** (the previous month, or the one before on day 1 to `MONTH_SAFETY_DAY`). Marketplaces with no MONTH rows at all (UK before its backfill) are listed too. This is expected for DE, ES, FR and IT (and US) until the first weekly run fills Sep 2026 (section 6.6). It runs after every load, for the loaded marketplace, and `load_csv_to_db.py` prints it for all six marketplaces.
 - **Freshness:** the stale-version query for the forecast, and the stale weekly-data query for sales and inventory (Appendix C): newest WEEK `period_end` per marketplace older than 13 days. Section 6.3 explains why the weekly check must alert early. It must **also run independently of the load**, for example at the start of every scheduled job, because a job that does not run never reaches its post-load checks.
 
 ### 11.2 Tests
@@ -664,6 +686,17 @@ New-Item -ItemType Directory -Force output | Out-Null
 python sp_api_sales_report.py     --months 36 --marketplaces US,UK,DE,FR,IT,ES --out "output/daylight_sales_report_{mp}.csv"
 python sp_api_inventory_report.py --months 36 --marketplaces US,UK,DE,FR,IT,ES --out "output/daylight_inventory_report_{mp}.csv"
 python sp_api_forecast_report.py  --marketplaces US,UK,DE,FR,IT,ES --out-dir output/forecast_snapshots
+
+# UK only (never loaded before; run after day 5 of the month: Oct 2023 to Sep 2026 when run in October 2026)
+python sp_api_sales_report.py     --months 36 --marketplaces UK --out "output/daylight_sales_report_{mp}.csv"
+python sp_api_inventory_report.py --months 36 --marketplaces UK --out "output/daylight_inventory_report_{mp}.csv"
+
+# Load: list and validate first (writes nothing), then load
+python load_csv_to_db.py --csv-dir output
+python load_csv_to_db.py --csv-dir output --load
+
+# One-time import of the US forecast snapshot (section 8.6)
+python load_csv_to_db.py --forecast-json "<path>aw_forecast_US_20260927.json" --marketplace US --load
 ```
 
 ## Appendix C. Useful queries
