@@ -7,12 +7,15 @@ scripts (to be folded into sp_api_common.py in T3).
 
   - WEEK rows for every week whose Saturday falls in the CURRENT month and is
     published (re-pulled every run, to catch restatements).
-  - "Completion" WEEK rows: weeks whose Saturday falls in the PREVIOUS month,
-    are published, and are not yet stored. Decided from stored data, not from
-    the date. Without a database to ask (--sink csv, --dry-run) all of them
-    are assumed missing, and the plan says so in `notes`. Completion weeks
-    older than WEEK_LOOKBACK_WEEKS are skipped and named in `notes`
-    ("skipped, outside lookback"); that alone is never a failure.
+  - "Completion" (catch-up) WEEK rows: every earlier published week inside the lookback
+    (Saturday at most WEEK_LOOKBACK_WEEKS weeks before the newest published
+    Saturday) that is not yet stored, whatever month it is in. Decided from
+    stored data, not from the date. Without a database to ask (--sink csv,
+    --dry-run) every week inside the lookback is assumed missing, and the
+    plan says so in `notes`. Missing weeks between the newest stored week and
+    the lookback edge can no longer be requested; they are listed in
+    `skipped_weeks` and named in `notes` ("skipped, outside lookback"); that
+    alone is never a failure.
   - The previous month's MONTH row, on every run once past MONTH_SAFETY_DAY.
 
 A week belongs to the month of its Saturday (D8): Sep 27 - Oct 3 is October.
@@ -30,7 +33,7 @@ WEEK_PUBLISH_LAG_DAYS = 5
 WEEK_MAX_WINDOW_WEEKS = 7
 # Oldest requestable week, in weeks before the newest published week. Probe T0,
 # 2026-10-15, US (measured twice): 6 weeks back DONE, 7 weeks back refused as a
-# "prohibited date range". Older completion weeks are skipped, not requested.
+# "prohibited date range". Older weeks are never requested.
 WEEK_LOOKBACK_WEEKS = 6
 # On day 1..MONTH_SAFETY_DAY the previous month's MONTH row is not requested (section 9.2).
 MONTH_SAFETY_DAY = 5
@@ -76,9 +79,9 @@ def week_windows(saturdays, max_weeks: int = WEEK_MAX_WINDOW_WEEKS) -> list[tupl
 class WeeklyPlan:
     today: date
     current_weeks: list[date]        # Saturdays in the current month, published
-    completion_weeks: list[date]     # Saturdays in the previous month, published, not stored, within lookback
+    completion_weeks: list[date]     # earlier Saturdays inside the lookback, published, not stored
     completion_assumed: bool         # True when there was no database to check
-    skipped_weeks: list[date]        # missing previous-month Saturdays outside the lookback
+    skipped_weeks: list[date]        # missing Saturdays after the newest stored one, outside the lookback
     week_windows: list[tuple[date, date]]
     month: date | None               # first day of the MONTH row to request, or None
     notes: list[str] = field(default_factory=list)
@@ -96,30 +99,39 @@ def plan_weekly_run(today: date, stored_saturdays=None, *,
                     lookback_weeks: int = WEEK_LOOKBACK_WEEKS,
                     month_safety_day: int = MONTH_SAFETY_DAY) -> WeeklyPlan:
     """Plan one marketplace and report type. `stored_saturdays` holds the week-ending
-    dates already in the weekly table for the previous month (extra dates are
-    ignored), or None when there is no database to ask."""
+    dates already in the weekly table for this marketplace and report type (at
+    least those inside the lookback; older ones are used only to name weeks lost
+    to it), or None when there is no database to ask."""
     published = latest_published_saturday(today, lag_days)
-    current = [s for s in saturdays_in_month(today.replace(day=1)) if s <= published]
-    prev_first = previous_month_first(today)
-    prev = [s for s in saturdays_in_month(prev_first) if s <= published]
+    oldest_ok = published - timedelta(days=7 * lookback_weeks)
+    month_first = today.replace(day=1)
+    current = [s for s in saturdays_in_month(month_first) if s <= published]
+    in_lookback = [oldest_ok + timedelta(days=7 * i) for i in range(lookback_weeks + 1)]
+    earlier = [s for s in in_lookback if s < month_first]
 
     notes = []
+    skipped = []
     if stored_saturdays is None:
-        completion = prev
-        notes.append(f"No database to check stored weeks: assuming all {len(prev)} week(s) "
-                     f"of {prev_first:%Y-%m} are missing.")
+        completion = earlier
+        notes.append(f"No database to check stored weeks: assuming all {len(in_lookback)} week(s) "
+                     f"inside the lookback ({oldest_ok - timedelta(days=6)}..{published}) are missing.")
     else:
         stored = set(stored_saturdays)
-        completion = [s for s in prev if s not in stored]
-
-    oldest_ok = published - timedelta(days=7 * lookback_weeks)
-    skipped = [s for s in completion if s < oldest_ok]
-    completion = [s for s in completion if s >= oldest_ok]
+        completion = [s for s in earlier if s not in stored]
+        # Weeks after the newest stored one that have already fallen out of the
+        # lookback: lost for good (the MONTH row still covers their month).
+        # Older holes were reported by the run that lost them.
+        if stored:
+            s = max(stored) + timedelta(days=7)
+            while s < oldest_ok:
+                skipped.append(s)
+                s += timedelta(days=7)
     for s in skipped:
         notes.append(f"Week {s - timedelta(days=6)}..{s} skipped, outside lookback "
                      f"(oldest requestable week ends {oldest_ok}).")
 
-    month =prev_first if today.day > month_safety_day else None
+    prev_first = previous_month_first(today)
+    month = prev_first if today.day > month_safety_day else None
     if month is None:
         notes.append(f"MONTH {prev_first:%Y-%m} not requested: day {today.day} is within "
                      f"MONTH_SAFETY_DAY ({month_safety_day}).")

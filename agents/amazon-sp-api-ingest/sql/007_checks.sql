@@ -11,6 +11,10 @@
 --   2. Spec objects present (after 001-005). Expect present = 1 everywhere.
 --   3. Old tables: month-to-date rows. These must NOT be carried over (7.6
 --      step 4); this only shows how many there are.
+--  3b. Old tables: whole-month rows that may still be month-to-date roll-ups
+--      labelled final (written by sp_api_month_to_date.py, or last loaded on
+--      or before day MONTH_SAFETY_DAY = 5 after the month ended). Not caught
+--      by check 3. 008 (fallback only) leaves these out.
 --   4. Monthly coverage per marketplace, old tables (whole months only).
 --   5. Coverage per marketplace and period_type, spec tables (after T5).
 --      Expect for MONTH: last_period 2026-09-01 (or later) and at least 36
@@ -67,6 +71,40 @@ ELSE
     WHERE end_date <> EOMONTH(start_date)
     GROUP BY marketplace
     ORDER BY marketplace;
+GO
+
+-- 3b. Old tables: whole-month rows that look final but may be month-to-date
+--     roll-ups. Uses loaded_at and source_file (added by ingest_to_db.py);
+--     skipped if those columns are missing.
+DECLARE @month_safety_day INT = 5;   -- MONTH_SAFETY_DAY (week_plan.py, spec 9.2)
+DECLARE @t SYSNAME, @sql NVARCHAR(MAX);
+DECLARE @old TABLE (seq INT IDENTITY(1,1), t SYSNAME);
+INSERT @old (t) VALUES ('Daylight_sales_report'), ('Daylight_inventory_report');
+DECLARE @i INT = 1;
+WHILE @i <= 2
+BEGIN
+    SELECT @t = t FROM @old WHERE seq = @i;
+    IF OBJECT_ID(N'dbo.' + QUOTENAME(@t), 'U') IS NULL
+        PRINT CONCAT('Check 3b skipped: dbo.', @t, ' does not exist.');
+    ELSE IF COL_LENGTH(N'dbo.' + @t, 'loaded_at') IS NULL OR COL_LENGTH(N'dbo.' + @t, 'source_file') IS NULL
+        PRINT CONCAT('Check 3b skipped: dbo.', @t, ' has no loaded_at/source_file column.');
+    ELSE
+    BEGIN
+        SET @sql = N'
+SELECT ''check 3b: ' + @t + N' suspect final rows'' AS check_name, marketplace, start_date,
+       COUNT(*) AS suspect_rows,
+       SUM(CASE WHEN source_file LIKE ''sp_api_month_to_date%'' THEN 1 ELSE 0 END) AS from_month_to_date_script,
+       MAX(loaded_at) AS last_loaded_at
+FROM dbo.' + QUOTENAME(@t) + N'
+WHERE DAY(start_date) = 1 AND end_date = EOMONTH(start_date)
+  AND (source_file LIKE ''sp_api_month_to_date%''
+       OR CAST(loaded_at AS DATE) <= DATEADD(day, @safety, EOMONTH(start_date)))
+GROUP BY marketplace, start_date
+ORDER BY marketplace, start_date;';
+        EXEC sys.sp_executesql @sql, N'@safety INT', @safety = @month_safety_day;
+    END
+    SET @i += 1;
+END
 GO
 
 -- 4. Monthly coverage, old tables (whole months only).

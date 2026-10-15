@@ -98,8 +98,10 @@ GO
 --   1. No readers of the old names (Power BI datasets, other agents, saved
 --      queries) - step 1.
 --   2. Backup row counts above match - step 2.
---   3. Spec tables created (001-005) and loaded from the validated CSVs by
---      load_csv_to_db.py (T5), not copied from the old tables - steps 3 and 4.
+--   3. Spec tables created (001-005) and loaded from the validated monthly
+--      CSVs by load_csv_to_db.py (T5) - steps 3 and 4. Never copy rows from
+--      the old tables or from these backups: they hold month-to-date rows
+--      labelled final. Only fallback: 008 (closed whole months only).
 --   4. Coverage check run on old and new tables, differences explained
 --      (007_checks.sql) - step 5.
 --   5. Samir has signed off - step 6.

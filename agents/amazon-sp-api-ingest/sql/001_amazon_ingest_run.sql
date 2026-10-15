@@ -28,6 +28,9 @@ CREATE TABLE dbo.amazon_ingest_run (
     started_at    DATETIME2(0)   NOT NULL CONSTRAINT DF_amazon_ingest_run_start DEFAULT SYSUTCDATETIME(),
     finished_at   DATETIME2(0)   NULL,
     message       NVARCHAR(2000) NULL,       -- includes weeks "skipped, outside lookback" (section 9.1)
-    host_name     NVARCHAR(128)  NULL
+    host_name     NVARCHAR(128)  NULL,
+    -- no_data = nothing new for this marketplace (D10); it is not a failure.
+    CONSTRAINT CK_amazon_ingest_run_status
+        CHECK (status IN ('running', 'success', 'partial', 'failed', 'no_data'))
 );
 GO
