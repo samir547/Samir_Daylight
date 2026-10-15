@@ -18,7 +18,7 @@ Window and lookback limits were measured on **US only**. UK and DE were checked 
 | Constant | Value | Basis | Confidence |
 |---|---|---|---|
 | `WEEK_PUBLISH_LAG_DAYS` | **5** | The week ending Sat 2026-10-10 was DONE on Thu 2026-10-15 for sales and inventory in US, UK and DE. | **Provisional.** Only checked at about 14:00 UTC, not at the 06:00 UTC cron time. See "Thursday timing" below. A shorter lag (4 days) could not be tested today. |
-| `WEEK_MAX_WEEKS_PER_REQUEST` | **7** | US: 7 weeks (Aug 23 to Oct 10) DONE for sales and inventory. 8 weeks (Aug 16 to Oct 10) refused with the "maximum length" error. | Confirmed for US. |
+| `WEEK_MAX_WINDOW_WEEKS` | **7** | US: 7 weeks (Aug 23 to Oct 10) DONE for sales and inventory. 8 weeks (Aug 16 to Oct 10) refused with the "maximum length" error. | Confirmed for US. |
 | `WEEK_LOOKBACK_WEEKS` | **7** (the newest published week plus 6 earlier) | US: a single week 6 weeks before the newest (Aug 23–29, starting 53 days before the run) DONE. 7 weeks back (Aug 16–22, 60 days) refused as a "prohibited date range" for sales and inventory. Also refused at 9, 13, 26, 52 and 104 weeks back. | Confirmed for US on this one day. It is unknown whether Amazon counts the limit in days from today or in weeks from the newest week, and exactly where the boundary falls between 53 and 60 days. |
 
 ## Section 5 answers
@@ -58,7 +58,7 @@ This is expected from the attribution rule: Aug 30–31 are counted in September
 
 ## Conflicts with the spec, for review at Gate 1
 
-1. **The section 9.1 WEEK window sometimes breaks both limits.** The window starts on the Sunday on or before the 1st of the previous month. Computed for upcoming Thursdays:
+1. **Resolved 2026-10-15 (option 1, spec revision (d)).** The window now covers current-month weeks plus only the missing previous-month weeks, so the regular Thursday runs stay within both limits. The remaining edge cases (a catch-up after several missed runs, or `--sink csv` / `--dry-run` late in a month) are open item O15. Original finding, kept for the record: **the section 9.1 WEEK window sometimes breaks both limits.** The window starts on the Sunday on or before the 1st of the previous month. Computed for upcoming Thursdays:
 
    | Thursday | Window start | Weeks | Days back to start |
    |---|---|---|---|

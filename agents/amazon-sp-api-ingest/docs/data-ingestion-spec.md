@@ -7,6 +7,7 @@
 | 2026-10-15 | The weekly job now loads **weekly (WEEK) rows** for the previous and current month, plus the previous month's MONTH row once Amazon publishes it. Before this change only closed months were loaded. Both grains are kept (D8). Sums must never mix grains (D9). A run with nothing new is logged as `no_data` and is not a failure (D10). Scheduling moves to **bash and cron on Ubuntu**, Wednesdays (D11). Forecast rules restated (D12). New scope covers a weekly history backfill and moving the two tables loaded on 2026-10-11 to the spec names. Amazon facts about weekly reports are marked "to be confirmed by probe (T0)". Vivek's daily month-to-date approach (`sp_api_month_to_date.py`) is superseded. **Why:** the business needs the in-progress month without waiting for it to close, and the VM turned out to be Ubuntu. | Approved by Krishna. Samir sign-off pending. |
 | 2026-10-15 (b) | Clarifications before implementation. `no_data` now also covers a load that inserts and updates nothing (D10). The previous month's MONTH row is re-requested on every run while it is still the previous month, so restatements are caught (D1). A forecast pulled again under the same generation date is compared with the stored version: identical means "no new version", different means replace (D5, section 8.4). Safety constant renamed `MONTH_SAFETY_DAY`. Database settings use the `DB_*` names already used by the demand-planning agent (O6 closed). Backfill acceptance is now "at least 36 months ending Sep 2026"; the existing Sep 2023 rows are kept. | Approved by Krishna. Samir sign-off pending. |
 | 2026-10-15 (c) | Both weekly jobs move from **Wednesday to Thursday** (06:00 and 07:00 UTC, still one forecast run per week). **Why:** on Thursday the previous week is 5 days old instead of 4, which gives more margin on Amazon's publishing lag. Wednesday was an arbitrary choice. Whether a 5-day-old week is reliably available is confirmed by the probe (T0). | Approved by Krishna. Samir sign-off pending. |
+| 2026-10-15 (d) | Weekly window narrowed (D1, D8, section 9.1). Each run now pulls WEEK rows for the **current** month's weeks, plus a **completion** pull of only those previous-month weeks that are **not yet stored**. It no longer re-pulls the previous and the current month. The completion need is read from stored data, not from the date. Without a database (`--sink csv`, `--dry-run`), all previous-month weeks are assumed missing, and the output says so. Closed-month WEEK rows stay as last loaded. The MONTH row is the authoritative figure for a closed month. Requests are chunked to `WEEK_MAX_WINDOW_WEEKS`. Worked examples for 2026-10-22, 2026-11-05 and 2026-11-12. Planning logic in `week_plan.py` with unit tests. **Why:** the probe (T0) found that WEEK requests are limited to 7 weeks and about 7 weeks of lookback, and the old window reached 8 weeks and about 60 days back roughly once a month. | Approved by Krishna (option 1). Samir sign-off pending. |
 
 ## 1. Purpose
 
@@ -34,14 +35,14 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 
 | # | Topic | Decision |
 |---|---|---|
-| D1 | What each weekly sales and inventory run pulls | **Replaced 2026-10-15.** For each marketplace, every run pulls: (1) **WEEK rows** (`reportPeriod = WEEK`, Sunday to Saturday) for every week whose **Saturday** falls in the previous or the current calendar month. The window starts on the Sunday on or before the 1st of the previous month. It ends at the latest closed Saturday Amazon has published. The whole window is re-pulled each run, to catch restatements. The loader updates a row only if a value changed. (2) The **MONTH row for the previous calendar month**, once past the day-5 safety margin (section 9.2). It is requested on **every** run while that month is still the previous month, even if it is already stored, so restatements are picked up; the loader updates only changed rows. If it is not yet available, it is skipped and the WEEK rows cover that month; the next run picks it up. The in-progress month is covered by the weekly rows, not by daily reports. The daily month-to-date approach (`sp_api_month_to_date.py`) is **superseded** and not part of the design. |
+| D1 | What each weekly sales and inventory run pulls | **Replaced 2026-10-15, narrowed 2026-10-15 (d).** For each marketplace and report type, every run pulls: (1a) **Current-month WEEK rows** (`reportPeriod = WEEK`, Sunday to Saturday): every week whose **Saturday** falls in the current calendar month and is at least `WEEK_PUBLISH_LAG_DAYS` old. These are re-pulled each run, to catch restatements. The loader updates a row only if a value changed. (1b) **Completion WEEK rows**: only the weeks whose Saturday falls in the **previous** month, are past `WEEK_PUBLISH_LAG_DAYS`, and are **not yet stored** in the weekly table for that marketplace and report type. This is decided from stored data, not from the date, so the last week or two of a month are not lost and a missed run is caught up. When none are missing, nothing is requested for the previous month's weeks. Without database access (`--sink csv`, `--dry-run`) all of them are assumed missing, and the output says so. Requests are chunked to `WEEK_MAX_WINDOW_WEEKS`; non-contiguous weeks go in separate windows. (2) The **MONTH row for the previous calendar month**, once past the day-5 safety margin (section 9.2). It is requested on **every** run while that month is still the previous month, even if it is already stored, so restatements are picked up; the loader updates only changed rows. If it is not yet available, it is skipped and the WEEK rows cover that month; the next run picks it up. The in-progress month is covered by the weekly rows, not by daily reports. The daily month-to-date approach (`sp_api_month_to_date.py`) is **superseded** and not part of the design. |
 | D2 | "Per region" | Per **marketplace** (US, UK, DE, FR, IT, ES). One refresh and one failure boundary per marketplace. |
 | D3 | Target database | Existing Azure SQL `DAYHANSA_SQL1`. Varun has the required rights. |
 | D4 | Scheduler | Runs on the team's **VM**. Platform details in D11. |
 | D5 | Duplicate forecast pull | If the same generation date is pulled again, the content is compared with the stored version. Identical: nothing is written ("no new version", status `no_data`). Different: the new pull **replaces** the stored version, keeping the same `forecast_run_id`. |
 | D6 | Credentials | Krishna shares the `.env` with Varun and Vivek for development. Key Vault is not part of this phase. |
 | D7 | ASIN to product mapping | Uses the existing `dbo.amazon_asin_sku_map` table. The mapping stays out of the fact tables (section 7.2). |
-| D8 | Both grains are kept | **New.** Closed months keep both their WEEK rows and their MONTH row. A week belongs to the month in which its **Saturday** falls. A straddling week (for example Sep 27 to Oct 3) belongs to October. Weekly and monthly totals for the same month will differ slightly. This is expected. |
+| D8 | Both grains are kept | **New.** Closed months keep both their WEEK rows and their MONTH row. A week belongs to the month in which its **Saturday** falls. A straddling week (for example Sep 27 to Oct 3) belongs to October. Weekly and monthly totals for the same month will differ slightly. This is expected. WEEK rows are **never deleted**. Once a month has closed, its WEEK rows stay as last loaded (completion pulls only add missing weeks; they do not refresh stored ones). The **MONTH row is the authoritative figure for a closed month**. |
 | D9 | Never sum across period types | **New.** `period_type` is `WEEK` or `MONTH`. `DAY` is not used. Consumers read through views that return one grain at a time (section 7.3). A plain `SUM` over the base tables double-counts. |
 | D10 | No-data behaviour | **New.** "Nothing new" means one of: no week in the window is closed yet; Amazon reports the period as not available; or the load inserts 0 rows and updates 0 rows. A run that only updated existing rows is `success`. If there is nothing new for a marketplace (for example the newest week is not yet published), the job logs it, writes an `amazon_ingest_run` row with status `no_data`, changes nothing, deletes nothing, and exits 0. Genuine errors still fail with exit code 1: authentication failure, a 4xx other than "not available", 429 or 5xx after retries, or a parse failure. The code must not treat every HTTP error as "not published yet". Genuine errors never become `no_data`. |
 | D11 | Schedule and platform | **New.** The VM is **Ubuntu 24.04** (UK South, `vm-daylight-agents-01`), time zone UTC. Bash wrapper scripts and cron, not PowerShell and Task Scheduler. Both jobs run on **Thursday** (changed from Wednesday on 2026-10-15: the previous week is then 5 days old, not 4). Same-day retry on failure. One forecast run per week, no second run. Details in section 9.5. PowerShell instructions remain only for developer machines (section 6 and Appendix B). |
@@ -54,7 +55,7 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 - Historical pull for sales and inventory (36 months, MONTH rows) and a first forecast pull, all six marketplaces.
 - **Weekly history backfill** (WEEK rows) for sales and inventory, as far back as Amazon's weekly lookback allows. The limit is to be confirmed by the probe (T0).
 - Database tables, views and load logic for sales, inventory, forecast versions, and an ingest run log.
-- Weekly scheduled refresh of sales and inventory, including **WEEK rows for the previous and current month** (D1).
+- Weekly scheduled refresh of sales and inventory, including **WEEK rows for the current month, plus any missing weeks of the previous month** (D1).
 - Weekly scheduled, versioned forecast load.
 - **Migration** of the two tables loaded on 2026-10-11 (`dbo.Daylight_sales_report`, `dbo.Daylight_inventory_report`) to the spec names `dbo.amazon_vendor_sales` and `dbo.amazon_vendor_inventory`, with a backup first (section 7.6).
 - Retry, error handling, exit codes, logging, data quality checks, tests, and a runbook for the VM.
@@ -556,15 +557,16 @@ Sections 9.1 and 9.2 are specific to the sales and inventory refresh. Sections 9
 
 Each weekly run, for each marketplace, for sales and for inventory:
 
-1. **Work out the WEEK window.**
-   - Start: the Sunday on or before the 1st of the previous calendar month.
-   - End: the latest closed Saturday that Amazon has published. The publishing lag is a named constant, set after the probe (T0).
-   - This covers every week whose Saturday falls in the previous or the current month (D8).
-2. **Request WEEK rows** for the whole window and upsert them. The whole window is re-pulled every run, to catch restatements. Unchanged rows are not touched.
-3. **Request the MONTH row for the previous month**, if the day-5 safety margin allows it (section 9.2). Request it on every run while it is the previous month, even if already stored, so restatements are caught. If Amazon says it is not available yet, skip it. This is not an error; the WEEK rows cover that month and the next run picks the MONTH row up.
+1. **Work out the WEEK requests** (D1, D8). A week is *published* when its Saturday is at least `WEEK_PUBLISH_LAG_DAYS` days before today (UTC). A week belongs to the month of its Saturday.
+   - **Current-month weeks:** every published week whose Saturday is in the current month.
+   - **Completion weeks:** every published week whose Saturday is in the previous month and that is **not** in the weekly table for this marketplace and report type. Read this from the database. Without database access (`--sink csv`, `--dry-run`), treat all of them as missing and print a line saying so.
+   - Group the requested weeks into contiguous Sunday-to-Saturday windows, each at most `WEEK_MAX_WINDOW_WEEKS` long. Current-month and completion weeks share a window only if they are contiguous.
+   - Constants (proposed values from the probe, `docs/probe-weekly-results.md`, pending Gate 1 review): `WEEK_PUBLISH_LAG_DAYS = 5`, `WEEK_MAX_WINDOW_WEEKS = 7`. Reference implementation: `week_plan.py` (`plan_weekly_run`).
+2. **Request the WEEK windows** and upsert them. Current-month weeks are re-pulled every run, to catch restatements; unchanged rows are not touched. Previous-month weeks that are already stored are **not** re-pulled; they stay as last loaded (D8).
+3. **Request the MONTH row for the previous month**, if the day-5 safety margin allows it (section 9.2). Request it on every run while it is the previous month, even if already stored, so restatements are caught. If Amazon says it is not available yet, skip it. This is not an error; the next run picks it up. For a closed month, the MONTH row is the authoritative figure.
 4. **Record the outcome** in `amazon_ingest_run`:
    - `success`: at least one row was inserted or updated.
-   - `no_data`: nothing new for this marketplace (D10): no closed week in the window, Amazon reports the period not available, or the load inserted 0 and updated 0. Nothing is changed or deleted. Exit code 0.
+   - `no_data`: nothing new for this marketplace (D10): nothing to request (no closed current-month week, no missing completion week, and the MONTH row inside the safety margin; the early-month case), Amazon reports the period not available, or the load inserted 0 and updated 0. Nothing is changed or deleted. Exit code 0.
    - `partial`: one request succeeded and another hit a genuine error.
    - `failed`: a genuine error (authentication, a 4xx other than "not available", 429 or 5xx after retries, parse failure).
 
@@ -575,12 +577,35 @@ Other rules:
 - "Not available" must be recognised by Amazon's specific response for that case (to be confirmed by probe, T0). Any other error is a failure.
 - Dashboards show the in-progress month from the weekly views, labelled with `is_partial` and `loaded_through`.
 
-Worked example (run on Thursday 2026-10-22, assuming the week ending Saturday 2026-10-17, 5 days earlier, is published):
+Worked examples. They assume every earlier Thursday run succeeded and every week whose Saturday is at least 5 days old is published. Saturdays in October 2026 are 3, 10, 17, 24 and 31 (five); in November 7, 14, 21 and 28.
+
+**Thursday 2026-10-22** (all September weeks already stored):
 
 | Request | Window |
 |---|---|
-| WEEK | Sunday 2026-08-30 to Saturday 2026-10-17 (the Saturdays 5 Sep to 26 Sep belong to September, 3 Oct to 17 Oct to October) |
-| MONTH | September 2026 (day 21 is past the day-5 margin) |
+| WEEK, current month | Sunday 2026-09-27 to Saturday 2026-10-17 (Saturdays 3, 10, 17 Oct; the straddling week Sep 27 to Oct 3 belongs to October) |
+| WEEK, completion | None: no September week is missing |
+| MONTH | September 2026 (day 22 is past the day-5 margin) |
+
+**Thursday 2026-11-05** (first run of November; the 2026-10-29 run stored October through Saturday Oct 24):
+
+| Request | Window |
+|---|---|
+| WEEK, current month | **None.** No November week has closed (Nov 7 is in the future) |
+| WEEK, completion | Sunday 2026-10-25 to Saturday 2026-10-31: the only October week not yet stored, now 5 days old |
+| MONTH | **Skipped.** October 2026 is not requested; day 5 is inside `MONTH_SAFETY_DAY` |
+
+If October had been complete already (for example on a re-run), nothing would be requested and the run would be `no_data`, exit 0.
+
+**Thursday 2026-11-12** (all October weeks stored by the 11-05 run):
+
+| Request | Window |
+|---|---|
+| WEEK, current month | Sunday 2026-11-01 to Saturday 2026-11-07 |
+| WEEK, completion | None: no October week is missing |
+| MONTH | October 2026 (day 12 is past the margin), requested again on every run in November |
+
+If the 10-29 and 11-05 runs had both been missed (October stored only through Oct 17), the 11-12 run would request the completion weeks ending Oct 24 and Oct 31 plus Nov 7. They are contiguous, so this is one window, Sunday 2026-10-18 to Saturday 2026-11-07 (3 weeks).
 
 ### 9.2 Month availability safety margin (code change)
 
@@ -719,7 +744,7 @@ Git workflow: one feature branch and one pull request per task; no data files, `
 ### 11.2 Tests
 
 - Unit: `month_window_chunks` (including the 36-month case giving 15 + 15 + 6), the day-5 safety margin, `_amount`, and the three `flatten_*` functions using small fixture JSON files (trimmed copies of real raw reports with ASINs and values anonymised).
-- Unit: the WEEK window (start on the Sunday on or before the 1st of the previous month; a straddling week is assigned to the month of its Saturday), including a run in the first 5 days of a month.
+- Unit (`tests/test_week_plan.py`, `python -m pytest tests`): WEEK request planning per section 9.1. Covers the first run of a month (completion week only, MONTH skipped, `no_data` when nothing is missing, all weeks assumed missing without a database), a missed run followed by a catch-up run (one contiguous window; a non-contiguous gap gets its own window), a month with five Saturdays (including chunking to `WEEK_MAX_WINDOW_WEEKS`), the straddling week (assigned to the month of its Saturday, never a completion week of the earlier month), and the publish lag.
 - Unit: classification of Amazon responses into "not available" (`no_data`) versus genuine errors (D10).
 - Retry helper: simulate 429 then success; simulate repeated failure.
 - Database (against a separate test schema or database, never production tables): idempotent re-load; an update changes `rows_updated` and `last_updated_at`; a `no_data` run changes nothing; replacing a forecast version keeps the same `forecast_run_id` and replaces its rows; a failed marketplace rolls back without affecting the others.
@@ -732,7 +757,7 @@ O1 (VM operating system: Ubuntu 24.04, D11), O4 (schedule day: Thursday, changed
 
 | # | Item | Default if not answered |
 |---|---|---|
-| O2 | Refresh window N (months re-pulled weekly) | Superseded by D1 (previous and current month of WEEK rows, plus previous MONTH row) |
+| O2 | Refresh window N (months re-pulled weekly) | Superseded by D1 (current-month WEEK rows, missing previous-month WEEK rows, plus previous MONTH row) |
 | O3 | Alerting channel for failed or stale jobs | Run table, wrapper exit codes in `logs/`, and the stale-forecast query only |
 | O5 | FR and IT coverage in `dbo.amazon_asin_sku_map` | Report them as unmapped until fixed |
 | O7 | Dedicated least-privilege SQL login for the VM job (needs Varun) | Create one before T7 |
@@ -743,6 +768,7 @@ O1 (VM operating system: Ubuntu 24.04, D11), O4 (schedule day: Thursday, changed
 | O12 | Samir sign-off on the 2026-10-15 revision | Pending |
 | O13 | Tolerance for the weekly versus monthly reconciliation (section 11.1) | Report only, no threshold |
 | O14 | The exact times for the Thursday runs (section 9.5) | 06:00 and 07:00 UTC |
+| O15 | Weekly lookback (about 7 weeks, probe T0). Completion weeks can be older than that in two cases: a catch-up after several missed runs, or a `--sink csv` / `--dry-run` run late in a month, which assumes all previous-month weeks are missing. For example on 2026-11-26 the week starting Sep 27 is 60 days back. Amazon refuses such a week as a "prohibited date range", which section 9.1 counts as `failed`. Should the planner drop weeks past the lookback and log them instead? | Not decided; `week_plan.py` does not clamp yet |
 
 ## Appendix A. Amazon constraints quick reference
 
