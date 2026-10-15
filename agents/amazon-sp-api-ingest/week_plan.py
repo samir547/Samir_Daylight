@@ -3,7 +3,7 @@ Which WEEK windows and which MONTH row the weekly sales/inventory run requests
 on a given day (data-ingestion-spec.md section 9.1, decisions D1 and D8).
 
 Pure date logic, no I/O, so it can be unit-tested and reused by the report
-scripts (to be folded into sp_api_common.py in T3).
+scripts (vendor_report_job.py).
 
   - WEEK rows for every week whose Saturday falls in the CURRENT month and is
     published (re-pulled every run, to catch restatements).

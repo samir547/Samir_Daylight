@@ -1,20 +1,17 @@
 """
 One-off probe: finds where SP-API's ~36-month lookback cap for
 GET_VENDOR_SALES_REPORT actually bites, by requesting a few single-month
-windows working backward from Sep 2023. Reuses sp_api_sales_report.py's
-own functions/config, so .env is picked up the same way.
+windows working backward from Sep 2023. Reuses sp_api_common.py's
+functions and config, so .env is picked up the same way.
+last_closed_month() applies the MONTH_SAFETY_DAY margin.
 
 Run (with your venv activated, in this folder):
     python probe_lookback.py
 """
-import importlib.util
 import sys
 import time
 
-spec = importlib.util.spec_from_file_location("m", "sp_api_sales_report.py")
-m = importlib.util.module_from_spec(spec)
-sys.argv = ["probe_lookback"]
-spec.loader.exec_module(m)
+import sp_api_common as m
 
 client_id, client_secret, refresh_token, token_env = m.resolve_credentials("US")
 if not (client_id and client_secret and refresh_token):

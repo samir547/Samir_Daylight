@@ -43,7 +43,7 @@ from pathlib import Path
 
 import requests
 
-import sp_api_sales_report as spapi
+import sp_api_common as spapi
 import week_plan
 
 HERE = Path(__file__).parent
