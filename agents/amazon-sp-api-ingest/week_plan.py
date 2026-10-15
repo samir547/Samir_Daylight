@@ -10,7 +10,9 @@ scripts (to be folded into sp_api_common.py in T3).
   - "Completion" WEEK rows: weeks whose Saturday falls in the PREVIOUS month,
     are published, and are not yet stored. Decided from stored data, not from
     the date. Without a database to ask (--sink csv, --dry-run) all of them
-    are assumed missing, and the plan says so in `notes`.
+    are assumed missing, and the plan says so in `notes`. Completion weeks
+    older than WEEK_LOOKBACK_WEEKS are skipped and named in `notes`
+    ("skipped, outside lookback"); that alone is never a failure.
   - The previous month's MONTH row, on every run once past MONTH_SAFETY_DAY.
 
 A week belongs to the month of its Saturday (D8): Sep 27 - Oct 3 is October.
@@ -26,6 +28,10 @@ from datetime import date, timedelta
 WEEK_PUBLISH_LAG_DAYS = 5
 # Amazon refuses WEEK requests longer than this (probe T0, 2026-10-15, US).
 WEEK_MAX_WINDOW_WEEKS = 7
+# Oldest requestable week, in weeks before the newest published week. Probe T0,
+# 2026-10-15, US (measured twice): 6 weeks back DONE, 7 weeks back refused as a
+# "prohibited date range". Older completion weeks are skipped, not requested.
+WEEK_LOOKBACK_WEEKS = 6
 # On day 1..MONTH_SAFETY_DAY the previous month's MONTH row is not requested (section 9.2).
 MONTH_SAFETY_DAY = 5
 
@@ -70,21 +76,24 @@ def week_windows(saturdays, max_weeks: int = WEEK_MAX_WINDOW_WEEKS) -> list[tupl
 class WeeklyPlan:
     today: date
     current_weeks: list[date]        # Saturdays in the current month, published
-    completion_weeks: list[date]     # Saturdays in the previous month, published, not stored
+    completion_weeks: list[date]     # Saturdays in the previous month, published, not stored, within lookback
     completion_assumed: bool         # True when there was no database to check
+    skipped_weeks: list[date]        # missing previous-month Saturdays outside the lookback
     week_windows: list[tuple[date, date]]
     month: date | None               # first day of the MONTH row to request, or None
     notes: list[str] = field(default_factory=list)
 
     @property
     def no_data(self) -> bool:
-        """Nothing to request at all: the run is `no_data` (D10), exit 0."""
+        """Nothing to request at all (weeks skipped for lookback do not count):
+        the run is `no_data` (D10), exit 0."""
         return not self.week_windows and self.month is None
 
 
 def plan_weekly_run(today: date, stored_saturdays=None, *,
                     lag_days: int = WEEK_PUBLISH_LAG_DAYS,
                     max_weeks: int = WEEK_MAX_WINDOW_WEEKS,
+                    lookback_weeks: int = WEEK_LOOKBACK_WEEKS,
                     month_safety_day: int = MONTH_SAFETY_DAY) -> WeeklyPlan:
     """Plan one marketplace and report type. `stored_saturdays` holds the week-ending
     dates already in the weekly table for the previous month (extra dates are
@@ -103,7 +112,14 @@ def plan_weekly_run(today: date, stored_saturdays=None, *,
         stored = set(stored_saturdays)
         completion = [s for s in prev if s not in stored]
 
-    month = prev_first if today.day > month_safety_day else None
+    oldest_ok = published - timedelta(days=7 * lookback_weeks)
+    skipped = [s for s in completion if s < oldest_ok]
+    completion = [s for s in completion if s >= oldest_ok]
+    for s in skipped:
+        notes.append(f"Week {s - timedelta(days=6)}..{s} skipped, outside lookback "
+                     f"(oldest requestable week ends {oldest_ok}).")
+
+    month =prev_first if today.day > month_safety_day else None
     if month is None:
         notes.append(f"MONTH {prev_first:%Y-%m} not requested: day {today.day} is within "
                      f"MONTH_SAFETY_DAY ({month_safety_day}).")
@@ -111,6 +127,6 @@ def plan_weekly_run(today: date, stored_saturdays=None, *,
         notes.append(f"No closed week in {today:%Y-%m} yet.")
 
     return WeeklyPlan(today=today, current_weeks=current, completion_weeks=completion,
-                      completion_assumed=stored_saturdays is None,
+                      completion_assumed=stored_saturdays is None, skipped_weeks=skipped,
                       week_windows=week_windows(current + completion, max_weeks),
                       month=month, notes=notes)

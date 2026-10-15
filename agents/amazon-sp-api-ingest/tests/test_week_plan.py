@@ -83,8 +83,9 @@ def test_month_with_five_saturdays_last_run_inside_the_month():
 
 
 def test_five_saturday_month_plus_current_weeks_is_chunked_to_max_window():
-    # No database, Thursday 2026-11-26: 5 October weeks + Nov 7, 14, 21 = 8 contiguous weeks.
-    plan = plan_weekly_run(date(2026, 11, 26), stored_saturdays=None)
+    # 5 October weeks + Nov 7, 14, 21 = 8 contiguous weeks. The real 6-week lookback
+    # would skip Oct 3 (see the lookback tests), so it is widened here to test chunking.
+    plan = plan_weekly_run(date(2026, 11, 26), stored_saturdays=None, lookback_weeks=52)
     assert plan.week_windows == [(date(2026, 9, 27), date(2026, 11, 14)),
                                  (date(2026, 11, 15), date(2026, 11, 21))]
 
@@ -115,4 +116,46 @@ def test_straddling_week_is_not_a_completion_week_of_the_earlier_month():
 
 def test_early_month_with_nothing_to_do_is_no_data():
     plan = plan_weekly_run(date(2026, 10, 1), stored_saturdays=SEP)
+    assert plan.no_data
+
+
+# ---- completion weeks outside Amazon's weekly lookback (WEEK_LOOKBACK_WEEKS = 6)
+
+def test_catch_up_after_several_missed_runs_skips_weeks_outside_lookback():
+    # Last good run 2026-10-01 (September only). Every October run was missed.
+    # Thursday 2026-11-26: newest published Saturday Nov 21, oldest requestable Oct 10.
+    plan = plan_weekly_run(date(2026, 11, 26), stored_saturdays=SEP)
+    assert plan.skipped_weeks == [date(2026, 10, 3)]
+    assert plan.completion_weeks == OCT[1:]
+    assert plan.week_windows == [(date(2026, 10, 4), date(2026, 11, 21))]   # 7 weeks, one request
+    assert plan.month == date(2026, 10, 1)
+    assert "Week 2026-09-27..2026-10-03 skipped, outside lookback" in " ".join(plan.notes)
+    assert not plan.no_data
+
+
+def test_run_without_database_late_in_month_skips_weeks_outside_lookback():
+    plan = plan_weekly_run(date(2026, 11, 26), stored_saturdays=None)
+    assert plan.completion_assumed
+    assert plan.skipped_weeks == [date(2026, 10, 3)]
+    assert plan.week_windows == [(date(2026, 10, 4), date(2026, 11, 21))]
+    notes = " ".join(plan.notes)
+    assert "assuming all 5 week(s) of 2026-10 are missing" in notes
+    assert "skipped, outside lookback" in notes
+
+
+def test_weeks_inside_lookback_are_never_skipped():
+    # Thursday 2026-11-05, nothing stored for October: Oct 3 is 4 weeks before Oct 31.
+    plan = plan_weekly_run(date(2026, 11, 5), stored_saturdays=[])
+    assert plan.skipped_weeks == []
+    assert plan.completion_weeks == OCT
+
+
+def test_run_with_only_skipped_weeks_is_no_data():
+    # With the real constants a Thursday run cannot reach this state, so the
+    # lookback is narrowed: only Oct 3 is missing, and it is outside the lookback.
+    stored = [s for s in OCT if s != date(2026, 10, 3)]
+    plan = plan_weekly_run(date(2026, 11, 5), stored_saturdays=stored, lookback_weeks=2)
+    assert plan.skipped_weeks == [date(2026, 10, 3)]
+    assert plan.week_windows == []
+    assert plan.month is None
     assert plan.no_data
