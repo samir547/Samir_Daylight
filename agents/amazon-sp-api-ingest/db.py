@@ -25,6 +25,7 @@ one transaction.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import time
 from datetime import date, timedelta
@@ -149,7 +150,13 @@ def finish_run(conn, run_id: int, status: str, rows_read: int | None = None, row
 
 # ---------------------------------------------------------------- row preparation
 
-def _num(value, kind: str, col: str):
+def _scale(sql_type: str) -> int | None:
+    """Scale of a DECIMAL(p,s) column type, else None."""
+    m = re.match(r"\s*DECIMAL\((\d+),\s*(\d+)\)", sql_type, re.I)
+    return int(m.group(2)) if m else None
+
+
+def _num(value, kind: str, col: str, scale: int | None = None):
     if value is None or (isinstance(value, str) and value.strip() == ""):
         return None
     try:
@@ -162,6 +169,10 @@ def _num(value, kind: str, col: str):
         if d != d.to_integral_value():
             raise DataError(f"{col}: expected a whole number, got {value!r}")
         return int(d)
+    if scale is not None:
+        # Same exponent on every value: pyodbc fast_executemany otherwise infers the
+        # parameter precision from the first row and fails on later, longer ones.
+        d = d.quantize(Decimal(1).scaleb(-scale))
     return d
 
 
@@ -218,12 +229,37 @@ def prepare_vendor_rows(kind: str, rows: list[dict], period_type: str | None = N
                 cur = r.get("currency")
                 values[col] = str(cur).strip().upper() if cur not in (None, "") else None
             else:
-                values[col] = _num(r.get(col), "INT" if sql_type.startswith("INT") else "DEC", col)
+                values[col] = _num(r.get(col), "INT" if sql_type.startswith("INT") else "DEC", col, _scale(sql_type))
         out.append(tuple(values[c] for c in cols))
     return out
 
 
 # ---------------------------------------------------------------- vendor MERGE
+
+def _input_sizes(types: list[str]) -> list[tuple]:
+    """pyodbc setinputsizes() entries for SQL column types such as 'DECIMAL(18,2) NULL'.
+    With fast_executemany pyodbc guesses types from the first row; a leading NULL or a
+    shorter number then breaks later rows (HY090 / 'Converting decimal loses precision')."""
+    import pyodbc
+    out = []
+    for t in types:
+        u = t.upper()
+        m = re.match(r"(DECIMAL|NUMERIC)\((\d+),\s*(\d+)\)", u)
+        if m:
+            out.append((pyodbc.SQL_DECIMAL, int(m.group(2)), int(m.group(3))))
+        elif u.startswith("INT"):
+            out.append((pyodbc.SQL_INTEGER, 0, 0))
+        elif u.startswith("SMALLINT"):
+            out.append((pyodbc.SQL_SMALLINT, 0, 0))
+        elif u.startswith("BIGINT"):
+            out.append((pyodbc.SQL_BIGINT, 0, 0))
+        elif u.startswith("DATE"):
+            out.append((pyodbc.SQL_TYPE_DATE, 0, 0))
+        else:
+            m = re.match(r"(?:N?VAR)?CHAR\((\d+)\)", u)
+            out.append((pyodbc.SQL_VARCHAR, int(m.group(1)) if m else 255, 0))
+    return out
+
 
 def _stage_and_merge(conn, kind: str, rows: list[tuple], run_id: int) -> tuple[int, int]:
     spec = VENDOR_TABLES[kind]
@@ -237,6 +273,8 @@ def _stage_and_merge(conn, kind: str, rows: list[tuple], run_id: int) -> tuple[i
     batch = max(1, int(os.getenv("DB_BATCH_ROWS", "500")))
     ins_cur = conn.cursor()
     ins_cur.fast_executemany = os.getenv("DB_FAST_EXECUTEMANY", "1") != "0"
+    if ins_cur.fast_executemany:
+        ins_cur.setinputsizes(_input_sizes(list(spec["columns"].values())))
     for i in range(0, len(rows), batch):
         ins_cur.executemany(insert, rows[i:i + batch])
     on = " AND ".join(f"t.{c} = s.{c}" for c in KEY_COLS)
@@ -330,6 +368,9 @@ def load_forecast_version(conn, marketplace: str, selling_program: str, generati
         outcome = "new"
     ins = conn.cursor()
     ins.fast_executemany = os.getenv("DB_FAST_EXECUTEMANY", "1") != "0"
+    if ins.fast_executemany:
+        ins.setinputsizes(_input_sizes(["BIGINT", "VARCHAR(10)", "DATE", "DATE", "SMALLINT"]
+                                       + ["DECIMAL(12,2)"] * 4))
     batch = max(1, int(os.getenv("DB_BATCH_ROWS", "500")))
     params = [(fid, r["asin"], r["week_start"], r["week_end"], int(r["weeks_ahead"]), _q2(r["mean_units"]),
                _q2(r["p70_units"]), _q2(r["p80_units"]), _q2(r["p90_units"])) for r in rows]
