@@ -1,12 +1,13 @@
 # amazon-sp-api-ingest
 
-Data-pull agent for Daylight's Amazon **Vendor Central** account via the Selling Partner API (SP-API). It downloads three Vendor Retail Analytics reports and writes them to CSV for downstream use (e.g. the demand forecast pipeline).
+Data-pull agent for Daylight's Amazon **Vendor Central** account via the Selling Partner API (SP-API). It downloads three Vendor Retail Analytics reports, writes them to CSV, and loads them into Azure SQL (sales, inventory and versioned forecasts) for Power BI and the Amazon demand forecast.
 
 | Script | Report type | Output |
 |---|---|---|
 | `sp_api_sales_report.py` | `GET_VENDOR_SALES_REPORT` | `daylight_sales_report_<MP>.csv` |
 | `sp_api_inventory_report.py` | `GET_VENDOR_INVENTORY_REPORT` | `daylight_inventory_report_<MP>.csv` |
 | `sp_api_forecast_report.py` | `GET_VENDOR_FORECASTING_REPORT` | `forecast_snapshots/daylight_forecast_<MP>_<YYYYMMDD>.csv` |
+| `load_csv_to_db.py` | validated CSVs or a raw forecast JSON | Azure SQL (`--load`) |
 | `probe_*.py` | diagnostics | console only |
 
 Generated CSV and raw JSON files are git-ignored: they contain Amazon cost and inventory figures and are regenerated on every run. Never commit them or `.env`.
@@ -160,46 +161,93 @@ How it differs from the sales and inventory reports:
 - **Reading P-levels:** P80 = Amazon estimates an 80% probability that demand will not exceed that many units that week. The report has no P-level request option - Amazon always returns mean, P70, P80 and P90 together. Use `--levels` (e.g. `--levels p80`, or `--levels p70,p90`) to keep only some of those columns in the CSV; the raw JSON always holds all of them.
 - **Unverified parser:** field names follow Amazon's documentation but have not yet been checked against a live response. Compare the first raw JSON with the CSV. The forecast horizon (number of weeks) is not stated on the report page, so confirm it from the first pull.
 
-## Loading into SQL Server (`ingest_to_db.py`, `sp_api_month_to_date.py`)
+## Loading into SQL Server
 
-Both report types land in `DAYHANSA_SQL1` (connection settings `DB_*` in `.env`):
-`dbo.Daylight_sales_report` and `dbo.Daylight_inventory_report`, same columns as
-the CSVs plus `period_status`, `source_file` and `loaded_at`.
+Everything here lands in `DAYHANSA_SQL1` (settings `DB_*` in `.env`). The design and the
+reasons for it are in `docs/data-ingestion-spec.md`; the VM setup and cron lines are in
+`docs/RUNBOOK.md`.
 
-**One row per marketplace, ASIN and month** (primary key `marketplace, asin, start_date`).
-Every load is an upsert on that key, so re-running anything never creates duplicates.
-`period_status` is `final` for a whole closed month and `month_to_date` for the current
-month (then `end_date` is the last day included). Rows of a loaded month that the new
-data no longer contains are removed.
+**Tables are created by hand, never by the code.** Run `sql/001` to `sql/005` once (in
+SSMS, as an admin). The scripts can be re-run safely. `sql/006` backs up the old
+`Daylight_*` tables, `sql/007` holds read-only checks and `sql/008` is a fallback copy
+(see the spec, section 7.6). The loader fails with a clear message if a table is missing.
+
+| Object | What it holds |
+|---|---|
+| `dbo.amazon_ingest_run` | One row per job run per marketplace: status (`running`, `success`, `partial`, `failed`, `no_data`), row counts, message |
+| `dbo.amazon_vendor_sales`, `dbo.amazon_vendor_inventory` | One row per marketplace, ASIN and period. `period_type` is `MONTH` or `WEEK` |
+| `dbo.amazon_forecast_run`, `dbo.amazon_forecast_weekly` | Every weekly Amazon forecast kept as a version (marketplace, selling program, generation date) |
+| `dbo.vw_amazon_vendor_sales_monthly_sku`, `..._weekly_sku` and the inventory equivalents | One grain at a time, joined to `amazon_asin_sku_map` on **both** `asin` and `market`, `ALL` rows excluded |
+| `dbo.vw_amazon_forecast_versioned` | All forecast versions with `version_no` and `is_latest` |
+
+**Rules for anyone reading the tables**
+- Read through the views. Never sum `WEEK` and `MONTH` rows together: they cover the same days.
+- `asin = 'ALL'` rows are Amazon's account totals. They are for checking, not for demand planning.
+- Inventory is a snapshot. Never sum it across periods. A NULL means Amazon did not supply the field, not zero.
+- Never add amounts across marketplaces without converting currency (US USD, UK GBP, the rest EUR).
+- The code never deletes sales or inventory rows. The only `DELETE` replaces a forecast version that was pulled again under the same generation date.
+
+### First load (history)
+
+Pull 36 months to CSV (see "Running it"), then load the validated CSVs. The loader lists
+what it found and writes nothing unless you pass `--load`:
 
 ```powershell
-python ingest_to_db.py                 # load every CSV in data/ (history, backfills)
-python sp_api_month_to_date.py         # fetch + load the current month to date - run daily
+python load_csv_to_db.py --csv-dir "<folder with the CSVs>"          # list only
+python load_csv_to_db.py --csv-dir "<folder with the CSVs>" --load   # load as MONTH rows
+python load_csv_to_db.py --csv-dir output --marketplaces UK --load   # one marketplace
+python load_csv_to_db.py --forecast-json "<raw_forecast_US_YYYYMMDD.json>" --marketplace US --load
 ```
 
-`sp_api_month_to_date.py`, on every run, for each marketplace with credentials:
-1. **Current month:** Amazon rejects MONTH reports for an open month (FATAL), so it
-   fetches DAY reports from the 1st to the latest published day and rolls them up:
-   sales fields are summed; inventory `net_received_*` is summed and stock levels
-   (sellable, unsellable, aged 90+, open PO) take the last day's value.
-   `sell_through_rate` / `unhealthy_*` aren't in daily reports and stay NULL until the
-   month closes. Verified against September 2026 (US): matches Amazon's monthly figures.
-2. **Previous month:** until its final figures are in the table, requests the MONTH
-   report (available ~72h after month end), which replaces the month-to-date row.
+Loading the same files twice reports `0 inserted, 0 updated`.
 
-Amazon publishes each day ~3 days late (2026-10-11: through 10-08). The script asks for
-today − 3 days and steps back if that day isn't ready. DAY requests are capped at
-15 days, so a month takes up to 3 requests. Each run also saves what it loaded to
-`output/month_to_date/<type>_<YYYYMMDD>.csv`. Exit code is 1 if any marketplace failed,
-and a marketplace/month that failed part-way is not loaded at all.
+### Weekly refresh (scheduled, Thursdays UTC)
 
-The database connection on this network drops on some payloads, so loads go in
-200-row chunks, each retried smaller on a fresh connection if it drops.
+`run_weekly_sales_inventory.sh` (06:00) and `run_weekly_forecast.sh` (07:00) run on the
+Ubuntu VM. Each run, for every marketplace with credentials:
+
+1. **Sales and inventory, current month:** requests the published `WEEK` rows (Sunday to
+   Saturday) for the current month, in windows of at most 7 weeks, and re-pulls them every run.
+2. **Catch-up:** requests any published week inside Amazon's 6-week lookback that is not
+   stored yet (for example after a missed run). Weeks older than the lookback are skipped
+   and logged, never failed.
+3. **Previous month:** requests its `MONTH` row on every run until the month is no longer
+   the previous one, once past day 5 of the month. The `MONTH` row is the authoritative
+   figure for a closed month.
+4. **Forecast:** pulls Amazon's latest forecast and stores it as a version. The same generation
+   date with identical content is `no_data`; with different content it replaces that version.
+   The raw JSON is archived to `archive/forecast/`.
+
+If Amazon has nothing new, the job logs it, writes a run row with status `no_data`, changes
+nothing and exits 0. Any other error (credentials, access, throttling after retries, a
+rejected request) fails the run. Exit codes: `0` all marketplaces succeeded or had
+`no_data`, `1` at least one failed (the others stay committed), `2` nothing could run.
+Throttling (HTTP 429) and 5xx errors are retried after 30s, 60s and 120s.
+
+The same job can be run by hand:
+
+```powershell
+python sp_api_sales_report.py     --weekly-refresh --marketplaces UK --dry-run          # plan only: no Amazon, no database
+python sp_api_sales_report.py     --weekly-refresh --marketplaces UK --sink db --trigger manual
+python sp_api_inventory_report.py --weekly-refresh --marketplaces UK --sink db --trigger manual
+python sp_api_forecast_report.py  --marketplaces US,UK --sink db --trigger manual
+```
+
+`--sink csv|db|both` (default `csv`) works on all three scripts. Weekly rows only
+accumulate from go-live; Amazon serves about 6 weeks of weekly history, so there is no
+weekly backfill. If runs are missed for more than 6 Thursdays the oldest weeks are lost
+for good; the stale-data check in the runbook alerts well before that.
+
+Loading tunables (`.env`): `DB_BATCH_ROWS` (rows per batch, default 500) and
+`DB_FAST_EXECUTEMANY` (`1`/`0`, default `1`; set `0` if the bulk insert misbehaves on a
+network). A marketplace loads in one transaction, so a failure rolls back that
+marketplace only.
 
 ## Diagnostic probes
 
 - `probe_lookback.py` - finds the earliest month `GET_VENDOR_SALES_REPORT` will actually return data for (US credentials). Confirmed 2023-09 as of 2026-09; re-run periodically since the window rolls forward.
 - `probe_inventory_lookback.py` - same, for `GET_VENDOR_INVENTORY_REPORT`. Also confirmed 2023-09 (2026-09-25) - same boundary as the sales report.
+- `probe_weekly_reports.py` - read-only probe of WEEK reports (support, publishing lag, window and lookback limits). `--lag-only` is the quick Thursday re-check; results are in `docs/probe-weekly-results.md`.
 - `probe_token_matrix.py` - checks which LWA client pair (shared vs UK) accepts which refresh token. Prints only the outcome per combination, never secrets.
 
 The lookback probes just print each probed month's outcome (`DONE` vs `FATAL` vs a clean
@@ -207,6 +255,8 @@ rejection) - they don't write or overwrite any CSV or raw JSON output.
 
 ## Known limitations
 
-- **EU marketplaces (UK, DE, FR, IT, ES) are wired but unverified.** Credentials were supplied by Ankush (2026-09-30); no EU report has been run yet. Whether `distributorView: MANUFACTURING` and the 36-month lookback boundary hold for each EU marketplace has not been confirmed - re-run the probe scripts per marketplace before a full backfill. Marketplaces with no credentials configured are skipped with a clear message rather than failing silently.
+- **Marketplace coverage:** US, UK, DE, FR, IT and ES have 36 months of monthly history loaded (September 2026 for all but UK comes from the first weekly run). Weekly reports were probed on US, UK and DE (the shared app, standing in for FR, IT and ES). The forecast report has only been run for US; UK and the EU marketplaces are untested. Marketplaces with no credentials are skipped and reported, and the run exits 1.
+- **FR and IT have no rows in `amazon_asin_sku_map`,** so their ASINs show as unmapped in the `_sku` views until the map is completed.
+- **Publishing lag at cron time is unconfirmed.** The 5-day lag was measured around 14:00 UTC; check with `probe_weekly_reports.py --lag-only` at 06:00 UTC on a Thursday.
 - **`distributorView: MANUFACTURING` is hardcoded.** If Daylight's Vendor Central relationship with Amazon ever changes to a sourcing/distributor model instead, this would need to switch to `SOURCING`.
 - **Credential hygiene:** rotate the client secret and refresh token in Vendor Central if they were ever shared outside a secrets manager — don't hardcode them into this script or commit them anywhere.
