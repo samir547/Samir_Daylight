@@ -2,9 +2,12 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # generated Amazon data - never commit
 *.csv
 raw_*.json
 forecast_snapshots/
 output/
+archive/
+logs/

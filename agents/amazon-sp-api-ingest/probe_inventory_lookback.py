@@ -11,8 +11,7 @@ Run (with your venv activated, in this folder):
 """
 import time
 
-import sp_api_sales_report as spapi
-import sp_api_inventory_report as inv
+import sp_api_common as spapi
 
 client_id, client_secret, refresh_token, token_env = spapi.resolve_credentials("US")
 if not (client_id and client_secret and refresh_token):
@@ -40,7 +39,7 @@ for (y, mo) in candidates:
     print(f"--- probing {y}-{mo:02d} ({months_back} months before last-closed-month {end_y}-{end_m:02d}) ---")
     try:
         report_id = spapi.create_report(host, access_token, marketplace_id, start_iso, end_iso,
-                                         report_type=inv.REPORT_TYPE, report_options=inv.REPORT_OPTIONS)
+                                         report_type="GET_VENDOR_INVENTORY_REPORT", report_options=spapi.MONTH_REPORT_OPTIONS)
         print("  create_report OK, reportId:", report_id)
     except Exception as e:
         resp = getattr(e, "response", None)
