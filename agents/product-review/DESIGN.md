@@ -234,7 +234,7 @@ always picks the newest file by mtime, a stale differently-named leftover in
 **Auth path (unchanged):** ROPC first (fails on this account — MFA), then
 MSAL device-code flow, token cached to `.sp_token_cache.json`. A truly
 unattended run only works until the cached token expires; durable fix is an
-IT app registration with application-level `Sites.Read.All`.
+app registration with application-level `Sites.Selected` (see ISSUE-21).
 
 ## 8. Database load (`infra/db/`)
 
@@ -317,6 +317,19 @@ refactor; keep them green.
   deliberate for Family/Category purposes, but `product_region` specifically
   is therefore not necessarily accurate for those ASINs. Needs a decision
   (prefer `review_country`?), not silently a fix.
+- **SharePoint sign-in is delegated, not app-level (ISSUE-21)** — the pipeline
+  signs in as a person (device-code flow, token cached in `.sp_token_cache.json`),
+  so an unattended run works only while that cached token stays valid, and the
+  pipeline's access depends on one individual's account. The durable design is
+  an Entra app registration (single tenant) with the Microsoft Graph application
+  permission `Sites.Selected`, granted `write` on one SharePoint site only
+  (write is needed to move files from "In Progress" to "Processed"), using the
+  client-credentials flow with a client secret or certificate. Two prerequisites
+  are outside the pipeline's control: (1) the review exports currently sit behind
+  a personal OneDrive sharing link, which `Sites.Selected` cannot cover — they
+  would need to move into a SharePoint team site; (2) a Daylight tenant admin must
+  register the app and grant consent. Parked until Daylight decides to take both
+  on. The client secret expires (24 months maximum) and would need a renewal owner.
 - **Bright Data replacement undecided (ISSUE-03)** — Varun is pulling Amazon
   data manually in the interim; the replacement should become a
   `ReviewSource` implementation.
