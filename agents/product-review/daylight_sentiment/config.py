@@ -20,11 +20,15 @@ class LLMProvider(Enum):
 @dataclass
 class ClaudeSettings:
     api_key: Optional[str] = None
+    # Overridable per environment with CLAUDE_MODEL, and per run with --model.
     model: str = "claude-sonnet-4-6"
 
     @classmethod
     def from_env(cls) -> "ClaudeSettings":
-        return cls(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        return cls(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            model=os.getenv("CLAUDE_MODEL") or cls.model,
+        )
 
 
 @dataclass

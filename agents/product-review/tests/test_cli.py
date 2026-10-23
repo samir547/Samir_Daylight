@@ -55,6 +55,16 @@ class TestBuildConfig:
         assert config.model_name == "claude-x"
 
 
+    def test_claude_model_env_applies_without_flag(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODEL", "claude-env-model")
+        assert build_config(parse_args([])).model_name == "claude-env-model"
+
+    def test_model_flag_overrides_claude_model_env(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_MODEL", "claude-env-model")
+        config = build_config(parse_args(["--model", "claude-flag-model"]))
+        assert config.model_name == "claude-flag-model"
+
+
 class TestApplyRerunFlags:
     DONE = {
         "trustpilot:product:1": {"review_type": "product"},

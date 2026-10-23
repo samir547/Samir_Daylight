@@ -84,6 +84,21 @@ def test_model_name_follows_provider():
     assert cfg.model_name == "claude-x"
 
 
+def test_claude_model_defaults_without_env(monkeypatch):
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+    assert Config.from_env(dotenv=False).claude.model == "claude-sonnet-4-6"
+    monkeypatch.setenv("CLAUDE_MODEL", "")  # set but empty -> still the default
+    assert Config.from_env(dotenv=False).claude.model == "claude-sonnet-4-6"
+
+
+def test_claude_model_from_env(monkeypatch):
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-env-model")
+    cfg = Config.from_env(dotenv=False)
+    assert cfg.claude.model == "claude-env-model"
+    assert cfg.model_name == "claude-env-model"
+    assert Config().claude.model == "claude-sonnet-4-6"  # plain Config ignores env
+
+
 def test_configured_properties():
     assert not DatabaseSettings().configured
     assert DatabaseSettings(server="s", user="u", password="p").configured
