@@ -280,7 +280,8 @@ checkpoint format stay the same whichever provider runs. To add one:
    `FatalProviderError` for anything that would fail every call.
 4. Register the class in `_ANALYZERS` in `infra/analyzers/factory.py`.
    `--provider` picks up the new member automatically.
-5. Add the SDK to `requirements.txt` and its variables to `.env.example`.
+5. Pin the SDK in `requirements.txt`, regenerate `constraints.txt` (see its
+   header), and add its variables to `.env.example`.
 
 ## 6. Output files
 
@@ -292,12 +293,30 @@ checkpoint format stay the same whichever provider runs. To add one:
 
 ### 7.1 Build / install
 
+Supported Python version: **3.12** (the system Python on the Ubuntu 24.04
+production VM; the pinned files are tested on Python 3.12.3).
+
 ```bash
-cd agents\product-review        # from the repository root
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-pip install -r requirements.txt
+cd agents/product-review        # from the repository root
+python3 -m venv .venv
+source .venv/bin/activate       # Linux (Windows: .venv\Scripts\activate)
+pip install -r requirements.txt -c constraints.txt
 ```
+
+Dependencies are pinned to exact tested versions:
+
+- `requirements.txt` — the direct runtime dependencies.
+- `requirements-dev.txt` — the runtime dependencies plus `pytest` and
+  `httpx` (imported directly by the tests), for running the test suite (§7.3).
+- `constraints.txt` — every package, including sub-dependencies, at the
+  version tested. Always pass it with `-c` so a rebuild installs the same set.
+
+**System prerequisite.** `pyodbc` needs Microsoft's "ODBC Driver 18 for SQL
+Server" installed on the machine; it is an operating-system package, not a
+Python package, so pip does not install it. On Linux, check it is installed
+with `odbcinst -q -d`, which should list `[ODBC Driver 18 for SQL Server]`. To
+install it, follow Microsoft's official instructions:
+[Install the Microsoft ODBC driver for SQL Server (Linux)](https://learn.microsoft.com/en-us/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server).
 
 Create `.env` by copying `.env.example` and filling in real values (the
 Anthropic API key, SharePoint and database settings; optionally
@@ -382,8 +401,15 @@ from a new machine during the VM migration.
 
 ### 7.3 Test / validate
 
-A pytest suite lives in `tests/` (run `pytest` from this folder; `pytest.ini`
-is already configured). Beyond the unit tests, validate a run by inspecting
+A pytest suite lives in `tests/`. Install the test dependencies and run it
+from this folder (`pytest.ini` is already configured):
+
+```bash
+pip install -r requirements-dev.txt -c constraints.txt
+python -m pytest
+```
+
+Beyond the unit tests, validate a run by inspecting
 its own output:
 
 1. **Smoke test first, always.** Run with `--limit 20` on whichever model

@@ -1,0 +1,5 @@
+# Runtime dependencies plus the test runner and httpx (imported directly by the tests).
+# Install with: pip install -r requirements-dev.txt -c constraints.txt
+-r requirements.txt
+pytest==9.1.1
+httpx==0.28.1
