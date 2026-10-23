@@ -5,7 +5,8 @@ and Amazon review exports via automated SharePoint sync, classifies every
 review's sentiment with an LLM (Claude), translates non-English
 reviews, and loads the results into the Azure SQL Server database that the
 Power BI dashboards read from — unattended, end to end, on a single
-invocation. Structured as the `daylight_sentiment` package; see `DESIGN.md`
+invocation. After loading new reviews it also writes the top 3 to-do items
+for the business, for Power BI (§7.6). Structured as the `daylight_sentiment` package; see `DESIGN.md`
 for the full architecture and current known issues.
 
 ---
@@ -82,12 +83,20 @@ without touching the pipeline (see §5).
  │                    │  to the DB row -- a separate concern from sentiment,
  │                    │  reusing the same analyzer, not the same JSON files
  └─────────────────┘
+        │
+        ▼
+ ┌─────────────────┐   run_action_items() (only when this run loaded new reviews)
+ │ 10. ACTION ITEMS  │  one LLM call over a summary of the stored results;
+ │                    │  saves the top 3 to-do items for Power BI (§7.6)
+ └─────────────────┘
 ```
 
 Stage 1 is skipped (using whatever's already in `Reviews/`) when `SP_*` env
 vars aren't set or `--skip-sharepoint-sync` is passed — see §7.4. Stages 8
 and 9 are each independently skippable (`--skip-db-load`, `--skip-translation`)
-and both depend on `DB_*` being set at all — see §7.4 and §8.
+and both depend on `DB_*` being set at all — see §7.4 and §8. Stage 10 runs
+only when stage 8 loaded reviews analysed in this run; `--skip-action-items`
+skips it (§7.6).
 
 Step 5 happens continuously during step 4 (not after) — every individual
 result is flushed to the checkpoint file as soon as it's done, which is what
@@ -371,11 +380,13 @@ Flags: `--provider {claude}` (default `claude`), `--model <override>`
 `--skip-db-load`, `--skip-translation`, `--load-db-only`,
 `--sync-sharepoint-only` (download the new files into `Reviews/` and stop),
 `--keep-output-files` (don't delete the JSON outputs after a successful DB
-load).
+load), `--skip-action-items`, `--action-items-months N`,
+`--action-items-only`, `--action-items-dry-run` (see §7.6).
 
 Exit codes: `0` finished (including "nothing new in SharePoint"), `1` the
-Claude API rejected the run (key, billing or model — see §4.5), `2`
-SharePoint sign-in is needed (see §7.5).
+Claude API rejected the run (key, billing or model — see §4.5), or
+`--action-items-only` couldn't produce the items, `2` SharePoint sign-in is
+needed (see §7.5).
 
 Operator tools live in `scripts/` and are run as modules from the repo root
 (the same form as the pipeline itself), e.g.:
@@ -537,6 +548,66 @@ last log line starts `SharePoint sync:` and lists how many sources had a new
 file. The next scheduled run then signs in silently. To process the files
 straight away instead of waiting, run the pipeline once by hand
 (`python -m daylight_sentiment.cli`).
+
+### 7.6 Action items for the business
+
+After a run that analysed and loaded new reviews, the pipeline writes the
+**top 3 to-do items** for the business, for the Financial Director to read
+in Power BI. Each item has a rank (1 = biggest business impact), a short
+title that starts with a verb, what to do, why (citing the review numbers),
+the area it concerns (a sector group, a service aspect, a region, or
+"overall") and one sentence of evidence. They are read-only advice: there is
+no status tracking or write-back.
+
+**What they're based on.** The analysed reviews in `dbo.vw_review_analysis`
+whose review date falls in the last 12 months. The 12 months end on the
+**newest review date in the database**, not today, so the period doesn't
+shrink while no new files arrive. If fewer than 100 reviews fall in it, all
+dated reviews are used instead; if that's still fewer than 50, no items are
+generated and the log says why. The code summarises the reviews (counts and
+negative shares by review type and source, sector group, service aspect and
+region; the most frequent complaint themes; the monthly negative share; up
+to 10 short negative quotes, with no reviewer names) and makes one LLM call
+on that summary. The reply is checked (exactly 3 items, ranks 1-3, every
+field filled in, within length limits, a known area) before the 3 items are
+saved together in `dbo.sentiment_action_items`; a reply that fails the check
+is logged and nothing is saved. Every generation is kept.
+
+**Flags.**
+
+- `--skip-action-items` — don't generate them in this run.
+- `--action-items-months N` — base them on the last N months instead of 12
+  (or set `ACTION_ITEMS_WINDOW_MONTHS` in `.env`).
+- `--action-items-only` — skip SharePoint, loading and analysis; generate
+  from what's already in the database, then exit. Exit code `1` if it
+  fails.
+- `--action-items-dry-run` — generate and print the items but don't save
+  them.
+
+```bash
+# Preview from the data already in the database, saving nothing
+python -m daylight_sentiment.cli --action-items-only --action-items-dry-run
+
+# Regenerate on demand and save (e.g. after a manual load)
+python -m daylight_sentiment.cli --action-items-only
+
+# Same, over the last 6 months
+python -m daylight_sentiment.cli --action-items-only --action-items-months 6
+```
+
+In a normal run, a failure here (the model's reply failed the check, the
+view is missing, a network error) logs one `ERROR` line starting
+`Action items were not generated` and doesn't change the exit code: the
+reviews are already saved. An invalid API key or exhausted credit still
+stops the run with exit code `1`, as everywhere else.
+
+**Power BI.** Use the view `dbo.vw_latest_action_items`
+(`SQL/views/vw_latest_action_items.sql`). It returns the 3 rows of the newest
+generation; sort by `item_rank`. Its `basis` column reads like "Based on 710
+reviews from 2025-08-21 to 2026-08-20", so readers can see how recent the
+reviews behind the advice are. The pipeline creates the table itself, but its
+database login can't create views: an administrator applies the view file in
+SSMS once (and again whenever it changes).
 
 ## 8. Known things to watch
 

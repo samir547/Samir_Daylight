@@ -36,6 +36,9 @@ daylight_sentiment/
     domain/                 pure logic, no I/O, depends on nothing in-tree
         taxonomy.py           SECTORS / ASPECTS / SENTIMENTS
         prompts.py            SENTIMENT_GUIDANCE, prompts, _build_context, ...
+        action_items.py       review window, summary, reply validation for
+                              the business to-do items (see §8a)
+        action_items_prompt.py  the to-do items prompt
         normalise.py          _normalise, _sanitise_sector_label, _strip_fences,
                               _align_batch
     infra/                  external I/O; depends only on config + domain
@@ -44,7 +47,8 @@ daylight_sentiment/
                               helpers, resolve_source_file(), load_reviews()
         sharepoint_sync.py    SharePointSync, pattern-matched (see §7)
         db/                   connect(), schema MIGRATIONS registry,
-                              ReviewRepository, RunRepository
+                              ReviewRepository, RunRepository,
+                              ActionItemRepository
         analyzers/            SentimentAnalyzer ABC (base.py),
                               errors.py (typed provider errors),
                               claude_analyzer.py, factory.py (provider registry)
@@ -54,6 +58,7 @@ daylight_sentiment/
         aggregator.py         AnalysisAggregator
         output_generator.py   OutputGenerator
         checkpoint.py         load_checkpoint() + CheckpointWriter
+        action_items.py       generate_action_items() (see §8a)
     cli.py                  parse_args + a thin main() wiring phase functions
 scripts/                    operator tools that import the package (not library
                             code): translate_reviews, test_prompt_on_review,
@@ -77,7 +82,12 @@ supported indefinitely.
 2. parse_args() + build_config()                   -> Config.from_env() + CLI overrides
 3. configure_logging()                             -> multi_source_sentiment.log + stdout
 
-4. if args.load_db_only:
+4. if args.action_items_only:
+       action_items_only(config)                   -> run_action_items() on the
+                                                      reviews already in the DB
+       return 0, or 1 on any failure                <-- early exit (§8a)
+
+   if args.load_db_only:
        load_database(config, existing JSON)
        delete_analysis_outputs(config)   [unless --keep-output-files]
        return                                      <-- early exit
@@ -127,6 +137,13 @@ supported indefinitely.
         then LLM translation of fr/de/it/es/nl/sv/pl/cs rows where
         review_text_en IS NULL; writes review_text_en + detected_language.
         A FatalProviderError stops the pass and main() exits 1
+
+13. run_action_items(config, analyzer)             [if step 11 loaded, this run
+                                                    analysed new reviews (not
+                                                    replayed from the checkpoint),
+                                                    not --skip-action-items]
+        the top 3 business to-do items (§8a). Any failure logs one ERROR line
+        and the exit code is unchanged; a FatalProviderError exits 1
 ```
 
 **Key invariants:**
@@ -142,8 +159,9 @@ supported indefinitely.
   files, or by `python -m scripts.translate_reviews`.
 
 **Exit codes:** `0` finished, including the "nothing new in SharePoint" early
-exit; `1` fatal LLM provider error (`FatalProviderError`); `2` SharePoint
-sign-in needed (`SharePointSignInRequiredError`).
+exit; `1` fatal LLM provider error (`FatalProviderError`), or
+`--action-items-only` failed; `2` SharePoint sign-in needed
+(`SharePointSignInRequiredError`).
 
 ## 4. Data sources & the `uid` key
 
@@ -315,9 +333,10 @@ registration with application-level `Sites.Selected` (see ISSUE-21).
 Target: `daylight-powerbi-db-1.database.windows.net` / `DAYHANSA_SQL1`.
 `connection.connect()` is the public connection factory (Packet Size=4096 and
 the 120s statement timeout — see Network resilience). `ensure_schema()`
-applies an ordered, idempotent, append-only `MIGRATIONS` registry (both
-CREATEs + the guarded `model_number` / `review_country` ALTERs). New schema
-changes are appended to that registry.
+applies an ordered, idempotent, append-only `MIGRATIONS` registry (the
+reviews and runs CREATEs, the guarded `model_number` / `review_country`
+ALTERs, and the `sentiment_action_items` CREATE). New schema changes are
+appended to that registry.
 
 ### `dbo.sentiment_analysis_reviews` (`ReviewRepository`)
 Primary key: `uid`. `MERGE ... USING (VALUES ...)`, 50 rows/statement
@@ -347,6 +366,84 @@ header), consolidates sectors via `dbo.sector_group_map`, and exposes
 `review_text_en`, `detected_language`, and `review_text_display`
 (`COALESCE(review_text_en, review_text)`) for Power BI.
 
+## 8a. Action items (`application/action_items.py`)
+
+The top 3 to-do items for the business, from the stored sentiment results,
+read by the client's Financial Director in Power BI. Read-only: no status
+tracking or write-back.
+
+**Position.** Step 13 of §3: after the database load, the move to Processed
+and the translation pass, so the reviews from this run are in the database
+with their English text. It runs only when this run analysed and loaded new
+reviews, so it is skipped by the "nothing new" early exit, `--skip-db-load`,
+`--load-db-only` and a run with no `DB_*`. `--action-items-only` runs it on
+its own.
+
+**Flow** (`generate_action_items()`):
+
+1. `ActionItemRepository.fetch_analysed_rows()` reads analysed rows
+   (`sentiment IS NOT NULL`) from `dbo.vw_review_analysis`: `uid`,
+   `review_type`, `review_source`, `sentiment`, `confidence`, `rating`,
+   `sector_group`, `primary_aspect`, `product_region`, `key_themes`,
+   `review_date_parsed`, plus `review_text_en` / `review_text` for negative
+   reviews only. `reviewer_name` is never read.
+2. `domain.action_items.select_window()`: rows with no `review_date_parsed`
+   are left out and counted in the log. The window is the last
+   `window_months` (default 12, `ACTION_ITEMS_WINDOW_MONTHS`,
+   `--action-items-months`) ending on the newest review date, not today.
+   Under `min_window_reviews` (100) it widens to every dated review; under
+   `min_total_reviews` (50) even then, generation is skipped with a WARNING
+   (not a failure). Settings: `ActionItemSettings` in `config.py`.
+3. `build_summary()`: totals and sentiment split; by review type and source;
+   product reviews by `sector_group` and service reviews by `primary_aspect`
+   (count, negative count, negative share); product reviews by
+   `product_region`; the 15 most frequent `key_themes` among negative reviews
+   (JSON parsed defensively, lower-cased); monthly negative share; up to 10
+   negative excerpts (most confident first, round-robin across areas,
+   identical texts once, English text preferred, 300 characters, email
+   addresses and phone numbers blanked).
+4. One `analyzer.complete_json(prompt, max_tokens=1500)` call with the prompt
+   from `domain/action_items_prompt.py`: plain British English for a
+   non-technical reader, exactly 3 items ranked by business impact, titles
+   starting with a verb, only numbers from the summary, cited evidence, say
+   when data is thin, no generic advice.
+5. `validate_action_items()`: exactly 3 items, ranks 1-3 once each, every
+   field a non-empty string within its cap (`title` 200 and `related_area`
+   100, the column sizes; the text fields 1,000-1,500), `related_area`
+   "overall" or a group/aspect/region in the summary. Anything else raises
+   `ActionItemsValidationError`; nothing is saved.
+6. `ActionItemRepository.save()` applies `ensure_schema()` and inserts the 3
+   rows in one transaction (rolled back on any error).
+
+**Table `dbo.sentiment_action_items`** (`SQL/tables/sentiment_action_items.sql`,
+and the last `MIGRATIONS` entry): `item_id INT IDENTITY PK`,
+`generation_id UNIQUEIDENTIFIER` (the 3 rows of one generation),
+`generated_at DATETIME2 DEFAULT SYSUTCDATETIME()`, `run_timestamp` (the
+run's `sentiment_analysis_runs.run_timestamp`; NULL for
+`--action-items-only`; not an enforced foreign key), `[rank] TINYINT`,
+`title NVARCHAR(200)`, `description`, `rationale`, `evidence`
+(`NVARCHAR(MAX)`), `related_area NVARCHAR(100)`, `window_start`,
+`window_end` (`DATE`), `reviews_analysed INT`, `llm_provider`, `llm_model`;
+`UNIQUE (generation_id, [rank])`. Insert-only: every generation is kept.
+
+**View `dbo.vw_latest_action_items`** (`SQL/views/vw_latest_action_items.sql`):
+the rows of the newest generation (latest `generated_at`, then highest
+`item_id`), with `item_rank` for sorting and a `basis` column ("Based on N
+reviews from <window_start> to <window_end>"). The pipeline's login
+(`daylight_agents`) can create tables but not views, so an administrator
+applies this file in SSMS.
+
+**Flags:** `--skip-action-items`, `--action-items-months N`,
+`--action-items-only`, `--action-items-dry-run` (generate and print, write
+nothing; combinable with `--action-items-only`).
+
+**Failure behaviour.** In a normal run any failure (provider error, reply
+that fails validation, missing view, database error) logs one ERROR line,
+`Action items were not generated: ...`, and the exit code stays what it
+would otherwise be: the reviews are already saved. `--action-items-only`
+exits 1 on the same failures. A `FatalProviderError` is reported as
+everywhere else and exits 1.
+
 ## 9. Testing
 
 `python -m pytest` — offline, no API/DB access, ~1.5s. Characterization tests
@@ -372,6 +469,10 @@ refactor; keep them green.
 | `--load-db-only` | Skip sync + analysis; load existing JSON and exit (no translation) |
 | `--sync-sharepoint-only` | Download new files into `Reviews/` and exit; also the sign-in recovery command |
 | `--keep-output-files` | Load the DB as normal, but don't delete the JSON afterward |
+| `--skip-action-items` | Don't generate the business to-do items (§8a) |
+| `--action-items-months N` | Base the to-do items on the last N months (default 12) |
+| `--action-items-only` | Skip sync, analysis and loading; generate the to-do items from the database and exit (1 on failure) |
+| `--action-items-dry-run` | Generate and print the to-do items without saving them |
 
 ## 11. Known issues
 
@@ -408,6 +509,11 @@ refactor; keep them green.
   would need to move into a SharePoint team site; (2) a Daylight tenant admin must
   register the app and grant consent. Parked until Daylight decides to take both
   on. The client secret expires (24 months maximum) and would need a renewal owner.
+- **Action items wording varies between runs** — the to-do items call runs
+  at the provider's default temperature (no fixed temperature is set), so
+  regenerating from the same data can rank or word the items differently.
+  Each generation is stored with its window and model, and Power BI shows
+  only the latest.
 - **Bright Data replacement undecided (ISSUE-03)** — Varun is pulling Amazon
   data manually in the interim; the replacement should become a
   `ReviewSource` implementation.
