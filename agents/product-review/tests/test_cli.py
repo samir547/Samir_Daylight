@@ -126,7 +126,8 @@ SOURCE_KEYS = ("trustpilot_product", "trustpilot_service", "amazon_brightdata")
 # Everything after the sync that analyses, writes, loads, moves or deletes.
 WORK_PHASES = {"load_reviews", "build_analyzer", "process_all_reviews", "write_outputs",
                "load_database", "delete_analysis_outputs",
-               "move_synced_files_to_processed", "run_translation"}
+               "move_synced_files_to_processed", "run_translation", "run_action_items"}
+NEW_RESULT = {"uid": "trustpilot:product:1", "analysis": {"sentiment": "positive"}}
 
 
 def _sync_results(*synced_keys):
@@ -146,7 +147,8 @@ class TestMainPhases:
     @pytest.fixture
     def run(self, monkeypatch, tmp_path):
         calls = []
-        state = {"sync": None, "move": None}
+        state = {"sync": None, "move": None, "results": [NEW_RESULT], "done": {},
+                 "action": None, "action_kwargs": []}
         config = Config(db=DatabaseSettings(server="s", name="n", user="u", password="p"))
         config.output_dir = tmp_path
 
@@ -172,29 +174,44 @@ class TestMainPhases:
 
             def process_all_reviews(self, *a, **k):
                 calls.append("process_all_reviews")
-                return []
+                return list(state["results"])
 
         def fake_move(config, sync_results):
             calls.append("move_synced_files_to_processed")
             if state["move"]:
                 raise state["move"]
 
+        def fake_action_items(config, analyzer, **kwargs):
+            calls.append("run_action_items")
+            state["action_kwargs"].append(kwargs)
+            if state["action"]:
+                raise state["action"]
+
         summary = {"total_reviews_analyzed": 0, "failed_reviews": 0, "overall_sentiment": {}}
         monkeypatch.setattr(cli, "sync_sharepoint", fake_sync)
         monkeypatch.setattr(cli, "load_reviews", record("load_reviews", []))
         monkeypatch.setattr(cli, "build_analyzer", record("build_analyzer", object()))
-        monkeypatch.setattr(cli, "resume_state", record("resume_state", {}))
+        monkeypatch.setattr(cli, "resume_state", lambda *a: dict(state["done"]))
         monkeypatch.setattr(cli, "MultiSourcePipeline", FakePipeline)
         monkeypatch.setattr(cli, "write_outputs", record(
-            "write_outputs", ({"summary": summary}, tmp_path / "s.json", tmp_path / "d.json")))
+            "write_outputs", ({"summary": summary, "metadata": {"timestamp": "2026-10-24T09:00:00"}},
+                              tmp_path / "s.json", tmp_path / "d.json")))
         monkeypatch.setattr(cli, "load_database", record("load_database"))
         monkeypatch.setattr(cli, "delete_analysis_outputs", record("delete_analysis_outputs"))
         monkeypatch.setattr(cli, "move_synced_files_to_processed", fake_move)
         monkeypatch.setattr(cli, "run_translation", record("run_translation"))
+        monkeypatch.setattr(cli, "run_action_items", fake_action_items)
 
-        def go(argv=(), sync=None, move=None):
-            state["sync"], state["move"] = sync, move
+        def go(argv=(), sync=None, move=None, results=None, done=None, action=None):
+            state["sync"], state["move"], state["action"] = sync, move, action
+            if results is not None:
+                state["results"] = results
+            if done is not None:
+                state["done"] = done
+            calls.clear()
             return cli.main(list(argv)), calls
+        go.state = state
+        go.config = config
         return go
 
     def test_sign_in_required_during_sync_exits_2_and_does_nothing(self, run, caplog):
@@ -247,3 +264,210 @@ class TestMainPhases:
     def test_sync_only_with_nothing_new_exits_0(self, run):
         code, calls = run(["--sync-sharepoint-only"], sync=_sync_results())
         assert code == 0 and calls == ["sync_sharepoint"]
+
+
+class TestActionItemsWiring:
+    """The action-items step's position, gating and failure handling in
+    main(), all phases faked."""
+
+    run = TestMainPhases.run
+
+    def test_parse_args_flags(self):
+        args = parse_args(["--skip-action-items", "--action-items-months", "6",
+                           "--action-items-only", "--action-items-dry-run"])
+        assert args.skip_action_items and args.action_items_only
+        assert args.action_items_dry_run and args.action_items_months == 6
+        defaults = parse_args([])
+        assert defaults.action_items_months is None
+        assert not (defaults.skip_action_items or defaults.action_items_only
+                    or defaults.action_items_dry_run)
+
+    @pytest.mark.parametrize("value", ["0", "-3", "six"])
+    def test_months_must_be_positive(self, value):
+        with pytest.raises(SystemExit):
+            parse_args(["--action-items-months", value])
+
+    def test_months_flag_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("ACTION_ITEMS_WINDOW_MONTHS", "18")
+        assert build_config(parse_args([])).action_items.window_months == 18
+        config = build_config(parse_args(["--action-items-months", "6"]))
+        assert config.action_items.window_months == 6
+
+    def test_runs_after_load_move_and_translation(self, run):
+        code, calls = run(sync=_sync_results("trustpilot_product"))
+        assert code == 0
+        order = [c for c in calls if c in ("load_database", "move_synced_files_to_processed",
+                                           "run_translation", "run_action_items")]
+        assert order == ["load_database", "move_synced_files_to_processed",
+                         "run_translation", "run_action_items"]
+        assert run.state["action_kwargs"] == [
+            {"run_timestamp": "2026-10-24T09:00:00", "dry_run": False}]
+
+    def test_skipped_when_nothing_new_in_sharepoint(self, run):
+        code, calls = run(sync=_sync_results())
+        assert code == 0 and "run_action_items" not in calls
+
+    def test_skipped_when_no_review_was_newly_analysed(self, run):
+        # Everything replayed from the checkpoint...
+        code, calls = run(done={NEW_RESULT["uid"]: NEW_RESULT})
+        assert code == 0 and "run_action_items" not in calls
+        # ...or every new review failed this run.
+        code, calls = run(results=[{"uid": "x", "analysis": None, "error": "boom"}], done={})
+        assert code == 0 and "run_action_items" not in calls
+
+    def test_count_newly_analysed(self):
+        assert cli.count_newly_analysed([NEW_RESULT], {}) == 1
+        assert cli.count_newly_analysed([NEW_RESULT], {NEW_RESULT["uid"]: NEW_RESULT}) == 0
+
+    def test_skip_flag(self, run):
+        code, calls = run(["--skip-action-items"])
+        assert code == 0 and "run_action_items" not in calls
+        assert "run_translation" in calls
+
+    def test_skip_db_load_skips_it(self, run):
+        code, calls = run(["--skip-db-load"])
+        assert code == 0 and "run_action_items" not in calls
+
+    def test_no_database_configured_skips_it(self, run):
+        run.config.db = DatabaseSettings()
+        code, calls = run()
+        assert code == 0 and "run_action_items" not in calls
+
+    def test_load_db_only_skips_it(self, run):
+        code, calls = run(["--load-db-only"])
+        assert code == 0 and "run_action_items" not in calls
+
+    def test_runs_with_skip_translation(self, run):
+        code, calls = run(["--skip-translation"])
+        assert code == 0 and "run_translation" not in calls
+        assert calls[-1] == "run_action_items"
+
+    @pytest.mark.parametrize("error", [
+        RuntimeError("Invalid object name 'dbo.vw_review_analysis'"),
+        ValueError("expected 3 items, got 2"),
+    ])
+    def test_failure_keeps_the_exit_code_and_logs_one_error(self, run, caplog, error):
+        with caplog.at_level("INFO", logger="multi_source_sentiment"):
+            code, calls = run(sync=_sync_results("trustpilot_product"), action=error)
+        assert code == 0
+        assert calls[-1] == "run_action_items"
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "Action items were not generated" in errors[0].getMessage()
+        assert str(error) in errors[0].getMessage()
+
+    def test_fatal_provider_error_keeps_its_handling(self, run):
+        from daylight_sentiment.infra.analyzers import FatalProviderError
+        code, _ = run(action=FatalProviderError("invalid x-api-key"))
+        assert code == 1
+
+    def test_dry_run_flag_passed_through(self, run):
+        run(["--action-items-dry-run"])
+        assert run.state["action_kwargs"][-1]["dry_run"] is True
+
+    def test_only_mode_skips_everything_else(self, run):
+        code, calls = run(["--action-items-only"], sync=_sync_results("amazon_brightdata"))
+        assert code == 0
+        assert calls == ["build_analyzer", "run_action_items"]
+        assert run.state["action_kwargs"] == [{"dry_run": False}]
+
+    def test_only_mode_dry_run(self, run):
+        code, calls = run(["--action-items-only", "--action-items-dry-run"])
+        assert code == 0 and calls == ["build_analyzer", "run_action_items"]
+        assert run.state["action_kwargs"] == [{"dry_run": True}]
+
+    def test_only_mode_failure_exits_1(self, run, caplog):
+        code, _ = run(["--action-items-only"], action=ValueError("expected 3 items, got 4"))
+        assert code == 1
+        assert "Action items were not generated: ValueError" in caplog.text
+
+    def test_only_mode_fatal_provider_error_exits_1(self, run, caplog):
+        from daylight_sentiment.infra.analyzers import FatalProviderError
+        code, _ = run(["--action-items-only"], action=FatalProviderError("no credit"))
+        assert code == 1
+        assert "Stopping: the claude API rejected the request" in caplog.text
+
+    def test_only_mode_without_database_exits_1(self, run):
+        run.config.db = DatabaseSettings()
+        code, calls = run(["--action-items-only"])
+        assert code == 1 and calls == []
+
+
+class TestActionItemsEndToEndOffline:
+    """The real run_action_items() + generate_action_items() with a fake
+    repository and a fake second provider registered in the analyzer factory."""
+
+    REPLY = {"items": [
+        {"rank": r, "title": f"Reduce glare {r}", "description": "Do it.",
+         "rationale": "38 of 150 reviews are negative.", "related_area": "Beauty",
+         "evidence": "38 negative reviews mention glare."} for r in (1, 2, 3)]}
+
+    def _setup(self, monkeypatch, reply):
+        from datetime import date
+        from enum import Enum
+        from types import SimpleNamespace
+
+        from daylight_sentiment.infra.analyzers import SentimentAnalyzer, factory
+
+        class OtherProvider(Enum):
+            FAKE = "fake"
+
+        class FakeProviderAnalyzer(SentimentAnalyzer):
+            def __init__(self, config):
+                pass
+
+            def complete_json(self, prompt, max_tokens=None):
+                return reply
+
+            def analyze_product_review(self, text, product_name=None, rating=None):
+                return {}
+
+            def analyze_service_review(self, text, rating=None):
+                return {}
+
+        rows = [{"uid": f"u{i}", "review_type": "product", "review_source": "amazon",
+                 "sentiment": "negative" if i % 4 == 0 else "positive", "confidence": 0.8,
+                 "rating": 3, "sector_group": "Beauty", "primary_aspect": None,
+                 "product_region": "UK", "key_themes": '["glare"]',
+                 "review_date_parsed": date(2026, 7, 1), "review_text_en": None,
+                 "review_text": "too much glare" if i % 4 == 0 else None}
+                for i in range(150)]
+        saved = []
+
+        class FakeRepository:
+            def __init__(self, settings):
+                pass
+
+            def fetch_analysed_rows(self):
+                return rows
+
+            def save(self, items, *args):
+                saved.append((items, args))
+                return "gid"
+
+        monkeypatch.setitem(factory._ANALYZERS, OtherProvider.FAKE, FakeProviderAnalyzer)
+        monkeypatch.setattr(cli, "ActionItemRepository", FakeRepository)
+        config = Config(llm_provider=OtherProvider.FAKE,
+                        db=DatabaseSettings(server="s", name="n", user="u", password="p"))
+        object.__setattr__(config, "fake", SimpleNamespace(model="fake-model"))
+        return config, saved
+
+    def test_second_provider_generates_and_saves(self, monkeypatch):
+        config, saved = self._setup(monkeypatch, self.REPLY)
+        assert cli.action_items_only(config, dry_run=False) == 0
+        [(items, args)] = saved
+        assert [i["rank"] for i in items] == [1, 2, 3]
+        assert args[2:5] == (150, "fake", "fake-model")
+
+    def test_dry_run_prints_and_writes_nothing(self, monkeypatch, capsys):
+        config, saved = self._setup(monkeypatch, self.REPLY)
+        assert cli.action_items_only(config, dry_run=True) == 0
+        assert saved == []
+        out = capsys.readouterr().out
+        assert "Based on 150 reviews from 2025-07-02 to 2026-07-01" in out
+        assert "1. Reduce glare 1  [Beauty]" in out
+
+    def test_invalid_reply_saves_nothing_and_exits_1(self, monkeypatch):
+        config, saved = self._setup(monkeypatch, {"items": self.REPLY["items"][:2]})
+        assert cli.action_items_only(config, dry_run=False) == 1
+        assert saved == []
