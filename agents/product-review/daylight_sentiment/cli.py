@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,7 +20,11 @@ from daylight_sentiment.application.output_generator import OutputGenerator
 from daylight_sentiment.application.pipeline import MultiSourcePipeline
 from daylight_sentiment.config import Config, LLMProvider
 from daylight_sentiment.logging_setup import configure_logging as _configure_logging
-from daylight_sentiment.infra.analyzers import SentimentAnalyzer, build_analyzer
+from daylight_sentiment.infra.analyzers import (
+    FatalProviderError,
+    SentimentAnalyzer,
+    build_analyzer,
+)
 from daylight_sentiment.infra.db import (
     REVIEWS_TABLE,
     RUNS_TABLE,
@@ -38,6 +41,7 @@ from daylight_sentiment.infra.review_sources import (
     load_reviews,
 )
 from daylight_sentiment.infra.sharepoint_sync import (
+    SharePointSignInRequiredError,
     SharePointSync,
     SourceSpec,
     SourceSyncResult,
@@ -49,13 +53,14 @@ logger = logging.getLogger("multi_source_sentiment")
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-source sentiment pipeline")
     p.add_argument("--provider", choices=[e.value for e in LLMProvider],
-                   default=os.getenv("LLM_PROVIDER", "groq"))
+                   default=LLMProvider.CLAUDE.value,
+                   help="LLM provider (default: claude)")
     p.add_argument("--model", help="Override the provider's default model")
     p.add_argument("--limit", type=int, help="Only process the first N reviews (smoke test)")
     p.add_argument("--workers", type=int, default=None,
                    help="Concurrent worker threads (default 8)")
     p.add_argument("--batch-size", type=int, default=None,
-                   help="Reviews per LLM call; 1 disables batching (default 10)")
+                   help="Reviews per unit of work handed to a worker thread (default 10)")
     p.add_argument("--fresh-start", action="store_true",
                    help="Ignore the checkpoint and reprocess every review from scratch. "
                         "By default the pipeline always resumes from the checkpoint -- "
@@ -107,10 +112,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.model:
-        if config.llm_provider is LLMProvider.GROQ:
-            config.groq_model = args.model
-        else:
-            config.claude_model = args.model
+        getattr(config, config.llm_provider.value).model = args.model
     config.output_dir.mkdir(parents=True, exist_ok=True)
     return config
 
@@ -313,10 +315,23 @@ def run_translation(config: Config, analyzer: SentimentAnalyzer) -> None:
                 stats["matched"], stats["translated"], stats["failed"])
 
 
+def report_fatal_provider_error(config: Config, exc: FatalProviderError) -> int:
+    logger.error("Stopping: the %s API rejected the request in a way every other call "
+                 "would repeat (invalid API key, no credit, missing permission or unknown "
+                 "model %r): %s", config.llm_provider.value, config.model_name, exc)
+    logger.error("Fix the key, billing or model setting and rerun; reviews that were not "
+                 "analysed stay pending and the run resumes from the checkpoint.")
+    return 1
+
+
+def report_sign_in_required(exc: SharePointSignInRequiredError) -> int:
+    logger.error("%s", exc)
+    return 2
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # .env is loaded here -- explicitly, at the entry point -- never at import
-    # time (ISSUE-11). It must precede parse_args(), whose --provider default
-    # reads LLM_PROVIDER from the environment.
+    # time (ISSUE-11).
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -337,10 +352,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.sync_sharepoint_only:
-        sync_sharepoint(config, skip=False)
+        try:
+            sync_sharepoint(config, skip=False)
+        except SharePointSignInRequiredError as exc:
+            return report_sign_in_required(exc)
         return 0
 
-    sync_results = sync_sharepoint(config, skip=args.skip_sharepoint_sync)
+    try:
+        sync_results = sync_sharepoint(config, skip=args.skip_sharepoint_sync)
+    except SharePointSignInRequiredError as exc:
+        return report_sign_in_required(exc)
+
+    # A sync that ran and found nothing new means there's nothing to do: no
+    # analysis, no empty outputs, no zero-review run row, no translation pass.
+    if sync_results is not None and not any(r.synced for r in sync_results.values()):
+        logger.info("No new review files waiting in SharePoint; nothing to do")
+        return 0
 
     sources = active_sources(config, sync_results)
     if sync_results is not None:
@@ -357,9 +384,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     pipeline = MultiSourcePipeline(config, analyzer)
     # resume is explicit: a run that loads only some sources (or none) must
     # append to the checkpoint, never truncate the other sources' entries.
-    results = pipeline.process_all_reviews(
-        all_reviews, config.output_dir / config.checkpoint_file, done,
-        resume=not args.fresh_start)
+    try:
+        results = pipeline.process_all_reviews(
+            all_reviews, config.output_dir / config.checkpoint_file, done,
+            resume=not args.fresh_start)
+    except FatalProviderError as exc:
+        return report_fatal_provider_error(config, exc)
     elapsed = time.time() - started
 
     output, out_path, detail_path = write_outputs(config, results, elapsed)
@@ -379,7 +409,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.keep_output_files:
             delete_analysis_outputs(config)
         if sync_results is not None:
-            move_synced_files_to_processed(config, sync_results)
+            try:
+                move_synced_files_to_processed(config, sync_results)
+            except SharePointSignInRequiredError as exc:
+                return report_sign_in_required(exc)
     else:
         if args.skip_db_load:
             logger.info("--skip-db-load set; not loading into the database")
@@ -391,7 +424,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "stay in In Progress for the next run that can load them.")
 
     if config.db.configured and not args.skip_translation:
-        run_translation(config, analyzer)
+        try:
+            run_translation(config, analyzer)
+        except FatalProviderError as exc:
+            return report_fatal_provider_error(config, exc)
     elif args.skip_translation:
         logger.info("--skip-translation set; not translating")
     else:

@@ -17,16 +17,16 @@ Verifies, independently of daylight_sentiment/infra/sharepoint_sync.py:
 Deliberately does NOT import anything from daylight_sentiment -- this is a
 throwaway diagnostic, not a change to the pipeline. It reads the same .env
 variables sharepoint_sync.py reads and, if you let it, writes to the exact
-same token cache file (.sp_token_cache.json, next to this script) that the
+same token cache file (agents/product-review/.sp_token_cache.json) that the
 real pipeline reads -- so a successful sign-in here also unblocks the real
 `daylight_sentiment.cli` run afterwards, with no second interactive prompt.
 
-Usage:
-    python check_sharepoint_connection.py
-    python check_sharepoint_connection.py --max-depth 2
-    python check_sharepoint_connection.py --no-cache      # force a fresh sign-in
+Usage (from agents/product-review):
+    python -m scripts.check_sharepoint_connection
+    python -m scripts.check_sharepoint_connection --max-depth 2
+    python -m scripts.check_sharepoint_connection --no-cache   # force a fresh sign-in
 
-Reads from .env (place this script next to it, at the repo root):
+Reads from .env (in agents/product-review):
     SP_SHARE_URL   (required)
     SP_USERNAME    (required)
     SP_PASSWORD    (optional -- omit to go straight to device-code sign-in)
@@ -56,7 +56,7 @@ SCOPES = ["https://graph.microsoft.com/Files.ReadWrite.All",
 # to a plain bad password.
 MFA_ERROR_CODES = ("AADSTS50076", "AADSTS50079", "AADSTS65001", "AADSTS70002")
 
-BASE = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent.parent  # agents/product-review
 TOKEN_CACHE_PATH = BASE / ".sp_token_cache.json"  # same path the real pipeline reads
 
 
@@ -112,7 +112,13 @@ def get_token(client_id: str, tenant: str, username: str, password: Optional[str
             f"{result.get('error_description')}")
 
     if use_cache and cache.has_state_changed:
-        TOKEN_CACHE_PATH.write_text(cache.serialize(), encoding="utf-8")
+        if os.name == "posix":  # owner-only, as the pipeline writes it
+            fd = os.open(TOKEN_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.chmod(TOKEN_CACHE_PATH, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(cache.serialize())
+        else:
+            TOKEN_CACHE_PATH.write_text(cache.serialize(), encoding="utf-8")
         print(f"Token cached to {TOKEN_CACHE_PATH} for future runs "
               f"(the real pipeline will reuse this too).")
 

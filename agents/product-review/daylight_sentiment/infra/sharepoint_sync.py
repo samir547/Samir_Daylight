@@ -18,6 +18,8 @@ once -- and only once -- its reviews are confirmed durable in the database.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence
@@ -33,6 +35,56 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # the repo) so a completed device-code sign-in survives across runs via its
 # refresh token, instead of prompting every single time this is invoked.
 BASE = Path(__file__).resolve().parent.parent.parent
+
+# The one command a person runs, in a terminal from agents/product-review, to
+# redo the device-code sign-in. It uses this module's sign-in and token cache
+# and only downloads into Reviews/ -- nothing is analysed, loaded or moved.
+SIGN_IN_RECOVERY_COMMAND = "python -m daylight_sentiment.cli --sync-sharepoint-only"
+
+
+class SharePointSignInRequiredError(RuntimeError):
+    """The saved sign-in is missing or expired and the session is not
+    interactive (e.g. cron), so a device-code sign-in could never be
+    completed. Raised instead of starting the device flow and waiting for it."""
+
+
+def _stdin_is_interactive() -> bool:
+    """True only when a person could type at this process: stdin exists, is
+    open and is a terminal. A closed or missing stdin counts as unattended."""
+    stdin = sys.stdin
+    if stdin is None or getattr(stdin, "closed", True):
+        return False
+    try:
+        if not stdin.isatty():
+            return False
+        if os.name == "nt":
+            return _is_windows_console(stdin.fileno())
+        return True
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _is_windows_console(fd: int) -> bool:
+    """On Windows isatty() is also true for NUL (any character device), which
+    is what a scheduled or redirected run gets as stdin; only a real console
+    handle answers GetConsoleMode."""
+    import ctypes
+    import msvcrt
+    mode = ctypes.c_uint32()
+    handle = msvcrt.get_osfhandle(fd)
+    return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write the token cache readable by the owner only on POSIX (0o600) --
+    it holds refresh tokens. On Windows the file keeps the default ACLs."""
+    if os.name != "posix":
+        path.write_text(text, encoding="utf-8")
+        return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(path, 0o600)  # O_CREAT's mode only applies to a new file
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 class NoMatchingFileError(RuntimeError):
@@ -118,13 +170,21 @@ class SharePointSync:
     _MFA_ERROR_CODES = ("AADSTS50076", "AADSTS50079", "AADSTS65001", "AADSTS70002")
 
     def __init__(self, share_url: str, username: str, password: Optional[str],
-                client_id: str, tenant: str = "organizations"):
+                client_id: str, tenant: str = "organizations",
+                interactive: Optional[bool] = None):
         self.share_url = share_url
         self.username = username
         self.password = password
         self.client_id = client_id
         self.tenant = tenant
+        # None = decide from stdin when a sign-in is actually needed.
+        self.interactive = interactive
         self._token: Optional[str] = None
+
+    def _is_interactive(self) -> bool:
+        if self.interactive is not None:
+            return self.interactive
+        return _stdin_is_interactive()
 
     def _build_app(self, cache):
         import msal
@@ -159,6 +219,13 @@ class SharePointSync:
                         f"({result.get('error')}): {result.get('error_description')}")
 
             if not result or "access_token" not in result:
+                if not self._is_interactive():
+                    raise SharePointSignInRequiredError(
+                        "SharePoint sign-in has expired or has not been set up on this "
+                        "machine, and no one is at a terminal to complete it. In a "
+                        "terminal, from the agents/product-review folder, run "
+                        f"`{SIGN_IN_RECOVERY_COMMAND}`, open the address shown, enter "
+                        "the code and sign in, then re-run.")
                 logger.info("Password sign-in isn't usable for this account (MFA/Conditional "
                             "Access) -- falling back to interactive device-code sign-in.")
                 flow = app.initiate_device_flow(scopes=self.SCOPES)
@@ -176,7 +243,7 @@ class SharePointSync:
                     f"({result.get('error')}): {result.get('error_description')}")
 
             if cache.has_state_changed:
-                self.TOKEN_CACHE_PATH.write_text(cache.serialize(), encoding="utf-8")
+                _write_private(self.TOKEN_CACHE_PATH, cache.serialize())
 
             self._token = result["access_token"]
             return self._token

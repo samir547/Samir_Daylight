@@ -1,6 +1,6 @@
 """Reconnaissance-only: detects review language (French/German/Italian/Spanish/other) for every
 review in dbo.sentiment_analysis_reviews, using a fully offline detector (langdetect) -- makes
-ZERO Claude/Groq API calls. Run this FIRST, before building or running any translation step, to
+ZERO LLM API calls. Run this FIRST, before building or running any translation step, to
 see exactly how many reviews would actually need translating and in which languages, so that
 step (a later, separate script) can be scoped and costed precisely instead of guessed at.
 

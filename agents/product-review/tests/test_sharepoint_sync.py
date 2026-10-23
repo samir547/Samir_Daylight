@@ -4,7 +4,10 @@ CLI wiring that decides which loaders run and when files get moved.
 
 The HTTP layer (requests.get / requests.patch) and token acquisition are
 monkeypatched -- nothing here touches Graph."""
+import io
 import logging
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,9 +16,12 @@ from daylight_sentiment import cli
 from daylight_sentiment.application.checkpoint import load_checkpoint
 from daylight_sentiment.application.pipeline import MultiSourcePipeline
 from daylight_sentiment.config import Config, FilePattern, SourceFiles
+from daylight_sentiment.infra import sharepoint_sync
 from daylight_sentiment.infra.sharepoint_sync import (
     GRAPH_BASE,
+    SIGN_IN_RECOVERY_COMMAND,
     NoMatchingFileError,
+    SharePointSignInRequiredError,
     SharePointSync,
     SourceSpec,
     SourceSyncResult,
@@ -304,3 +310,145 @@ class TestCheckpointSurvivesPartialRun:
                         encoding="utf-8")
         MultiSourcePipeline(Config(), analyzer=None).process_all_reviews([], ckpt, done_uids={})
         assert load_checkpoint(ckpt) == {}
+
+
+class _FakeMsalApp:
+    """Stands in for msal.PublicClientApplication: records which sign-in
+    paths were tried and never touches the network or blocks."""
+
+    def __init__(self, cached=False, ropc_result=None):
+        self.cached = cached
+        self.ropc_result = ropc_result or {
+            "error": "invalid_grant", "error_description": "AADSTS50076: MFA required"}
+        self.calls = []
+
+    def get_accounts(self, username=None):
+        self.calls.append("get_accounts")
+        return [{"username": username}] if self.cached else []
+
+    def acquire_token_silent(self, scopes, account=None):
+        self.calls.append("silent")
+        return {"access_token": "CACHED"} if self.cached else None
+
+    def acquire_token_by_username_password(self, username, password, scopes=None):
+        self.calls.append("ropc")
+        return self.ropc_result
+
+    def initiate_device_flow(self, scopes=None):
+        self.calls.append("initiate_device_flow")
+        return {"user_code": "ABC123", "message": "Go to https://microsoft.com/devicelogin"}
+
+    def acquire_token_by_device_flow(self, flow):
+        self.calls.append("device_flow")
+        return {"access_token": "DEVICE"}
+
+
+class TestSignInGuard:
+    def _syncer(self, monkeypatch, tmp_path, app, interactive, password="pw"):
+        monkeypatch.setattr(SharePointSync, "TOKEN_CACHE_PATH", tmp_path / ".sp_token_cache.json")
+        s = SharePointSync("https://x.sharepoint.com/:f:/p/u/abc", "u@x.com", password,
+                           "client", interactive=interactive)
+        monkeypatch.setattr(s, "_build_app", lambda cache: app)
+        return s
+
+    def test_unattended_without_cached_token_fails_fast(self, monkeypatch, tmp_path):
+        app = _FakeMsalApp(cached=False)
+        s = self._syncer(monkeypatch, tmp_path, app, interactive=False)
+        with pytest.raises(SharePointSignInRequiredError) as err:
+            s._get_token()
+        assert "initiate_device_flow" not in app.calls
+        assert "device_flow" not in app.calls
+        assert SIGN_IN_RECOVERY_COMMAND in str(err.value)
+        assert "no one is at a terminal" in str(err.value)
+
+    def test_unattended_without_password_also_fails_fast(self, monkeypatch, tmp_path):
+        app = _FakeMsalApp(cached=False)
+        s = self._syncer(monkeypatch, tmp_path, app, interactive=False, password=None)
+        with pytest.raises(SharePointSignInRequiredError):
+            s._get_token()
+        assert app.calls == ["get_accounts"]
+
+    def test_unattended_with_cached_token_signs_in_silently(self, monkeypatch, tmp_path):
+        app = _FakeMsalApp(cached=True)
+        s = self._syncer(monkeypatch, tmp_path, app, interactive=False)
+        assert s._get_token() == "CACHED"
+        assert app.calls == ["get_accounts", "silent"]
+
+    def test_interactive_without_cached_token_still_uses_device_code(self, monkeypatch, tmp_path):
+        app = _FakeMsalApp(cached=False)
+        s = self._syncer(monkeypatch, tmp_path, app, interactive=True)
+        assert s._get_token() == "DEVICE"
+        assert app.calls == ["get_accounts", "ropc",
+                             "initiate_device_flow", "device_flow"]
+
+    def test_non_mfa_password_failure_is_unchanged(self, monkeypatch, tmp_path):
+        app = _FakeMsalApp(cached=False, ropc_result={
+            "error": "invalid_grant", "error_description": "AADSTS50126: bad password"})
+        s = self._syncer(monkeypatch, tmp_path, app, interactive=False)
+        with pytest.raises(RuntimeError, match="AADSTS50126") as err:
+            s._get_token()
+        assert not isinstance(err.value, SharePointSignInRequiredError)
+
+    def test_is_a_runtime_error(self):
+        assert issubclass(SharePointSignInRequiredError, RuntimeError)
+
+
+class _Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class TestInteractiveDetection:
+    def test_none_stdin_is_unattended(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", None)
+        assert sharepoint_sync._stdin_is_interactive() is False
+
+    def test_closed_stdin_is_unattended(self, monkeypatch):
+        closed = _Tty()
+        closed.close()
+        monkeypatch.setattr(sys, "stdin", closed)
+        assert sharepoint_sync._stdin_is_interactive() is False
+
+    def test_non_tty_stdin_is_unattended(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        assert sharepoint_sync._stdin_is_interactive() is False
+
+    def test_tty_stdin_is_interactive(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(sys, "stdin", _Tty())
+        assert sharepoint_sync._stdin_is_interactive() is True
+
+    def test_devnull_stdin_is_unattended(self, monkeypatch):
+        # `< /dev/null` under cron; on Windows NUL even claims isatty().
+        with open(os.devnull, encoding="utf-8") as devnull:
+            monkeypatch.setattr(sys, "stdin", devnull)
+            assert sharepoint_sync._stdin_is_interactive() is False
+
+    def test_auto_detect_is_the_default(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "posix")
+        s = SharePointSync("u", "u@x.com", "pw", "client")
+        monkeypatch.setattr(sys, "stdin", None)
+        assert s._is_interactive() is False
+        monkeypatch.setattr(sys, "stdin", _Tty())
+        assert s._is_interactive() is True
+
+    def test_explicit_setting_wins(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", None)
+        assert SharePointSync("u", "u@x.com", "pw", "c", interactive=True)._is_interactive()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes only")
+class TestTokenCachePermissions:
+    def test_new_cache_file_is_owner_only(self, tmp_path):
+        path = tmp_path / ".sp_token_cache.json"
+        sharepoint_sync._write_private(path, "{}")
+        assert path.read_text(encoding="utf-8") == "{}"
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_existing_cache_file_is_tightened(self, tmp_path):
+        path = tmp_path / ".sp_token_cache.json"
+        path.write_text("old", encoding="utf-8")
+        path.chmod(0o644)
+        sharepoint_sync._write_private(path, "new")
+        assert path.read_text(encoding="utf-8") == "new"
+        assert path.stat().st_mode & 0o777 == 0o600

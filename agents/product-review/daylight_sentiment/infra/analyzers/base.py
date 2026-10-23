@@ -6,6 +6,21 @@ from typing import Any, Dict, List, Optional
 
 
 class SentimentAnalyzer(ABC):
+    """One implementation per LLM provider (registered in factory.py).
+
+    Provider failures surface as the typed errors in errors.py; in particular
+    a FatalProviderError (bad key, no credit, unknown model) stops the run.
+    """
+
+    @abstractmethod
+    def complete_json(self, prompt: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """Send one prompt and return the model's reply parsed as a JSON
+        object. The sentiment methods and the translation pass both go
+        through this. ``max_tokens`` caps the reply; None means the
+        provider's default for short classification output. A reply cut off
+        at that cap raises ResponseTruncatedError."""
+        ...
+
     @abstractmethod
     def analyze_product_review(self, text: str, product_name: Optional[str] = None,
                                rating: Optional[int] = None) -> Dict[str, Any]:
