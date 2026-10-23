@@ -86,6 +86,12 @@ supported indefinitely.
 
 5. sync_sharepoint(config)                         [if SP_* set, not --skip-sharepoint-sync]
        pattern-matched download of the 3 exports into Reviews/ (see §7)
+       SharePointSignInRequiredError (no saved sign-in, no terminal)
+       -> logged at ERROR, main() exits 2 before anything below runs
+   if a sync ran and no source got a new file:
+       log "No new review files waiting in SharePoint; nothing to do"
+       return 0                                    <-- early exit
+       # nothing analysed, written, loaded or moved, and no translation pass
 
 6. all_reviews = load_reviews(build_default_sources(config.sources))
        each ReviewSource fetches + normalises; uid = f"{source}:{type}:{review_id}"
@@ -111,6 +117,9 @@ supported indefinitely.
         RunRepository.upsert()    -- DELETE+INSERT keyed on run_timestamp
     delete_analysis_outputs()                      [unless --keep-output-files]
         # only after load_database() returned without raising
+    move_synced_files_to_processed()               [if a sync ran]
+        # In Progress -> Processed; a SharePointSignInRequiredError here
+        # exits 2 (the reviews are already in the database)
 
 12. run_translation(config, analyzer)              [if DB_* set, not --skip-translation]
         infra.translation.run_translation_pass(): offline language detection,
@@ -126,6 +135,14 @@ supported indefinitely.
   trusted from the checkpoint — a failed rerun can't blank out good data.
 - Translation state (`review_text_en IS NULL`) is independent of the sentiment
   checkpoint in both directions.
+- A run with nothing new in SharePoint does no work at all. The cost: rows
+  whose translation failed earlier (normally retried on every run) are not
+  retried on such a run; they are picked up by the next run that has new
+  files, or by `python -m scripts.translate_reviews`.
+
+**Exit codes:** `0` finished, including the "nothing new in SharePoint" early
+exit; `1` fatal LLM provider error (`FatalProviderError`); `2` SharePoint
+sign-in needed (`SharePointSignInRequiredError`).
 
 ## 4. Data sources & the `uid` key
 
@@ -261,10 +278,24 @@ raises. Since a sync always downloads under the real name and resolution
 always picks the newest file by mtime, a stale differently-named leftover in
 `Reviews/` is harmless — the freshly synced file wins.
 
-**Auth path (unchanged):** ROPC first (fails on this account — MFA), then
-MSAL device-code flow, token cached to `.sp_token_cache.json`. A truly
-unattended run only works until the cached token expires; durable fix is an
-app registration with application-level `Sites.Selected` (see ISSUE-21).
+**Auth path:** silent sign-in from the token cache first, then ROPC (fails
+on this account — MFA), then the MSAL device-code flow. The cache is
+`.sp_token_cache.json` next to the package (owner-only, 0o600, on POSIX);
+`scripts/check_sharepoint_connection.py` reads and writes the same file.
+`SP_PASSWORD` must be set for `SharePointSettings.configured` to be true.
+
+**Unattended guard:** the device-code flow is only started when someone can
+complete it. `SharePointSync(interactive=None)` auto-detects: stdin must
+exist, be open and be a terminal (on Windows, a real console — `NUL` also
+claims `isatty()`). Otherwise `_get_token` raises
+`SharePointSignInRequiredError` instead of starting the flow and polling for
+~15 minutes, and `cli.main()` logs it and exits 2. The message names the
+recovery command, `python -m daylight_sentiment.cli --sync-sharepoint-only`,
+which uses this same sign-in code and cache and only downloads into
+`Reviews/` (no analysis, database or move). Run it in a terminal, complete
+the device-code sign-in, and later scheduled runs sign in silently again.
+Steps for an operator are in README §7.5. The durable fix is an app
+registration with application-level `Sites.Selected` (see ISSUE-21).
 
 ## 8. Database load (`infra/db/`)
 
@@ -326,6 +357,7 @@ refactor; keep them green.
 | `--skip-db-load` | Analyze and write JSON, but don't load the DB (or delete JSON) |
 | `--skip-translation` | Don't run the translation pass |
 | `--load-db-only` | Skip sync + analysis; load existing JSON and exit (no translation) |
+| `--sync-sharepoint-only` | Download new files into `Reviews/` and exit; also the sign-in recovery command |
 | `--keep-output-files` | Load the DB as normal, but don't delete the JSON afterward |
 
 ## 11. Known issues
@@ -335,8 +367,10 @@ refactor; keep them green.
   path doesn't apply the limit).
 - **Amazon CSV loader** silently drops scrape-error and duplicate rows —
   check `multi_source_sentiment.log` for `WARNING` lines if the count looks low.
-- **SharePoint token expiry** — periodic device-code re-auth needed; not
-  transparent to a headless/scheduled run.
+- **SharePoint token expiry** — the saved sign-in eventually expires and a
+  person has to redo the device-code sign-in. A scheduled run with no saved
+  sign-in exits 2 at once with an ERROR line naming the recovery command
+  (§7, README §7.5); runs fail that way until someone signs in again.
 - **Unexplained deletion incident** — the checkpoint and both JSON outputs
   were once found deleted from `Trustpilot_Result/` mid-session, from outside
   the pipeline's own code path. Recovered from the Recycle Bin; cause never

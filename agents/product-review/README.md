@@ -305,6 +305,12 @@ non-English reviews already in the database straight to `review_text_en`
 (`multi_source_checkpoint.jsonl`) is never deleted by this — it's resume
 state, not an output.
 
+When SharePoint is configured and none of the three "In Progress" folders
+has a new file, the run logs `No new review files waiting in SharePoint;
+nothing to do` and exits with code 0 straight after the sync: no analysis,
+no output files, no database rows and no translation pass. This makes it
+safe to schedule the pipeline more often than new exports arrive.
+
 ```bash
 # Smoke test — 20 reviews
 python -m daylight_sentiment.cli --limit 20
@@ -331,8 +337,14 @@ Flags: `--provider {claude}` (default `claude`), `--model <override>`
 (overrides `CLAUDE_MODEL`), `--limit N`, `--workers N` (default 8),
 `--batch-size N` (reviews per unit of work handed to a worker, default 10),
 `--fresh-start` (ignore the checkpoint), `--skip-sharepoint-sync`,
-`--skip-db-load`, `--skip-translation`, `--load-db-only`, `--keep-output-files`
-(don't delete the JSON outputs after a successful DB load).
+`--skip-db-load`, `--skip-translation`, `--load-db-only`,
+`--sync-sharepoint-only` (download the new files into `Reviews/` and stop),
+`--keep-output-files` (don't delete the JSON outputs after a successful DB
+load).
+
+Exit codes: `0` finished (including "nothing new in SharePoint"), `1` the
+Claude API rejected the run (key, billing or model — see §4.5), `2`
+SharePoint sign-in is needed (see §7.5).
 
 Operator tools live in `scripts/` and are run as modules from the repo root
 (the same form as the pipeline itself), e.g.:
@@ -351,7 +363,8 @@ Two standalone, read-only diagnostics also live in `scripts/` —
 `python -m scripts.check_database_connection` (verifies `DAYHANSA_SQL1`
 connectivity and lists table row counts) and
 `python -m scripts.check_sharepoint_connection` (verifies the MSAL sign-in
-and SharePoint share access). Neither imports from `daylight_sentiment`;
+and SharePoint share access, and saves the sign-in to the same
+`.sp_token_cache.json` the pipeline reads). Neither imports from `daylight_sentiment`;
 they're meant for checking connectivity independently of the pipeline, e.g.
 from a new machine during the VM migration.
 
@@ -414,8 +427,14 @@ configured via env vars, skipped cleanly if they're absent:
   enforced, so it always falls back to an interactive device-code sign-in
   (prints a `microsoft.com/device` URL + code — a human has to complete it
   in a browser). A successful sign-in is cached to `.sp_token_cache.json`
-  (gitignored) so this isn't needed every run. `--skip-sharepoint-sync`
-  skips this and uses whatever's already in `Reviews/`.
+  (gitignored; owner-only on Linux) so this isn't needed every run.
+  `SP_PASSWORD` must still be set: without it the pipeline treats SharePoint
+  as not configured. When the saved sign-in is missing or expired and the
+  run has no terminal (a scheduled job), the device-code step is not
+  started: the run logs an error and exits with code 2 straight away, before
+  anything is analysed, loaded or moved — see §7.5.
+  `--skip-sharepoint-sync` skips this and uses whatever's already in
+  `Reviews/`.
 
 - **Database** (`DB_SERVER`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_DRIVER`,
   `DB_PORT` in `.env`) — `DatabaseWriter` creates two tables if they don't
@@ -441,6 +460,45 @@ configured via env vars, skipped cleanly if they're absent:
   happens after `load_files()` returns without raising, so a failed load
   never deletes local data. `--keep-output-files` disables this. The
   checkpoint is never touched by this step.
+
+### 7.5 SharePoint sign-in expired - what to do
+
+The pipeline signs in to SharePoint as a person, and that saved sign-in
+eventually runs out (for example after a long gap between runs, a password
+change or an admin sign-out). A scheduled run can't ask anyone to sign in,
+so it stops instead.
+
+**How you can tell.** The scheduled run ends with exit code `2`, and
+`multi_source_sentiment.log` has an `ERROR` line starting
+`SharePoint sign-in has expired or has not been set up on this machine`.
+Nothing has been analysed, loaded or moved; the files are still waiting in
+SharePoint.
+
+**What to do.**
+
+1. Open a terminal on the machine that runs the pipeline and go to the
+   `agents/product-review` folder (activate `.venv` if the setup uses one).
+2. Run:
+
+   ```bash
+   python -m daylight_sentiment.cli --sync-sharepoint-only
+   ```
+
+   This only signs in and downloads the waiting files into `Reviews/`. It
+   doesn't analyse anything, write to the database or move files in
+   SharePoint.
+3. The terminal shows a box headed `SHAREPOINT SIGN-IN REQUIRED` with a web
+   address (usually `https://microsoft.com/devicelogin`) and a short code.
+   Open the address in any browser, type the code, and sign in with the same
+   SharePoint account as before (the `SP_USERNAME` in `.env`), including the
+   MFA prompt. The code is valid for about 15 minutes.
+4. Go back to the terminal. It carries on by itself once you've signed in.
+
+**How to confirm it worked.** The command finishes without an error, and the
+last log line starts `SharePoint sync:` and lists how many sources had a new
+file. The next scheduled run then signs in silently. To process the files
+straight away instead of waiting, run the pipeline once by hand
+(`python -m daylight_sentiment.cli`).
 
 ## 8. Known things to watch
 
