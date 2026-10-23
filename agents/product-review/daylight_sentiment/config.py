@@ -173,6 +173,40 @@ class Tuning:
     max_review_chars: int = 6000  # guards against a runaway review body
 
 
+def _positive_int(name: str, raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ValueError(f"{name} must be a whole number of 1 or more, got {raw!r}")
+    return value
+
+
+@dataclass
+class ActionItemSettings:
+    """The business to-do items generated after a run (see
+    application/action_items.py). The review window ends on the newest
+    review date in the data; window_months is overridable with
+    ACTION_ITEMS_WINDOW_MONTHS and, per run, --action-items-months."""
+    window_months: int = 12
+    # Fewer analysed reviews than this in the window widens it to every
+    # dated review...
+    min_window_reviews: int = 100
+    # ...and fewer than this even then skips generation.
+    min_total_reviews: int = 50
+    top_themes: int = 15
+    max_excerpts: int = 10
+    excerpt_chars: int = 300
+
+    @classmethod
+    def from_env(cls) -> "ActionItemSettings":
+        raw = os.getenv("ACTION_ITEMS_WINDOW_MONTHS")
+        if not raw:
+            return cls()
+        return cls(window_months=_positive_int("ACTION_ITEMS_WINDOW_MONTHS", raw))
+
+
 # Legacy flat attribute -> (sub-config field, attribute). The compat layer for
 # every call site written against the old single flat dataclass.
 _FLAT_ALIASES = {
@@ -213,6 +247,7 @@ class Config:
     sources: SourceFiles = field(default_factory=SourceFiles)
     output: OutputSettings = field(default_factory=OutputSettings)
     tuning: Tuning = field(default_factory=Tuning)
+    action_items: ActionItemSettings = field(default_factory=ActionItemSettings)
 
     @property
     def model_name(self) -> str:
@@ -235,6 +270,7 @@ class Config:
             sharepoint=SharePointSettings.from_env(),
             db=DatabaseSettings.from_env(),
             sources=SourceFiles.from_env(),
+            action_items=ActionItemSettings.from_env(),
         )
 
     # -- legacy flat-attribute compatibility (reads AND writes) --------------
