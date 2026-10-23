@@ -15,6 +15,13 @@ from daylight_sentiment.infra.analyzers.errors import FatalProviderError
 logger = logging.getLogger("multi_source_sentiment")
 
 
+def _describe(exc: Exception) -> str:
+    """Error text for a failed review: the exception type keeps a bare
+    message (e.g. a JSON parse position) recognisable in failure_reasons."""
+    message = str(exc)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 class MultiSourcePipeline:
     """2D branching pipeline: review_type x review_source."""
 
@@ -58,18 +65,26 @@ class MultiSourcePipeline:
 
     def process_batch(self, batch: List[Dict[str, Any]], review_type: str
                       ) -> List[Dict[str, Any]]:
-        """Analyse one batch, returning a result dict per input review."""
+        """Analyse one batch, returning a result dict per input review. A
+        review that failed on its own gets its error and is retried next run;
+        the rest of the batch keeps its analyses."""
         try:
             analyses = self.analyzer.analyze_batch(batch, review_type)
         except FatalProviderError:
             raise  # bad key / no credit: process_all_reviews stops the run
         except Exception as exc:  # noqa: BLE001
-            logger.error("Batch failed outright: %s", exc)
-            analyses = [None] * len(batch)
+            # Only a provider that analyses the whole batch in one call can
+            # fail it outright; the base implementation returns errors per review.
+            logger.error("Batch failed outright: %s", _describe(exc))
+            analyses = [exc] * len(batch)
 
         out = []
         for review, analysis in zip(batch, analyses):
-            if analysis is None:
+            if isinstance(analysis, Exception):
+                reason = _describe(analysis)
+                logger.warning("Analysis failed for %s: %s", review.get("uid"), reason)
+                out.append({**review, "analysis": None, "error": reason})
+            elif analysis is None:
                 out.append({**review, "analysis": None,
                             "error": "Model returned no analysis for this review"})
             else:

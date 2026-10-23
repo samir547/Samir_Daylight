@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+from daylight_sentiment.infra.analyzers.errors import FatalProviderError
 
 
 class SentimentAnalyzer(ABC):
@@ -31,9 +33,21 @@ class SentimentAnalyzer(ABC):
         ...
 
     def analyze_batch(self, reviews: List[Dict[str, Any]], review_type: str
-                      ) -> List[Optional[Dict[str, Any]]]:
-        """Analyse a batch. Default implementation falls back to one call each."""
-        return [self._analyze_one(r, review_type) for r in reviews]
+                      ) -> List[Union[Dict[str, Any], Exception, None]]:
+        """Analyse a batch, returning one entry per input review, in order:
+        the analysis dict, None if there was nothing to analyse, or the
+        exception that failed that review alone. A FatalProviderError is
+        raised, not returned, so the run stops. Default implementation makes
+        one call per review."""
+        results: List[Union[Dict[str, Any], Exception, None]] = []
+        for review in reviews:
+            try:
+                results.append(self._analyze_one(review, review_type))
+            except FatalProviderError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                results.append(exc)
+        return results
 
     def _analyze_one(self, review: Dict[str, Any], review_type: str
                      ) -> Optional[Dict[str, Any]]:
