@@ -41,6 +41,7 @@ from daylight_sentiment.infra.review_sources import (
     load_reviews,
 )
 from daylight_sentiment.infra.sharepoint_sync import (
+    SharePointSignInRequiredError,
     SharePointSync,
     SourceSpec,
     SourceSyncResult,
@@ -323,6 +324,11 @@ def report_fatal_provider_error(config: Config, exc: FatalProviderError) -> int:
     return 1
 
 
+def report_sign_in_required(exc: SharePointSignInRequiredError) -> int:
+    logger.error("%s", exc)
+    return 2
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # .env is loaded here -- explicitly, at the entry point -- never at import
     # time (ISSUE-11).
@@ -346,10 +352,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.sync_sharepoint_only:
-        sync_sharepoint(config, skip=False)
+        try:
+            sync_sharepoint(config, skip=False)
+        except SharePointSignInRequiredError as exc:
+            return report_sign_in_required(exc)
         return 0
 
-    sync_results = sync_sharepoint(config, skip=args.skip_sharepoint_sync)
+    try:
+        sync_results = sync_sharepoint(config, skip=args.skip_sharepoint_sync)
+    except SharePointSignInRequiredError as exc:
+        return report_sign_in_required(exc)
+
+    # A sync that ran and found nothing new means there's nothing to do: no
+    # analysis, no empty outputs, no zero-review run row, no translation pass.
+    if sync_results is not None and not any(r.synced for r in sync_results.values()):
+        logger.info("No new review files waiting in SharePoint; nothing to do")
+        return 0
 
     sources = active_sources(config, sync_results)
     if sync_results is not None:
@@ -391,7 +409,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.keep_output_files:
             delete_analysis_outputs(config)
         if sync_results is not None:
-            move_synced_files_to_processed(config, sync_results)
+            try:
+                move_synced_files_to_processed(config, sync_results)
+            except SharePointSignInRequiredError as exc:
+                return report_sign_in_required(exc)
     else:
         if args.skip_db_load:
             logger.info("--skip-db-load set; not loading into the database")
