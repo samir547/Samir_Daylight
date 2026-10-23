@@ -1,6 +1,6 @@
 # Runtime dependencies of daylight_sentiment, pinned to exact tested versions.
 # Tested on Python 3.12.3. Install with: pip install -r requirements.txt -c constraints.txt
-pandas==3.1.0
+pandas==3.0.3
 openpyxl==3.1.5
 python-dotenv==1.2.4
 anthropic==0.125.0

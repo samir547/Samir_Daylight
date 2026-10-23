@@ -306,8 +306,8 @@ pip install -r requirements.txt -c constraints.txt
 Dependencies are pinned to exact tested versions:
 
 - `requirements.txt` — the direct runtime dependencies.
-- `requirements-dev.txt` — the runtime dependencies plus `pytest`, for
-  running the test suite (§7.3).
+- `requirements-dev.txt` — the runtime dependencies plus `pytest` and
+  `httpx` (imported directly by the tests), for running the test suite (§7.3).
 - `constraints.txt` — every package, including sub-dependencies, at the
   version tested. Always pass it with `-c` so a rebuild installs the same set.
 
