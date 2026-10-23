@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,13 +48,14 @@ logger = logging.getLogger("multi_source_sentiment")
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-source sentiment pipeline")
     p.add_argument("--provider", choices=[e.value for e in LLMProvider],
-                   default=os.getenv("LLM_PROVIDER", "groq"))
+                   default=LLMProvider.CLAUDE.value,
+                   help="LLM provider (default: claude)")
     p.add_argument("--model", help="Override the provider's default model")
     p.add_argument("--limit", type=int, help="Only process the first N reviews (smoke test)")
     p.add_argument("--workers", type=int, default=None,
                    help="Concurrent worker threads (default 8)")
     p.add_argument("--batch-size", type=int, default=None,
-                   help="Reviews per LLM call; 1 disables batching (default 10)")
+                   help="Reviews per unit of work handed to a worker thread (default 10)")
     p.add_argument("--fresh-start", action="store_true",
                    help="Ignore the checkpoint and reprocess every review from scratch. "
                         "By default the pipeline always resumes from the checkpoint -- "
@@ -107,10 +107,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.model:
-        if config.llm_provider is LLMProvider.GROQ:
-            config.groq_model = args.model
-        else:
-            config.claude_model = args.model
+        getattr(config, config.llm_provider.value).model = args.model
     config.output_dir.mkdir(parents=True, exist_ok=True)
     return config
 
@@ -315,8 +312,7 @@ def run_translation(config: Config, analyzer: SentimentAnalyzer) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     # .env is loaded here -- explicitly, at the entry point -- never at import
-    # time (ISSUE-11). It must precede parse_args(), whose --provider default
-    # reads LLM_PROVIDER from the environment.
+    # time (ISSUE-11).
     from dotenv import load_dotenv
     load_dotenv()
 

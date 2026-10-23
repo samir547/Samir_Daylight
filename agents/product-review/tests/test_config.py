@@ -10,7 +10,7 @@ from daylight_sentiment.config import (
 )
 
 ENV_KEYS = {
-    "GROQ_API_KEY": "gk", "ANTHROPIC_API_KEY": "ak",
+    "ANTHROPIC_API_KEY": "ak",
     "SP_SHARE_URL": "https://sp", "SP_USERNAME": "u", "SP_PASSWORD": "p",
     "DB_SERVER": "srv", "DB_NAME": "db", "DB_USER": "dbu", "DB_PASSWORD": "dbp",
     "DB_PORT": "1533",
@@ -25,7 +25,6 @@ def _set_env(monkeypatch):
 def test_plain_construction_never_reads_environment(monkeypatch):
     _set_env(monkeypatch)
     cfg = Config()
-    assert cfg.groq.api_key is None
     assert cfg.claude.api_key is None
     assert cfg.db.server is None
     assert cfg.sharepoint.share_url is None
@@ -36,7 +35,6 @@ def test_from_env_reads_environment(monkeypatch):
     _set_env(monkeypatch)
     cfg = Config.from_env(llm_provider=LLMProvider.CLAUDE, dotenv=False)
     assert cfg.llm_provider is LLMProvider.CLAUDE
-    assert cfg.groq.api_key == "gk"
     assert cfg.claude.api_key == "ak"
     assert cfg.db.server == "srv"
     assert cfg.db.port == 1533
@@ -47,7 +45,6 @@ def test_flat_aliases_read(monkeypatch):
     _set_env(monkeypatch)
     cfg = Config.from_env(dotenv=False)
     # The exact names every pre-refactor call site uses.
-    assert cfg.groq_api_key == "gk"
     assert cfg.claude_api_key == "ak"
     assert cfg.db_server == "srv"
     assert cfg.db_port == 1533
@@ -63,10 +60,10 @@ def test_flat_aliases_write_through():
     cfg = Config()
     cfg.max_workers = 4          # main() does exactly this
     cfg.batch_size = 5
-    cfg.groq_model = "other-model"
+    cfg.claude_model = "other-model"
     assert cfg.tuning.max_workers == 4
     assert cfg.tuning.batch_size == 5
-    assert cfg.groq.model == "other-model"
+    assert cfg.claude.model == "other-model"
 
 
 def test_unknown_attribute_still_raises():
@@ -74,9 +71,17 @@ def test_unknown_attribute_still_raises():
         Config().not_a_setting
 
 
+def test_claude_is_the_default_provider(monkeypatch):
+    _set_env(monkeypatch)
+    assert Config().llm_provider is LLMProvider.CLAUDE
+    assert Config.from_env(dotenv=False).llm_provider is LLMProvider.CLAUDE
+
+
 def test_model_name_follows_provider():
-    assert Config(llm_provider=LLMProvider.GROQ).model_name == "openai/gpt-oss-120b"
-    assert Config(llm_provider=LLMProvider.CLAUDE).model_name == "claude-sonnet-4-6"
+    cfg = Config(llm_provider=LLMProvider.CLAUDE)
+    assert cfg.model_name == "claude-sonnet-4-6"
+    cfg.claude.model = "claude-x"
+    assert cfg.model_name == "claude-x"
 
 
 def test_configured_properties():

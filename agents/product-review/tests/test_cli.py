@@ -2,24 +2,26 @@
 rerun-flag logic, and checkpoint writing (all offline)."""
 import json
 
+import pytest
+
 from daylight_sentiment.application.checkpoint import CheckpointWriter, load_checkpoint
 from daylight_sentiment.cli import apply_rerun_flags, build_config, parse_args
 from daylight_sentiment.config import LLMProvider
 
 
 class TestParseArgs:
-    def test_defaults(self, monkeypatch):
-        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    def test_defaults(self):
         args = parse_args([])
-        assert args.provider == "groq"
+        assert args.provider == "claude"
         assert args.workers is None
         assert args.batch_size is None
         assert not args.fresh_start
         assert not args.load_db_only
 
-    def test_provider_env_default(self, monkeypatch):
-        monkeypatch.setenv("LLM_PROVIDER", "claude")
-        assert parse_args([]).provider == "claude"
+    def test_provider_choices_come_from_llm_provider(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--provider", "not-a-provider"])
+        assert "choose from 'claude'" in capsys.readouterr().err
 
     def test_all_flags_still_exist(self):
         # The production flag surface must not shrink.
@@ -34,8 +36,7 @@ class TestParseArgs:
 
 
 class TestBuildConfig:
-    def test_tuning_defaults_come_from_config_not_argparse(self, monkeypatch):
-        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    def test_tuning_defaults_come_from_config_not_argparse(self):
         config = build_config(parse_args([]))
         # The old parse_args hardcoded 8/10 as its own defaults, shadowing
         # Config's -- now Config is the single source of truth.
@@ -49,11 +50,9 @@ class TestBuildConfig:
 
     def test_model_override_targets_active_provider(self):
         config = build_config(parse_args(["--provider", "claude", "--model", "claude-x"]))
+        assert config.llm_provider is LLMProvider.CLAUDE
         assert config.claude_model == "claude-x"
-        assert config.groq_model == "openai/gpt-oss-120b"
-        config = build_config(parse_args(["--provider", "groq", "--model", "groq-x"]))
-        assert config.groq_model == "groq-x"
-        assert config.llm_provider is LLMProvider.GROQ
+        assert config.model_name == "claude-x"
 
 
 class TestApplyRerunFlags:

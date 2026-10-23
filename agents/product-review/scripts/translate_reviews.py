@@ -10,7 +10,6 @@ Usage:
     python -m scripts.translate_reviews --dry-run       # detect + count only, no LLM calls, no writes
     python -m scripts.translate_reviews --limit 20      # smoke test on the first 20 matches
     python -m scripts.translate_reviews                 # full run (identical logic to the pipeline's)
-    python -m scripts.translate_reviews --provider groq # reuse the cheaper/default provider instead
 """
 from __future__ import annotations
 

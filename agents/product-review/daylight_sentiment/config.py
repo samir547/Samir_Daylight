@@ -11,26 +11,10 @@ BASE = Path(__file__).resolve().parent.parent
 
 
 class LLMProvider(Enum):
-    GROQ = "groq"
+    """Supported LLM providers -- the extension point for adding another one.
+    Each member's value is also the name of its settings field on Config, and
+    the key it is registered under in infra/analyzers/factory.py."""
     CLAUDE = "claude"
-
-
-@dataclass
-class GroqSettings:
-    api_key: Optional[str] = None
-    # llama-3.1-8b-instant from the original spec is decommissioned; this
-    # account serves gpt-oss-120b, which supports response_format=json_object.
-    model: str = "openai/gpt-oss-120b"
-    # gpt-oss models emit reasoning tokens that count against the TPM budget.
-    # "low" is ample for a fixed-vocabulary classification and cuts spend ~35%.
-    reasoning_effort: str = "low"
-    # Org-level tokens-per-minute ceiling (in + out). This, not latency, sets the
-    # floor on wall-clock for the full corpus -- see TokenRateLimiter.
-    tpm_limit: int = 8000
-
-    @classmethod
-    def from_env(cls) -> "GroqSettings":
-        return cls(api_key=os.getenv("GROQ_API_KEY"))
 
 
 @dataclass
@@ -175,27 +159,19 @@ class OutputSettings:
 @dataclass
 class Tuning:
     max_workers: int = 8
-    # Reviews per LLM call. The instruction block is ~250 tokens, so batching
-    # amortises it: ~440 tok/review one-at-a-time vs ~175 tok/review at 10.
-    # Under a fixed TPM ceiling that is a direct ~2.5x cut in wall-clock.
+    # Reviews per unit of work handed to a worker thread (and to
+    # SentimentAnalyzer.analyze_batch). The Claude analyzer still makes one
+    # call per review; a provider that overrides analyze_batch can send the
+    # whole batch in one prompt.
     batch_size: int = 10
     request_timeout: int = 30
     max_retries: int = 4
-    # Groq also caps tokens-per-day (200k on the free tier, per model) on a
-    # rolling window. Waiting it out is the correct response, so these bound how
-    # patient a single call may be rather than failing the batch outright.
-    max_tpd_wait: float = 900.0   # never sleep more than 15 min in one go
-    max_tpd_waits: int = 400      # ~roughly a day of waiting, worst case
     max_review_chars: int = 6000  # guards against a runaway review body
 
 
 # Legacy flat attribute -> (sub-config field, attribute). The compat layer for
 # every call site written against the old single flat dataclass.
 _FLAT_ALIASES = {
-    "groq_api_key": ("groq", "api_key"),
-    "groq_model": ("groq", "model"),
-    "groq_reasoning_effort": ("groq", "reasoning_effort"),
-    "groq_tpm_limit": ("groq", "tpm_limit"),
     "claude_api_key": ("claude", "api_key"),
     "claude_model": ("claude", "model"),
     "sp_share_url": ("sharepoint", "share_url"),
@@ -218,8 +194,6 @@ _FLAT_ALIASES = {
     "batch_size": ("tuning", "batch_size"),
     "request_timeout": ("tuning", "request_timeout"),
     "max_retries": ("tuning", "max_retries"),
-    "max_tpd_wait": ("tuning", "max_tpd_wait"),
-    "max_tpd_waits": ("tuning", "max_tpd_waits"),
     "max_review_chars": ("tuning", "max_review_chars"),
 }
 
@@ -228,8 +202,7 @@ _FLAT_ALIASES = {
 class Config:
     """Composed pipeline configuration. ``Config()`` is pure defaults with no
     environment access; use ``Config.from_env()`` for the real thing."""
-    llm_provider: LLMProvider = LLMProvider.GROQ
-    groq: GroqSettings = field(default_factory=GroqSettings)
+    llm_provider: LLMProvider = LLMProvider.CLAUDE
     claude: ClaudeSettings = field(default_factory=ClaudeSettings)
     sharepoint: SharePointSettings = field(default_factory=SharePointSettings)
     db: DatabaseSettings = field(default_factory=DatabaseSettings)
@@ -239,10 +212,12 @@ class Config:
 
     @property
     def model_name(self) -> str:
-        return self.groq.model if self.llm_provider is LLMProvider.GROQ else self.claude.model
+        """Model of the active provider (its settings field is named after
+        the LLMProvider value)."""
+        return getattr(self, self.llm_provider.value).model
 
     @classmethod
-    def from_env(cls, llm_provider: LLMProvider = LLMProvider.GROQ,
+    def from_env(cls, llm_provider: LLMProvider = LLMProvider.CLAUDE,
                  dotenv: bool = True) -> "Config":
         """Build a Config from .env + os.environ -- the one explicit place
         environment lookup happens. ``dotenv=False`` skips loading .env
@@ -252,7 +227,6 @@ class Config:
             load_dotenv()
         return cls(
             llm_provider=llm_provider,
-            groq=GroqSettings.from_env(),
             claude=ClaudeSettings.from_env(),
             sharepoint=SharePointSettings.from_env(),
             db=DatabaseSettings.from_env(),
