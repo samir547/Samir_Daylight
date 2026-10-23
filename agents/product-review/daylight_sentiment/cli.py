@@ -20,7 +20,11 @@ from daylight_sentiment.application.output_generator import OutputGenerator
 from daylight_sentiment.application.pipeline import MultiSourcePipeline
 from daylight_sentiment.config import Config, LLMProvider
 from daylight_sentiment.logging_setup import configure_logging as _configure_logging
-from daylight_sentiment.infra.analyzers import SentimentAnalyzer, build_analyzer
+from daylight_sentiment.infra.analyzers import (
+    FatalProviderError,
+    SentimentAnalyzer,
+    build_analyzer,
+)
 from daylight_sentiment.infra.db import (
     REVIEWS_TABLE,
     RUNS_TABLE,
@@ -310,6 +314,15 @@ def run_translation(config: Config, analyzer: SentimentAnalyzer) -> None:
                 stats["matched"], stats["translated"], stats["failed"])
 
 
+def report_fatal_provider_error(config: Config, exc: FatalProviderError) -> int:
+    logger.error("Stopping: the %s API rejected the request in a way every other call "
+                 "would repeat (invalid API key, no credit, missing permission or unknown "
+                 "model %r): %s", config.llm_provider.value, config.model_name, exc)
+    logger.error("Fix the key, billing or model setting and rerun; reviews that were not "
+                 "analysed stay pending and the run resumes from the checkpoint.")
+    return 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # .env is loaded here -- explicitly, at the entry point -- never at import
     # time (ISSUE-11).
@@ -353,9 +366,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     pipeline = MultiSourcePipeline(config, analyzer)
     # resume is explicit: a run that loads only some sources (or none) must
     # append to the checkpoint, never truncate the other sources' entries.
-    results = pipeline.process_all_reviews(
-        all_reviews, config.output_dir / config.checkpoint_file, done,
-        resume=not args.fresh_start)
+    try:
+        results = pipeline.process_all_reviews(
+            all_reviews, config.output_dir / config.checkpoint_file, done,
+            resume=not args.fresh_start)
+    except FatalProviderError as exc:
+        return report_fatal_provider_error(config, exc)
     elapsed = time.time() - started
 
     output, out_path, detail_path = write_outputs(config, results, elapsed)
@@ -387,7 +403,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "stay in In Progress for the next run that can load them.")
 
     if config.db.configured and not args.skip_translation:
-        run_translation(config, analyzer)
+        try:
+            run_translation(config, analyzer)
+        except FatalProviderError as exc:
+            return report_fatal_provider_error(config, exc)
     elif args.skip_translation:
         logger.info("--skip-translation set; not translating")
     else:

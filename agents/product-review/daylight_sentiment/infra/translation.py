@@ -3,11 +3,11 @@ narrow DB write-back. Used both by daylight_sentiment.cli (as an automatic phase
 regular run) and by translate_reviews.py (a standalone CLI for ad hoc backfills / dry-run
 testing without a full pipeline run).
 
-Callers pass in an already-constructed analyzer/DB-writer (duck-typed: analyzer needs only
-a ._call(prompt: str) -> dict method; writer needs only a ._connect() method returning a
-pyodbc connection) rather than this module importing the concrete classes. That keeps
-run_translation_pass() usable with whichever provider a run already built, with no second
-API client constructed. SettingsWriter below is the stock writer for callers that only
+Callers pass in an already-constructed analyzer/DB-writer (the analyzer is any
+SentimentAnalyzer -- only its public complete_json(prompt) -> dict is used; the writer is
+duck-typed and needs only a ._connect() method returning a pyodbc connection) rather than
+this module importing the concrete classes. That keeps run_translation_pass() usable with
+whichever provider a run already built, with no second API client constructed. SettingsWriter below is the stock writer for callers that only
 have a DatabaseSettings in hand.
 
 Lived at the repo root as translation_lib.py until 2026-09-17 (ISSUE-08: the old monolith
@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional
 from langdetect import detect, DetectorFactory, LangDetectException
 
 from daylight_sentiment.config import DatabaseSettings
+from daylight_sentiment.infra.analyzers.errors import FatalProviderError
 from daylight_sentiment.infra.db import REVIEWS_TABLE, connect
 
 logger = logging.getLogger("translation_lib")
@@ -115,12 +116,11 @@ def fetch_untranslated(conn) -> List[Dict[str, Any]]:
 
 
 def translate_one(analyzer: Any, text: str, language_name: str, max_chars: int = 6000) -> str:
-    """analyzer needs only a ._call(prompt: str) -> dict method -- both GroqSentimentAnalyzer
-    and ClaudeSentimentAnalyzer in daylight_sentiment.infra.analyzers already expose this, so
-    whichever provider a run used for sentiment is reused here automatically, with no second
-    API client constructed."""
+    """analyzer is any SentimentAnalyzer: complete_json() is part of the provider interface,
+    so whichever provider a run used for sentiment is reused here automatically, with no
+    second API client constructed."""
     prompt = TRANSLATION_PROMPT.format(language_name=language_name, text=text[:max_chars])
-    raw = analyzer._call(prompt)
+    raw = analyzer.complete_json(prompt)
     return str(raw.get("translation", "")).strip()
 
 
@@ -182,6 +182,8 @@ def run_translation_pass(analyzer: Any, writer: Any, max_chars: int = 6000,
                 ok += 1
                 logger.info("[%d/%d] %s (%s) -> translated (%d chars)",
                             i, len(matched), m["uid"], m["detected_language"], len(translation))
+            except FatalProviderError:
+                raise  # bad key / no credit: every remaining row would fail the same way
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.error("[%d/%d] %s failed: %s (will retry next run -- "

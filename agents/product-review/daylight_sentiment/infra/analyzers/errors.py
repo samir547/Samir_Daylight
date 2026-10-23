@@ -3,7 +3,8 @@
 Callers decide what to do with a failed LLM call by isinstance on these
 classes, never by string-matching a provider's error message. Each provider
 module owns one classifier that maps its SDK's exceptions onto this
-hierarchy, so if a provider rewords a message or changes a status code, the fix is that
+hierarchy (for Claude, classify_anthropic_error in claude_analyzer.py), so
+if a provider rewords a message or changes a status code, the fix is that
 one classifier, not a hunt through control flow.
 
     FatalProviderError      every further call would fail the same way (bad
@@ -31,4 +32,5 @@ class TransientProviderError(ProviderError):
 class FatalProviderError(ProviderError):
     """Retrying can't fix it and every other request would fail the same way:
     invalid API key, exhausted credit / billing problem, missing permission,
-    unknown model."""
+    unknown model. The pipeline and the translation pass stop on this rather
+    than marking every remaining review failed."""

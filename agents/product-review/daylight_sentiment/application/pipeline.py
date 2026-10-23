@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from daylight_sentiment.application.checkpoint import CheckpointWriter
 from daylight_sentiment.config import Config
 from daylight_sentiment.infra.analyzers.base import SentimentAnalyzer
+from daylight_sentiment.infra.analyzers.errors import FatalProviderError
 
 logger = logging.getLogger("multi_source_sentiment")
 
@@ -60,6 +61,8 @@ class MultiSourcePipeline:
         """Analyse one batch, returning a result dict per input review."""
         try:
             analyses = self.analyzer.analyze_batch(batch, review_type)
+        except FatalProviderError:
+            raise  # bad key / no credit: process_all_reviews stops the run
         except Exception as exc:  # noqa: BLE001
             logger.error("Batch failed outright: %s", exc)
             analyses = [None] * len(batch)
@@ -126,7 +129,15 @@ class MultiSourcePipeline:
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
                 futures = [pool.submit(self.process_batch, b, t) for b, t in batches]
                 for fut in as_completed(futures):
-                    for res in fut.result():
+                    try:
+                        batch_results = fut.result()
+                    except FatalProviderError:
+                        # Don't start the remaining batches; the reviews they hold
+                        # stay out of the checkpoint and are picked up next run.
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    for res in batch_results:
                         results.append(res)
                         self._record(res, len(pending))
         finally:
