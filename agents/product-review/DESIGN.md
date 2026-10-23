@@ -25,8 +25,9 @@ is the only entry point.
 
 ```
 daylight_sentiment/
-    config.py               Settings dataclasses (Groq/Claude/SharePoint/DB/
-                            SourceFiles/Output/Tuning) + Config.from_env().
+    config.py               LLMProvider enum + settings dataclasses (Claude/
+                            SharePoint/DB/SourceFiles/Output/Tuning) +
+                            Config.from_env().
                             Config() is pure defaults, zero env access;
                             from_env() is the ONE place .env/os.environ is read.
                             Flat legacy names (config.db_server, ...) still work
@@ -44,9 +45,9 @@ daylight_sentiment/
         sharepoint_sync.py    SharePointSync, pattern-matched (see §7)
         db/                   connect(), schema MIGRATIONS registry,
                               ReviewRepository, RunRepository
-        analyzers/            SentimentAnalyzer ABC, TokenRateLimiter,
+        analyzers/            SentimentAnalyzer ABC (base.py),
                               errors.py (typed provider errors),
-                              groq_analyzer.py, claude_analyzer.py, factory.py
+                              claude_analyzer.py, factory.py (provider registry)
         translation.py        run_translation_pass() + SettingsWriter (see §5a)
     application/            orchestration
         pipeline.py           MultiSourcePipeline
@@ -89,7 +90,8 @@ supported indefinitely.
 6. all_reviews = load_reviews(build_default_sources(config.sources))
        each ReviewSource fetches + normalises; uid = f"{source}:{type}:{review_id}"
 
-7. analyzer = build_analyzer(config)               -> Groq | Claude analyzer
+7. analyzer = build_analyzer(config)               -> analyzer registered for
+                                                      config.llm_provider (Claude)
 
 8. done = resume_state(config, args, all_reviews)
        checkpoint replay (successful rows only), restricted to loaded uids,
@@ -97,8 +99,9 @@ supported indefinitely.
 
 9. results = MultiSourcePipeline(config, analyzer).process_all_reviews(...)
        type-homogeneous batches of 10, ThreadPoolExecutor(max_workers=8);
-       dropped reviews retried individually; every result appended to the
-       checkpoint (CheckpointWriter, flushed per record) DURING the run
+       one LLM call per review; every result appended to the checkpoint
+       (CheckpointWriter, flushed per record) DURING the run. A
+       FatalProviderError cancels the remaining batches and main() exits 1
 
 10. write_outputs() -> Trustpilot_Result/*.json    (summary + per-review detail)
 
@@ -112,7 +115,8 @@ supported indefinitely.
 12. run_translation(config, analyzer)              [if DB_* set, not --skip-translation]
         infra.translation.run_translation_pass(): offline language detection,
         then LLM translation of fr/de/it/es/nl/sv/pl/cs rows where
-        review_text_en IS NULL; writes review_text_en + detected_language
+        review_text_en IS NULL; writes review_text_en + detected_language.
+        A FatalProviderError stops the pass and main() exits 1
 ```
 
 **Key invariants:**
@@ -160,27 +164,43 @@ with one minor complaint. The star rating is passed as context
 (`_build_context`) but deliberately as a secondary cue, not an override — a
 separate QA pass showed mismatched *ratings* are often the unreliable signal.
 
-| | Groq (`--provider groq`, default) | Claude (`--provider claude`) |
-|---|---|---|
-| Model | `openai/gpt-oss-120b` | `claude-sonnet-4-6` |
-| Cost/review | ~$0.0004 | ~$0.003 |
-| Daily cap | ~200k tokens (free tier) | none |
-| Batching | native, 1 call per batch of 10 | falls back to 1 call per review |
+| | Claude (`--provider claude`, the only and default provider) |
+|---|---|
+| Model | `claude-sonnet-4-6` unless `CLAUDE_MODEL` is set; `--model` overrides both for one run |
+| API key | `ANTHROPIC_API_KEY` |
+| Cost/review | ~$0.003 |
+| Calls | 1 per review (the base `analyze_batch()` loop) |
 
-`_align_batch()` maps a batched response back onto inputs by an echoed `id`;
-anything the model drops, duplicates, or mangles is retried individually.
+**Provider interface:** `SentimentAnalyzer` (`infra/analyzers/base.py`)
+requires `complete_json(prompt) -> dict` (send one prompt, return the parsed
+JSON object), `analyze_product_review()` and `analyze_service_review()`;
+`analyze_batch()` has a one-call-per-review default that a provider may
+override to send a whole batch per call (`_build_batch_prompt()` and
+`_align_batch()` in `domain/` support that). `ClaudeSentimentAnalyzer` parses
+model JSON with `strict=False` after stripping code fences: raw control
+characters inside string values (seen on some translation responses) don't
+fail the call.
 
-Both analyzers parse model JSON with `strict=False` (2026-09-17): raw control
-characters inside string values — seen on some translation responses — no
-longer fail the call.
+**Adding a provider:** add an `LLMProvider` member (its value is the
+`--provider` choice and the name of its settings field on `Config`), a
+settings dataclass + `Config` field loaded in `from_env()`, a
+`SentimentAnalyzer` implementation including `complete_json`, and an entry in
+`_ANALYZERS` in `infra/analyzers/factory.py`. `build_analyzer()` raises a
+clear `ValueError` for a provider with no registered analyzer.
 
-**Typed provider errors (`infra/analyzers/errors.py`, 2026-09-17):**
-`classify_groq_error()` is the one place Groq's error strings/status codes are
-parsed, emitting `DailyCapExceeded` / `RateLimited` / `TransientProviderError`
-/ `FatalProviderError`. The retry loop branches on type: daily-cap waits don't
-consume retry attempts; fatal 4xx re-raises immediately; the rate-limiter
-reservation is settled (not refunded) only when the call was actually charged
-(400 json_validate_failed).
+**Typed provider errors (`infra/analyzers/errors.py`):** a provider-neutral
+hierarchy — `FatalProviderError` (every further call would fail the same way:
+bad key, no credit, missing permission, unknown model), `RateLimited` and
+`TransientProviderError` (still failing after the SDK's own retries), and the
+base `ProviderError` (a failure specific to one request). Each provider maps
+its SDK's exceptions onto it in one classifier; for Claude that is
+`classify_anthropic_error()` (401/402/403/404 and a "credit balance is too
+low" 400 are fatal). The Anthropic SDK keeps doing its own retries for
+429/5xx/connection errors (`max_retries`, default 4). Callers branch by type:
+the pipeline and the translation pass re-raise `FatalProviderError`, which
+stops the run with a clear log message and exit status 1, and treat every
+other error as a failure of that batch or row only. Reviews not analysed
+before a fatal stop are not checkpointed, so the next run picks them up.
 
 ### 5a. Translation pass (`infra/translation.py`, added 2026-09-12)
 
@@ -192,9 +212,9 @@ confirmed fr/de/it/es/nl/sv/pl/cs review, writing `review_text_en` +
 touch sentiment data. Resumable via `review_text_en IS NULL` — no checkpoint
 file. `python -m scripts.translate_reviews` is the standalone/backfill entry.
 
-`run_translation_pass()` is duck-typed on purpose: callers pass in an analyzer
-(needs `._call(prompt) -> dict`) and a writer (needs `._connect()`), so whichever
-provider a run already built is reused with no second API client.
+`run_translation_pass()` takes the analyzer a run already built and calls its
+public `complete_json(prompt)`, so whichever provider the run uses is reused
+with no second API client. The writer is duck-typed (needs `._connect()`).
 `SettingsWriter(config.db)` is the stock writer. The module lived at the repo
 root as `translation_lib.py` until 2026-09-17, kept dependency-free to avoid a
 cycle with the old monolith (ISSUE-08); it now imports `REVIEWS_TABLE` from
@@ -277,18 +297,18 @@ header), consolidates sectors via `dbo.sector_group_map`, and exposes
 
 `python -m pytest` — offline, no API/DB access, ~1.5s. Characterization tests
 pin the domain functions, checkpoint semantics, MERGE column-safety, loader
-mappings (synthetic files), pattern matching, provider-error classification,
-and the CLI phase functions. Written as the safety net for the 2026-09-17
+mappings (synthetic files), pattern matching, provider-error classification
+and the fatal-error stop, the provider registry, and the CLI phase functions. Written as the safety net for the 2026-09-17
 refactor; keep them green.
 
 ## 10. CLI flags
 
 | Flag | Effect |
 |---|---|
-| `--provider {groq,claude}` | LLM backend (default `groq`, or `$LLM_PROVIDER`) |
-| `--model` | Override the provider's default model |
+| `--provider {claude}` | LLM backend; choices come from `LLMProvider` (default `claude`) |
+| `--model` | Override the provider's model for this run (wins over `CLAUDE_MODEL`) |
 | `--limit N` | Smoke-test on the first N reviews |
-| `--workers`, `--batch-size` | Tuning (defaults 8 / 10, now defined in Config only) |
+| `--workers`, `--batch-size` | Worker threads / reviews per unit of work (defaults 8 / 10, defined in Config only) |
 | `--fresh-start` | Ignore the checkpoint; reprocess every review |
 | `--rerun-product-reviews` | Reopen only product reviews (both sources) for reprocessing |
 | `--rerun-service-reviews` | Reopen only service reviews; combine with the above to reopen all |
@@ -300,8 +320,9 @@ refactor; keep them green.
 
 ## 11. Known issues
 
-- **Groq's ~200k token/day cap** — use `--provider claude` for a same-day full backfill.
-- **`max_review_chars` (6,000)** truncates long reviews before the model sees them.
+- **`max_review_chars` (6,000)** truncates review text sent to the translation
+  pass; sentiment calls send the full review text (the one-review-per-call
+  path doesn't apply the limit).
 - **Amazon CSV loader** silently drops scrape-error and duplicate rows —
   check `multi_source_sentiment.log` for `WARNING` lines if the count looks low.
 - **SharePoint token expiry** — periodic device-code re-auth needed; not

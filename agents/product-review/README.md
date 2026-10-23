@@ -2,7 +2,7 @@
 
 Multi-source review sentiment pipeline for Daylight Company. Pulls Trustpilot
 and Amazon review exports via automated SharePoint sync, classifies every
-review's sentiment with an LLM (Groq or Claude), translates non-English
+review's sentiment with an LLM (Claude), translates non-English
 reviews, and loads the results into the Azure SQL Server database that the
 Power BI dashboards read from — unattended, end to end, on a single
 invocation. Structured as the `daylight_sentiment` package; see `DESIGN.md`
@@ -17,7 +17,8 @@ SharePoint into `Reviews/`, normalizes them into one schema, sends each
 review to an LLM for classification, and produces two output files: an
 aggregated summary and a per-review detail dump. It's designed to run
 unattended over ~2,900 reviews, survive interruptions via checkpointing, and
-switch between two LLM providers without any code changes.
+keep the LLM provider behind one interface, so another provider can be added
+without touching the pipeline (see §5).
 
 ## 2. How it works — pipeline stages
 
@@ -47,9 +48,9 @@ switch between two LLM providers without any code changes.
  └─────────────────┘
         │
         ▼
- ┌─────────────────┐   GroqSentimentAnalyzer / ClaudeSentimentAnalyzer
- │  5. LLM CALL      │  sends the batch prompt, parses JSON response,
- │                    │  retries dropped/failed items individually
+ ┌─────────────────┐   ClaudeSentimentAnalyzer
+ │  5. LLM CALL      │  one call per review (complete_json), parses the
+ │                    │  JSON response; a fatal API error stops the run
  └─────────────────┘
         │
         ▼
@@ -90,7 +91,8 @@ and both depend on `DB_*` being set at all — see §7.4 and §8.
 
 Step 5 happens continuously during step 4 (not after) — every individual
 result is flushed to the checkpoint file as soon as it's done, which is what
-makes resuming safe against a mid-run crash or a Groq daily-cap stall.
+makes resuming safe against a mid-run crash or a run stopped by a fatal
+provider error (§4.5).
 
 ## 3. Data sources
 
@@ -142,38 +144,42 @@ missing cells as `NaN`/`NaT` in both numeric and text columns. Anything that
 stringifies to `"nan"`/`"nat"`/`"none"` is coerced to an empty string /
 `None` rather than leaking into a prompt or a rating average.
 
-### 4.2 Prompt construction — single vs. batch
-Two prompt shapes exist for each review type (`PRODUCT_PROMPT` /
-`SERVICE_PROMPT` for one review, `PRODUCT_BATCH_PROMPT` /
-`SERVICE_BATCH_PROMPT` for many). Batches are built by `_render_batch()`,
-which numbers each review (`--- Review 1 ---`, `--- Review 2 ---`, ...) and
-truncates each body to `max_review_chars` (default 6,000). The model is asked
-to echo the review's numeric `id` in its response so the answer can be mapped
-back to the right review.
+### 4.2 Prompt construction
+Each review type has its own prompt (`PRODUCT_PROMPT` / `SERVICE_PROMPT` in
+`domain/prompts.py`), filled with the review text and any context (product
+name, star rating). The Claude analyzer sends one review per call.
 
-### 4.3 Batching & response alignment
-`_align_batch()` maps a batched LLM response back onto the input list by the
-echoed `id`. If the model drops an id, duplicates one, or returns malformed
-ids, leftover items are filled into remaining empty slots positionally rather
-than discarded. Any review still unmapped after that is retried as an
-**individual** (non-batched) call — this is why a batch failure doesn't cost
-you the whole batch, only the reviews the model actually mishandled.
+### 4.3 Batches
+The pipeline groups pending reviews into type-homogeneous batches of
+`batch_size` (default 10) and hands each batch to a worker thread through
+`SentimentAnalyzer.analyze_batch()`. The base implementation, which the
+Claude analyzer uses, analyses the batch one review at a time.
+`domain/prompts.py` and `domain/normalise.py` also hold a multi-review prompt
+(`PRODUCT_BATCH_PROMPT` / `SERVICE_BATCH_PROMPT`, built by
+`_build_batch_prompt()`) and `_align_batch()`, which maps a batched response
+back onto the input reviews by their echoed `id`. A provider that overrides
+`analyze_batch()` to send a whole batch in one call can use them.
 
-### 4.4 Rate limiting — `TokenRateLimiter`
-A token-bucket limiter paces Groq calls under a tokens-per-minute ceiling
-(`groq_tpm_limit`, default 8,000). It reserves an estimated token cost before
-each call and reconciles against the real usage the API reports afterward
-(`settle()`), refunding the reservation if a call fails before generating any
-tokens (`refund()`). This exists because firing threads at Groq without
-pacing just produces 429 storms — the limiter is what lets `max_workers=8` run
-without constantly tripping the per-minute cap. Claude doesn't use this
-limiter; the Anthropic SDK's own retry handles 429/5xx.
+### 4.4 Retries
+The Anthropic SDK retries rate limits (429), server errors (5xx) and
+connection errors itself, with exponential backoff, up to `max_retries`
+(default 4) with a `request_timeout` of 30s per attempt. The pipeline does not
+add a retry loop on top.
 
-### 4.5 Retry & error handling
-- **Per-minute (429):** exponential backoff, capped at 120s, up to `max_retries` (default 4).
-- **Per-day (Groq TPD cap):** detected via `_is_daily_cap()` (matches "tokens per day" / "(tpd)" in the error text). This is treated as *not* a failure — the pipeline sleeps (up to 15 min per wait, up to 400 waits) and retries, rather than burning a retry attempt or failing the batch. This is the mechanism that lets a run survive hitting Groq's daily cap unattended, at the cost of the run pausing for however long the cap takes to reset.
-- **4xx other than 429/400:** raised immediately (unrecoverable — bad key, bad model, malformed request).
-- **Retry-After parsing:** `_retry_after()` reads the header if present, or parses Groq's plain-text wait time from the error body (`"try again in 6m56.448s"` style).
+### 4.5 Provider errors
+Once the SDK gives up, `classify_anthropic_error()`
+(`infra/analyzers/claude_analyzer.py`) maps the exception onto the typed
+hierarchy in `infra/analyzers/errors.py`:
+- **`FatalProviderError`** — invalid API key (401), billing / credit problem
+  (402, or a 400 saying the credit balance is too low), missing permission
+  (403) or unknown model (404, check `CLAUDE_MODEL`). Every other call would
+  fail the same way, so the run stops: the remaining batches are cancelled,
+  the CLI logs the reason and exits with status 1. Reviews that were not
+  analysed are not written to the checkpoint, so the next run picks them up.
+  The translation pass stops the same way.
+- **`RateLimited`, `TransientProviderError`, `ProviderError`** — only the
+  reviews in the affected batch are marked failed (the error text appears in
+  `failure_reasons`); they are retried on the next run.
 
 ### 4.6 Checkpointing & resume
 Every completed result (success or failure) is appended to
@@ -216,19 +222,39 @@ clamped to [0, 1], and themes are lowercased and capped at 6. This is what
 keeps the aggregate distributions meaningful even if the model occasionally
 invents a label.
 
-### Providers
+### Provider and model
 
-| | Groq (`--provider groq`, default) | Claude (`--provider claude`) |
-|---|---|---|
-| Model | `openai/gpt-oss-120b` | `claude-sonnet-4-6` |
-| Response parsing | native `response_format=json_object` | fence-stripped (`_strip_fences`) then `json.loads` |
-| Approx. cost | ~$0.0004/review | ~$0.003/review |
-| Daily cap | ~200k tokens/day (free tier) | none |
-| Batching | native (`analyze_batch` sends the whole batch in one call) | falls back to the `SentimentAnalyzer` base class's one-call-per-review loop — Claude analyzer doesn't override `analyze_batch` |
-| Best for | quick tests, small batches | the full remaining backfill |
+| | Claude (`--provider claude`, the default) |
+|---|---|
+| Model | `claude-sonnet-4-6` by default; set `CLAUDE_MODEL` in `.env` to change it, or pass `--model` for a single run (the flag wins) |
+| API key | `ANTHROPIC_API_KEY` |
+| Response parsing | fence-stripped (`_strip_fences`) then `json.loads(strict=False)` |
+| Approx. cost | ~$0.003/review |
+| Calls | one per review (sentiment) and one per non-English review (translation) |
 
-Both providers share the exact same prompts, output schema, and checkpoint
-format — switching is the `--provider` flag only, nothing else changes.
+### Adding another LLM provider
+
+Every provider sits behind the `SentimentAnalyzer` interface
+(`infra/analyzers/base.py`), so the pipeline, prompts, output schema and
+checkpoint format stay the same whichever provider runs. To add one:
+
+1. Add a member to `LLMProvider` in `config.py`, e.g. `OTHER = "other"`. Its
+   value is the `--provider` choice and also the name of its settings field
+   on `Config`.
+2. Add a settings dataclass (`api_key`, `model`, a `from_env()` reading its
+   environment variables) and a `Config` field with that name, loaded in
+   `Config.from_env()`.
+3. Write `infra/analyzers/other_analyzer.py` implementing `SentimentAnalyzer`:
+   `complete_json(prompt)` (send one prompt, return the parsed JSON object;
+   the translation pass uses it too), `analyze_product_review()` and
+   `analyze_service_review()` (shared prompts from `domain/prompts.py`, output
+   through `_normalise()`). Optionally override `analyze_batch()` to send a
+   whole batch per call (§4.3). Map the SDK's exceptions onto
+   `infra/analyzers/errors.py` in one classifier, raising
+   `FatalProviderError` for anything that would fail every call.
+4. Register the class in `_ANALYZERS` in `infra/analyzers/factory.py`.
+   `--provider` picks up the new member automatically.
+5. Add the SDK to `requirements.txt` and its variables to `.env.example`.
 
 ## 6. Output files
 
@@ -247,8 +273,9 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Create `.env` by copying `.env.example` and filling in real values (LLM API
-keys, SharePoint and database settings). `.env` is git-ignored: never commit it
+Create `.env` by copying `.env.example` and filling in real values (the
+Anthropic API key, SharePoint and database settings; optionally
+`CLAUDE_MODEL`). `.env` is git-ignored: never commit it
 or paste its contents into chat. The shared development values are handed out
 privately.
 
@@ -265,9 +292,11 @@ non-English reviews already in the database straight to `review_text_en`
 state, not an output.
 
 ```bash
-# Smoke test — 20 reviews, either provider
-python -m daylight_sentiment.cli --provider claude --limit 20
-python -m daylight_sentiment.cli --provider groq --limit 20
+# Smoke test — 20 reviews
+python -m daylight_sentiment.cli --limit 20
+
+# Same, on a different Claude model for this run only
+python -m daylight_sentiment.cli --limit 20 --model <model-id>
 
 # Full run — pulls from SharePoint, analyses (resuming automatically),
 # loads to DB, deletes the JSON outputs once loaded
@@ -280,13 +309,14 @@ python -m daylight_sentiment.cli --provider claude --fresh-start
 # Trustpilot_Result/*.json into the database (and then delete them)
 python -m daylight_sentiment.cli --load-db-only
 
-# Tune concurrency / batching if needed
+# Tune concurrency / batch size if needed
 python -m daylight_sentiment.cli --provider claude --workers 4 --batch-size 5
 ```
 
-Flags: `--provider {groq,claude}`, `--model <override>`, `--limit N`,
-`--workers N` (default 8), `--batch-size N` (default 10, `1` disables
-batching), `--fresh-start` (ignore the checkpoint), `--skip-sharepoint-sync`,
+Flags: `--provider {claude}` (default `claude`), `--model <override>`
+(overrides `CLAUDE_MODEL`), `--limit N`, `--workers N` (default 8),
+`--batch-size N` (reviews per unit of work handed to a worker, default 10),
+`--fresh-start` (ignore the checkpoint), `--skip-sharepoint-sync`,
 `--skip-db-load`, `--skip-translation`, `--load-db-only`, `--keep-output-files`
 (don't delete the JSON outputs after a successful DB load).
 
@@ -317,7 +347,7 @@ A pytest suite lives in `tests/` (run `pytest` from this folder; `pytest.ini`
 is already configured). Beyond the unit tests, validate a run by inspecting
 its own output:
 
-1. **Smoke test first, always.** Run with `--limit 20` on whichever provider
+1. **Smoke test first, always.** Run with `--limit 20` on whichever model
    you're about to trust for a full run, and manually read a handful of
    entries in `multi_source_sentiment_per_review.json` against the source
    review text — check the sentiment and sector/aspect calls look sane before
@@ -330,15 +360,16 @@ its own output:
    ```
    A handful of "Empty review text" is expected (blank rows in the source
    files). Anything else repeating more than a few times is worth
-   investigating — it usually means a batch is consistently getting dropped
-   ids from one provider.
+   investigating — it usually points at a systematic problem (a prompt,
+   an input format or the provider) rather than individual reviews.
 
-3. **Cross-check provider agreement on a shared sample.** Run the same
-   `--limit N` slice through both providers to different output files (copy
-   `Trustpilot_Result/` aside between runs, or diff the per-review JSON) and
-   compare `sentiment` and `primary_sector`/`primary_aspect` agreement. Large
-   disagreement on the same reviews is a signal to look at the prompt, not
-   just pick whichever provider is cheaper.
+3. **Cross-check model agreement on a shared sample** before changing
+   `CLAUDE_MODEL`. Run the same `--limit N --fresh-start` slice with the
+   current and the candidate model (`--model`), copying `Trustpilot_Result/`
+   aside between runs, and compare `sentiment` and
+   `primary_sector`/`primary_aspect` agreement. Large disagreement on the
+   same reviews is a signal to look at the prompt, not just pick whichever
+   model is cheaper.
 
 4. **Resume correctness.** Interrupt a run partway (Ctrl+C) and rerun it —
    resuming is automatic now, so confirm the log line
@@ -399,12 +430,9 @@ configured via env vars, skipped cleanly if they're absent:
 
 ## 8. Known things to watch
 
-- Groq's ~200k token/day cap means a same-day full backfill of the remaining
-  ~1,790 reviews should use `--provider claude`, not Groq — see the cost/cap
-  table above.
-- `max_review_chars` (6,000) truncates unusually long reviews before they
-  reach the model — if a specific review's analysis looks off, check whether
-  it was truncated.
+- `max_review_chars` (6,000) truncates review text sent to the translation
+  pass. Sentiment calls currently send the full review text (the
+  one-review-per-call path does not apply the limit).
 - The Amazon CSV loader silently drops rows with a populated `error` column
   and duplicate `review_id`s — both are logged (`logger.warning`) but not
   surfaced in the final summary JSON, so check `multi_source_sentiment.log`
