@@ -105,9 +105,10 @@ supported indefinitely.
 
 9. results = MultiSourcePipeline(config, analyzer).process_all_reviews(...)
        type-homogeneous batches of 10, ThreadPoolExecutor(max_workers=8);
-       one LLM call per review; every result appended to the checkpoint
-       (CheckpointWriter, flushed per record) DURING the run. A
-       FatalProviderError cancels the remaining batches and main() exits 1
+       one LLM call per review, each succeeding or failing on its own;
+       every result appended to the checkpoint (CheckpointWriter, flushed
+       per record) DURING the run. A FatalProviderError cancels the
+       remaining batches and main() exits 1
 
 10. write_outputs() -> Trustpilot_Result/*.json    (summary + per-review detail)
 
@@ -194,9 +195,15 @@ return the parsed JSON object; `max_tokens=None` means the provider's default
 for short classification output, 500 for Claude; a reply cut off at the
 limit raises `ResponseTruncatedError`), `analyze_product_review()` and
 `analyze_service_review()`;
-`analyze_batch()` has a one-call-per-review default that a provider may
-override to send a whole batch per call (`_build_batch_prompt()` and
-`_align_batch()` in `domain/` support that). `ClaudeSentimentAnalyzer` parses
+`analyze_batch()` returns one entry per input review, in order: the
+analysis dict, `None` (nothing to analyse), or the exception that failed
+that review alone; a `FatalProviderError` is raised instead, so the run
+stops. Its one-call-per-review default catches each review's non-fatal error
+and returns it in that review's slot, so one bad reply (unparseable JSON,
+truncation) does not cost the rest of the batch. A provider may override it
+to send a whole batch per call (`_build_batch_prompt()` and `_align_batch()`
+in `domain/` support that); if such an override raises a non-fatal error,
+every review in that batch fails with that error. `ClaudeSentimentAnalyzer` parses
 model JSON with `strict=False` after stripping code fences: raw control
 characters inside string values (seen on some translation responses) don't
 fail the call.
@@ -221,7 +228,10 @@ low" 400 are fatal). The Anthropic SDK keeps doing its own retries for
 429/5xx/connection errors (`max_retries`, default 4). Callers branch by type:
 the pipeline and the translation pass re-raise `FatalProviderError`, which
 stops the run with a clear log message and exit status 1, and treat every
-other error as a failure of that batch or row only. Reviews not analysed
+other error as a failure of that review or row only:
+`MultiSourcePipeline.process_batch()` logs it once at WARNING with the uid
+and stores `"<ExceptionType>: <message>"` in the review's `error`, which is
+what the summary's `failure_reasons` counts. Reviews not analysed
 before a fatal stop are not checkpointed, so the next run picks them up.
 
 ### 5a. Translation pass (`infra/translation.py`, added 2026-09-12)
@@ -252,7 +262,10 @@ cycle with the old monolith (ISSUE-08); it now imports `REVIEWS_TABLE` from
 `multi_source_checkpoint.jsonl` gets one JSON line per completed review,
 flushed immediately (`CheckpointWriter`). `load_checkpoint()` keeps only rows
 with a non-null `analysis` (failures retry) and the *last* record per uid
-(rerun flags append superseding entries).
+(rerun flags append superseding entries). Reviews succeed or fail
+individually, so when one review in a batch fails, the others in the batch
+are still checkpointed as done and only the failed one is analysed again
+next run.
 
 **Resume is the default**; `--fresh-start` is the only way to force a full
 reprocess. `--rerun-product-reviews` / `--rerun-service-reviews`

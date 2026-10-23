@@ -153,7 +153,10 @@ name, star rating). The Claude analyzer sends one review per call.
 The pipeline groups pending reviews into type-homogeneous batches of
 `batch_size` (default 10) and hands each batch to a worker thread through
 `SentimentAnalyzer.analyze_batch()`. The base implementation, which the
-Claude analyzer uses, analyses the batch one review at a time.
+Claude analyzer uses, analyses the batch one review at a time, and each
+review succeeds or fails on its own: `analyze_batch()` returns one entry per
+review — the analysis, `None` if there was nothing to analyse, or the
+exception that failed that review — and raises only a `FatalProviderError`.
 `domain/prompts.py` and `domain/normalise.py` also hold a multi-review prompt
 (`PRODUCT_BATCH_PROMPT` / `SERVICE_BATCH_PROMPT`, built by
 `_build_batch_prompt()`) and `_align_batch()`, which maps a batched response
@@ -181,9 +184,13 @@ hierarchy in `infra/analyzers/errors.py`:
   limit (`stop_reason == "max_tokens"`), so its JSON is incomplete. The error
   names the limit used.
 - **`RateLimited`, `TransientProviderError`, `ResponseTruncatedError`,
-  `ProviderError`** — only the reviews in the affected batch (or, in the
-  translation pass, the affected row) are marked failed (the error text
-  appears in `failure_reasons` / the log); they are retried on the next run.
+  `ProviderError`**, and any other error such as an unparseable JSON reply —
+  only the affected review (or, in the translation pass, the affected row)
+  is marked failed; the other reviews in its batch keep their analyses. The
+  failure is logged once at WARNING with the review's uid, and its `error`
+  reads `"<ExceptionType>: <message>"` (for example
+  `ResponseTruncatedError: Model response hit the output-token limit ...`),
+  which is what `failure_reasons` counts. It is retried on the next run.
 
 **Output-token limits.** `complete_json(prompt, max_tokens=None)` uses 500
 output tokens by default, which fits the short sentiment JSON. The
@@ -197,7 +204,10 @@ Every completed result (success or failure) is appended to
 `multi_source_checkpoint.jsonl` as one JSON object per line, flushed
 immediately. Every run resumes from this file by default — `_load_checkpoint()`
 reads it and keeps only rows with a non-null `analysis`; anything that
-previously errored is retried, not skipped. Pass `--fresh-start` to ignore it
+previously errored is retried, not skipped. Because reviews fail
+individually, a run in which one review of a batch failed checkpoints the
+rest of that batch as done, and the next run analyses only the failed
+review. Pass `--fresh-start` to ignore it
 and reprocess everything. The checkpoint is also filtered to only uids present
 in the *current* load of `Reviews/` (`wanted = {r["uid"] for r in all_reviews}`),
 so a stale checkpoint entry for data that's since been removed from the source
@@ -263,7 +273,9 @@ checkpoint format stay the same whichever provider runs. To add one:
    `analyze_product_review()` and
    `analyze_service_review()` (shared prompts from `domain/prompts.py`, output
    through `_normalise()`). Optionally override `analyze_batch()` to send a
-   whole batch per call (§4.3). Map the SDK's exceptions onto
+   whole batch per call (§4.3), keeping its contract: one entry per review
+   (analysis, `None`, or that review's exception), raising only
+   `FatalProviderError`. Map the SDK's exceptions onto
    `infra/analyzers/errors.py` in one classifier, raising
    `FatalProviderError` for anything that would fail every call.
 4. Register the class in `_ANALYZERS` in `infra/analyzers/factory.py`.
