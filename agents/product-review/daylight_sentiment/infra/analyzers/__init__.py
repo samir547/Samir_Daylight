@@ -12,6 +12,7 @@ from daylight_sentiment.infra.analyzers.errors import (  # noqa: F401
     FatalProviderError,
     ProviderError,
     RateLimited,
+    ResponseTruncatedError,
     TransientProviderError,
 )
 from daylight_sentiment.infra.analyzers.claude_analyzer import ClaudeSentimentAnalyzer  # noqa: F401

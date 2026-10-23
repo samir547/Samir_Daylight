@@ -115,12 +115,30 @@ def fetch_untranslated(conn) -> List[Dict[str, Any]]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+# Output-token budget for one translation: about one token per 2 source characters (the
+# English can run longer than the source, and non-English text tokenises poorly) plus room
+# for the JSON wrapper, kept between the sentiment default and a hard cap.
+TRANSLATION_TOKENS_PER_CHAR_DIVISOR = 2
+TRANSLATION_TOKENS_OVERHEAD = 200
+TRANSLATION_MIN_TOKENS = 500
+TRANSLATION_MAX_TOKENS = 4096
+
+
+def translation_max_tokens(text: str) -> int:
+    """Output-token limit for translating ``text`` (the already-truncated source)."""
+    estimate = len(text) // TRANSLATION_TOKENS_PER_CHAR_DIVISOR + TRANSLATION_TOKENS_OVERHEAD
+    return max(TRANSLATION_MIN_TOKENS, min(estimate, TRANSLATION_MAX_TOKENS))
+
+
 def translate_one(analyzer: Any, text: str, language_name: str, max_chars: int = 6000) -> str:
     """analyzer is any SentimentAnalyzer: complete_json() is part of the provider interface,
     so whichever provider a run used for sentiment is reused here automatically, with no
-    second API client constructed."""
-    prompt = TRANSLATION_PROMPT.format(language_name=language_name, text=text[:max_chars])
-    raw = analyzer.complete_json(prompt)
+    second API client constructed. The output limit scales with the text being sent; a
+    reply cut off at that limit raises ResponseTruncatedError, which run_translation_pass()
+    logs as a failure for that row (review_text_en stays NULL) before moving on."""
+    source = text[:max_chars]
+    prompt = TRANSLATION_PROMPT.format(language_name=language_name, text=source)
+    raw = analyzer.complete_json(prompt, max_tokens=translation_max_tokens(source))
     return str(raw.get("translation", "")).strip()
 
 

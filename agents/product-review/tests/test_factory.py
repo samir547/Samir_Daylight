@@ -18,7 +18,7 @@ class FakeProviderAnalyzer(SentimentAnalyzer):
     def __init__(self, config):
         self.config = config
 
-    def complete_json(self, prompt):
+    def complete_json(self, prompt, max_tokens=None):
         return {"echo": prompt}
 
     def analyze_product_review(self, text, product_name=None, rating=None):

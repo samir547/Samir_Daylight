@@ -13,10 +13,12 @@ class SentimentAnalyzer(ABC):
     """
 
     @abstractmethod
-    def complete_json(self, prompt: str) -> Dict[str, Any]:
+    def complete_json(self, prompt: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
         """Send one prompt and return the model's reply parsed as a JSON
         object. The sentiment methods and the translation pass both go
-        through this."""
+        through this. ``max_tokens`` caps the reply; None means the
+        provider's default for short classification output. A reply cut off
+        at that cap raises ResponseTruncatedError."""
         ...
 
     @abstractmethod

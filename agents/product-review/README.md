@@ -177,9 +177,20 @@ hierarchy in `infra/analyzers/errors.py`:
   the CLI logs the reason and exits with status 1. Reviews that were not
   analysed are not written to the checkpoint, so the next run picks them up.
   The translation pass stops the same way.
-- **`RateLimited`, `TransientProviderError`, `ProviderError`** — only the
-  reviews in the affected batch are marked failed (the error text appears in
-  `failure_reasons`); they are retried on the next run.
+- **`ResponseTruncatedError`** — the reply hit the call's output-token
+  limit (`stop_reason == "max_tokens"`), so its JSON is incomplete. The error
+  names the limit used.
+- **`RateLimited`, `TransientProviderError`, `ResponseTruncatedError`,
+  `ProviderError`** — only the reviews in the affected batch (or, in the
+  translation pass, the affected row) are marked failed (the error text
+  appears in `failure_reasons` / the log); they are retried on the next run.
+
+**Output-token limits.** `complete_json(prompt, max_tokens=None)` uses 500
+output tokens by default, which fits the short sentiment JSON. The
+translation pass sizes the limit to the text it sends
+(`translation_max_tokens()` in `infra/translation.py`): about one token per
+two characters plus 200, at least 500 and at most 4,096, so a full
+6,000-character review gets 3,200.
 
 ### 4.6 Checkpointing & resume
 Every completed result (success or failure) is appended to
@@ -245,8 +256,11 @@ checkpoint format stay the same whichever provider runs. To add one:
    environment variables) and a `Config` field with that name, loaded in
    `Config.from_env()`.
 3. Write `infra/analyzers/other_analyzer.py` implementing `SentimentAnalyzer`:
-   `complete_json(prompt)` (send one prompt, return the parsed JSON object;
-   the translation pass uses it too), `analyze_product_review()` and
+   `complete_json(prompt, max_tokens=None)` (send one prompt, return the
+   parsed JSON object; `None` means the provider's default for short output,
+   the translation pass passes a larger limit; raise
+   `ResponseTruncatedError` if the reply is cut off at the limit),
+   `analyze_product_review()` and
    `analyze_service_review()` (shared prompts from `domain/prompts.py`, output
    through `_normalise()`). Optionally override `analyze_batch()` to send a
    whole batch per call (§4.3). Map the SDK's exceptions onto

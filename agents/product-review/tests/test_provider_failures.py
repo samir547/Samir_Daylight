@@ -88,7 +88,7 @@ class FakeAnalyzer(SentimentAnalyzer):
         self.error = error
         self.calls: List[str] = []
 
-    def complete_json(self, prompt: str) -> Dict[str, Any]:
+    def complete_json(self, prompt: str, max_tokens: int = None) -> Dict[str, Any]:
         self.calls.append(prompt)
         if self.error:
             raise self.error

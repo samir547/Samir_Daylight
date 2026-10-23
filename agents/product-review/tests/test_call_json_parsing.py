@@ -21,7 +21,8 @@ EXPECTED = {"translation": "line one\nline two\tend"}
 def _claude_analyzer(text: str) -> ClaudeSentimentAnalyzer:
     analyzer = ClaudeSentimentAnalyzer.__new__(ClaudeSentimentAnalyzer)
     analyzer.config = SimpleNamespace(claude_model="stub")
-    resp = SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+    resp = SimpleNamespace(stop_reason="end_turn",
+                           content=[SimpleNamespace(type="text", text=text)])
     analyzer.client = SimpleNamespace(messages=SimpleNamespace(
         create=lambda **kwargs: resp))
     return analyzer

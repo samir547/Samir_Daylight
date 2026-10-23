@@ -172,8 +172,11 @@ separate QA pass showed mismatched *ratings* are often the unreliable signal.
 | Calls | 1 per review (the base `analyze_batch()` loop) |
 
 **Provider interface:** `SentimentAnalyzer` (`infra/analyzers/base.py`)
-requires `complete_json(prompt) -> dict` (send one prompt, return the parsed
-JSON object), `analyze_product_review()` and `analyze_service_review()`;
+requires `complete_json(prompt, max_tokens=None) -> dict` (send one prompt,
+return the parsed JSON object; `max_tokens=None` means the provider's default
+for short classification output, 500 for Claude; a reply cut off at the
+limit raises `ResponseTruncatedError`), `analyze_product_review()` and
+`analyze_service_review()`;
 `analyze_batch()` has a one-call-per-review default that a provider may
 override to send a whole batch per call (`_build_batch_prompt()` and
 `_align_batch()` in `domain/` support that). `ClaudeSentimentAnalyzer` parses
@@ -191,8 +194,10 @@ clear `ValueError` for a provider with no registered analyzer.
 **Typed provider errors (`infra/analyzers/errors.py`):** a provider-neutral
 hierarchy — `FatalProviderError` (every further call would fail the same way:
 bad key, no credit, missing permission, unknown model), `RateLimited` and
-`TransientProviderError` (still failing after the SDK's own retries), and the
-base `ProviderError` (a failure specific to one request). Each provider maps
+`TransientProviderError` (still failing after the SDK's own retries),
+`ResponseTruncatedError` (the reply hit the call's output-token limit,
+`stop_reason == "max_tokens"`; not fatal), and the base `ProviderError` (a
+failure specific to one request). Each provider maps
 its SDK's exceptions onto it in one classifier; for Claude that is
 `classify_anthropic_error()` (401/402/403/404 and a "credit balance is too
 low" 400 are fatal). The Anthropic SDK keeps doing its own retries for
@@ -213,8 +218,13 @@ touch sentiment data. Resumable via `review_text_en IS NULL` — no checkpoint
 file. `python -m scripts.translate_reviews` is the standalone/backfill entry.
 
 `run_translation_pass()` takes the analyzer a run already built and calls its
-public `complete_json(prompt)`, so whichever provider the run uses is reused
-with no second API client. The writer is duck-typed (needs `._connect()`).
+public `complete_json(prompt, max_tokens=...)`, so whichever provider the run
+uses is reused with no second API client. The output limit comes from
+`translation_max_tokens()`: `len(text) // 2 + 200` on the (already truncated)
+source text, clamped to 500–4,096, so a full 6,000-character review gets
+3,200 tokens. A reply that still hits the limit raises
+`ResponseTruncatedError`; the row is logged as failed, `review_text_en` stays
+NULL, and the pass moves on to the next row. The writer is duck-typed (needs `._connect()`).
 `SettingsWriter(config.db)` is the stock writer. The module lived at the repo
 root as `translation_lib.py` until 2026-09-17, kept dependency-free to avoid a
 cycle with the old monolith (ISSUE-08); it now imports `REVIEWS_TABLE` from

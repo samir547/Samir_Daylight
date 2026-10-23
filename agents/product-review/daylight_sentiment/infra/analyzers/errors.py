@@ -11,6 +11,7 @@ one classifier, not a hunt through control flow.
                             API key, no credit, unknown model): stop the run
     RateLimited             rate limit still hit after the SDK's own retries
     TransientProviderError  5xx / connection failure after the SDK's retries
+    ResponseTruncatedError  the reply hit the call's output-token limit
     ProviderError           any other failure specific to this one request
 """
 from __future__ import annotations
@@ -27,6 +28,11 @@ class RateLimited(ProviderError):
 
 class TransientProviderError(ProviderError):
     """5xx / connection-level failure not cleared by the SDK's own retries."""
+
+
+class ResponseTruncatedError(ProviderError):
+    """The model's reply was cut off at the call's output-token limit, so it
+    can't be parsed. Affects only that request; the run continues."""
 
 
 class FatalProviderError(ProviderError):

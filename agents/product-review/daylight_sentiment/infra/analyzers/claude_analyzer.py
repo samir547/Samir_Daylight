@@ -18,8 +18,13 @@ from daylight_sentiment.infra.analyzers.errors import (
     FatalProviderError,
     ProviderError,
     RateLimited,
+    ResponseTruncatedError,
     TransientProviderError,
 )
+
+# Output-token cap for the short JSON sentiment replies; callers that expect
+# longer output (translation) pass their own.
+DEFAULT_MAX_TOKENS = 500
 
 # 401 invalid key, 402 billing, 403 permission, 404 unknown model: every
 # request in the run would fail the same way.
@@ -57,16 +62,21 @@ class ClaudeSentimentAnalyzer(SentimentAnalyzer):
             max_retries=config.max_retries,
         )
 
-    def complete_json(self, prompt: str) -> Dict[str, Any]:
+    def complete_json(self, prompt: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        limit = DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
         try:
             resp = self.client.messages.create(
                 model=self.config.claude_model,
-                max_tokens=500,
+                max_tokens=limit,
                 system="You are a sentiment analysis expert. Respond with valid JSON only.",
                 messages=[{"role": "user", "content": prompt}],
             )
         except anthropic.APIError as exc:
             raise classify_anthropic_error(exc) from exc
+        if resp.stop_reason == "max_tokens":
+            raise ResponseTruncatedError(
+                f"Model response hit the output-token limit (max_tokens={limit}) "
+                f"and was cut off before the JSON was complete")
         text = "".join(b.text for b in resp.content if b.type == "text")
         # strict=False: model output (esp. translations) can carry raw control
         # characters inside JSON string values, which the default strict decoder
