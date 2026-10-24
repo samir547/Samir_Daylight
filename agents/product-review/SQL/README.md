@@ -39,9 +39,9 @@ rather than it being split across SQL and Python.
 | File | Object | Notes |
 |---|---|---|
 | `tables/sector_group_map.sql` | `dbo.sector_group_map` | Raw sector label -> reporting group; seeded by `seed/sector_group_map.sql` |
-| `tables/sentiment_action_items.sql` | `dbo.sentiment_action_items` | The business to-do items, 3 rows per generation, history kept. Also created by the pipeline itself (last entry in `MIGRATIONS`, `daylight_sentiment/infra/db/connection.py`) |
+| `tables/sentiment_action_items.sql` | `dbo.sentiment_action_items` | The business to-do items, 3 rows per generation, history kept. Also created by the pipeline itself, `evidence_strength` included (the last two entries in `MIGRATIONS`, `daylight_sentiment/infra/db/connection.py`) |
 | `views/vw_review_analysis.sql` | `dbo.vw_review_analysis` | Reviews with resolved SKU, region, parsed review date, sector group and English display text |
-| `views/vw_latest_action_items.sql` | `dbo.vw_latest_action_items` | The newest generation of to-do items for Power BI, with a plain-text `basis` line |
+| `views/vw_latest_action_items.sql` | `dbo.vw_latest_action_items` | The newest generation of to-do items for Power BI, with `evidence_strength` and a plain-text `basis` line |
 
 Views are applied by an administrator in SSMS: the pipeline's login
 (`daylight_agents`) can create and alter tables but not views.

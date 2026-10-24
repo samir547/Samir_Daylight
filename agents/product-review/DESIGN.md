@@ -384,52 +384,107 @@ its own.
 1. `ActionItemRepository.fetch_analysed_rows()` reads analysed rows
    (`sentiment IS NOT NULL`) from `dbo.vw_review_analysis`: `uid`,
    `review_type`, `review_source`, `sentiment`, `confidence`, `rating`,
-   `sector_group`, `primary_aspect`, `product_region`, `key_themes`,
-   `review_date_parsed`, plus `review_text_en` / `review_text` for negative
-   reviews only. `reviewer_name` is never read.
+   `sector_group`, `primary_aspect`, `product_region`, `resolved_sku`,
+   `product_name`, `key_themes`, `review_date_parsed`, plus `review_text_en` /
+   `review_text` for negative reviews only. `reviewer_name` is never read.
 2. `domain.action_items.select_window()`: rows with no `review_date_parsed`
    are left out and counted in the log. The window is the last
    `window_months` (default 12, `ACTION_ITEMS_WINDOW_MONTHS`,
-   `--action-items-months`) ending on the newest review date, not today.
-   Under `min_window_reviews` (100) it widens to every dated review; under
-   `min_total_reviews` (50) even then, generation is skipped with a WARNING
-   (not a failure). Settings: `ActionItemSettings` in `config.py`.
-3. `build_summary()`: totals and sentiment split; by review type and source;
-   product reviews by `sector_group` and service reviews by `primary_aspect`
-   (count, negative count, negative share); product reviews by
-   `product_region`; the 15 most frequent `key_themes` among negative reviews
-   (JSON parsed defensively, lower-cased); monthly negative share; up to 10
-   negative excerpts (most confident first, round-robin across areas,
-   identical texts once, English text preferred, 300 characters, email
-   addresses and phone numbers blanked).
-4. One `analyzer.complete_json(prompt, max_tokens=1500)` call with the prompt
-   from `domain/action_items_prompt.py`: plain British English for a
+   `--action-items-months`) ending on the earlier of the newest review date
+   and today. When the cap applies (a review dated in the future, usually a
+   misparsed date) a WARNING names the date; reviews dated after today stay
+   in the window. Under `min_window_reviews` (100) it widens to every dated
+   review; under `min_total_reviews` (50) even then, generation is skipped
+   with a WARNING (not a failure). Settings: `ActionItemSettings` in
+   `config.py`.
+3. `build_summary()`. Every grouped section gives `reviews`, `negatives`,
+   `negative_share_pct` and `small_sample` (fewer than
+   `SMALL_SAMPLE_REVIEWS` = 30 reviews; the threshold is in the summary as
+   `small_sample_threshold_reviews`). Sections: the sentiment split and
+   `negative_reviews_total`; `by_review_type_and_source`;
+   `product_by_sector_group`; `service_by_aspect`, under the readable names
+   in `ASPECT_NAMES` (one mapping for the summary, `related_area` and Power
+   BI; a label outside it is humanised); `product_by_region` (all sources
+   together) and, separately, `product_by_region_and_source`;
+   `products_most_negative`; `top_negative_themes`; `monthly_negative`;
+   `negative_excerpts` (up to 10, most confident first, round-robin across
+   areas, identical texts once, English text preferred, 300 characters,
+   email addresses and phone numbers blanked).
+   - **Products.** `vw_review_analysis` has no product family or catalogue
+     name; it exposes `resolved_sku` (the one key resolved for both sources)
+     and the raw `product_name` each review was filed under. Products are
+     grouped by `resolved_sku` and shown under their most frequent
+     `product_name` (cut to 80 characters; the SKU when there is none), with
+     the region. Only products with at least `MIN_PRODUCT_NEGATIVES` (3)
+     negatives are listed, at most `TOP_PRODUCTS` (10). Regional variants of
+     one product have different SKUs and are listed separately.
+   - **Themes.** `key_themes` is free text. Each theme is lower-cased and
+     trimmed (`parse_themes()`), then counted under `theme_key()`: words
+     singularised, a short explicit stem table (`defective` -> `defect`,
+     `broken`/`broke` -> `break`), words sorted. "product defect", "defective
+     product" and "product defects" are one theme, shown under its most
+     frequent spelling; a review counts once per merged theme. Themes that
+     merely overlap in meaning ("product failure", "short lifespan") stay
+     separate, which is why the prompt forbids adding counts together.
+4. `analyzer.complete_json(prompt, max_tokens=1500)` with the prompt from
+   `domain/action_items_prompt.py`: plain British English for a
    non-technical reader, exactly 3 items ranked by business impact, titles
-   starting with a verb, only numbers from the summary, cited evidence, say
-   when data is thin, no generic advice.
-5. `validate_action_items()`: exactly 3 items, ranks 1-3 once each, every
-   field a non-empty string within its cap (`title` 200 and `related_area`
-   100, the column sizes; the text fields 1,000-1,500), `related_area`
-   "overall" or a group/aspect/region in the summary. Anything else raises
-   `ActionItemsValidationError`; nothing is saved.
-6. `ActionItemRepository.save()` applies `ensure_schema()` and inserts the 3
+   starting with a verb, only numbers from the summary (and no derived
+   figures), cited evidence, no generic advice. Its comparison rules:
+   regions, sources and other groups are compared only within the same
+   source (`product_by_region_and_source`); Amazon and Trustpilot are
+   different populations (Trustpilot reviews are mostly company-invited and
+   skew positive), so a difference between them is context, never evidence
+   of a problem by itself; an item based mainly on a small-sample group is
+   framed as monitor or investigate, never overhaul or fix; no claim that a
+   difference is statistically significant or "not random"; theme counts
+   are never added or turned into a share of negative reviews; products are
+   named where the evidence supports it; `related_area` is "overall" for a
+   cross-cutting issue and "General / No Use Stated" only for that group;
+   `evidence_strength` is "early signal" for small-sample groups.
+5. `validate_action_items(reply, summary)`: exactly 3 items, ranks 1-3 once
+   each, every field a non-empty string within its cap (`title` 200,
+   `related_area` 100 and `evidence_strength` 20, the column sizes; the text
+   fields 1,000-1,500); `related_area` "overall" or a sector group, aspect
+   (readable name) or region in the summary, matched case-insensitively;
+   `evidence_strength` one of `strong`, `moderate`, `early signal` (stored
+   lower-case), and `early signal` when `related_area` is flagged
+   `small_sample`. Every number in `description`, `rationale` and `evidence`
+   must be one of the summary's numbers at 1 decimal place; a percentage must
+   match one of the summary's percentages, or that percentage rounded half up
+   to a whole number. Dates (ISO, numeric, with a month name), years
+   (1900-2099) and periods ("12 months", "3 weeks") are removed first, and
+   digits inside codes such as `D35500` are not numbers. All problems found
+   are reported together in one `ActionItemsValidationError`.
+6. If validation fails, one retry: the same prompt plus "Your previous reply
+   failed because: <the errors>". Each failure is logged as a WARNING with
+   the reason only. If the retry fails validation too, the error propagates
+   and nothing is saved. A provider error is not retried here.
+7. `ActionItemRepository.save()` applies `ensure_schema()` and inserts the 3
    rows in one transaction (rolled back on any error).
 
 **Table `dbo.sentiment_action_items`** (`SQL/tables/sentiment_action_items.sql`,
-and the last `MIGRATIONS` entry): `item_id INT IDENTITY PK`,
+and the `MIGRATIONS` entries `create_action_items_table` and
+`add_action_items_evidence_strength`): `item_id INT IDENTITY PK`,
 `generation_id UNIQUEIDENTIFIER` (the 3 rows of one generation),
 `generated_at DATETIME2 DEFAULT SYSUTCDATETIME()`, `run_timestamp` (the
 run's `sentiment_analysis_runs.run_timestamp`; NULL for
 `--action-items-only`; not an enforced foreign key), `[rank] TINYINT`,
 `title NVARCHAR(200)`, `description`, `rationale`, `evidence`
-(`NVARCHAR(MAX)`), `related_area NVARCHAR(100)`, `window_start`,
-`window_end` (`DATE`), `reviews_analysed INT`, `llm_provider`, `llm_model`;
+(`NVARCHAR(MAX)`), `related_area NVARCHAR(100)`,
+`evidence_strength NVARCHAR(20) NULL`, `window_start`, `window_end` (`DATE`),
+`reviews_analysed INT`, `llm_provider`, `llm_model`;
 `UNIQUE (generation_id, [rank])`. Insert-only: every generation is kept.
+`evidence_strength` is added to a table that already exists by its own
+guarded `ALTER TABLE ... ADD` (`IF NOT EXISTS` on `sys.columns`), the last
+`MIGRATIONS` entry; the create entry is left as it was first applied. The
+canonical SQL file has the final shape and the same guarded `ALTER`.
 
 **View `dbo.vw_latest_action_items`** (`SQL/views/vw_latest_action_items.sql`):
 the rows of the newest generation (latest `generated_at`, then highest
-`item_id`), with `item_rank` for sorting and a `basis` column ("Based on N
-reviews from <window_start> to <window_end>"). The pipeline's login
+`item_id`), with `item_rank` for sorting, `evidence_strength` capitalised
+("Early signal") and a `basis` column ("Based on N reviews from
+<window_start> to <window_end>"). The pipeline's login
 (`daylight_agents`) can create tables but not views, so an administrator
 applies this file in SSMS.
 
@@ -438,7 +493,8 @@ applies this file in SSMS.
 nothing; combinable with `--action-items-only`).
 
 **Failure behaviour.** In a normal run any failure (provider error, reply
-that fails validation, missing view, database error) logs one ERROR line,
+that fails validation twice, missing view, database error) logs one ERROR
+line,
 `Action items were not generated: ...`, and the exit code stays what it
 would otherwise be: the reviews are already saved. `--action-items-only`
 exits 1 on the same failures. A `FatalProviderError` is reported as

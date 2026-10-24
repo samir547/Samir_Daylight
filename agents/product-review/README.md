@@ -86,8 +86,9 @@ without touching the pipeline (see §5).
         │
         ▼
  ┌─────────────────┐   run_action_items() (only when this run loaded new reviews)
- │ 10. ACTION ITEMS  │  one LLM call over a summary of the stored results;
- │                    │  saves the top 3 to-do items for Power BI (§7.6)
+ │ 10. ACTION ITEMS  │  one LLM call over a summary of the stored results
+ │                    │  (one retry if the reply fails the checks); saves the
+ │                    │  top 3 to-do items for Power BI (§7.6)
  └─────────────────┘
 ```
 
@@ -555,23 +556,65 @@ After a run that analysed and loaded new reviews, the pipeline writes the
 **top 3 to-do items** for the business, for the Financial Director to read
 in Power BI. Each item has a rank (1 = biggest business impact), a short
 title that starts with a verb, what to do, why (citing the review numbers),
-the area it concerns (a sector group, a service aspect, a region, or
-"overall") and one sentence of evidence. They are read-only advice: there is
-no status tracking or write-back.
+the area it concerns (a sector group, a service aspect such as "Returns &
+refunds", a region, or "overall" for an issue that spans several), one
+sentence of evidence and an **evidence strength**: "strong", "moderate" or
+"early signal". They are read-only advice: there is no status tracking or
+write-back.
 
 **What they're based on.** The analysed reviews in `dbo.vw_review_analysis`
 whose review date falls in the last 12 months. The 12 months end on the
-**newest review date in the database**, not today, so the period doesn't
-shrink while no new files arrive. If fewer than 100 reviews fall in it, all
-dated reviews are used instead; if that's still fewer than 50, no items are
-generated and the log says why. The code summarises the reviews (counts and
-negative shares by review type and source, sector group, service aspect and
-region; the most frequent complaint themes; the monthly negative share; up
-to 10 short negative quotes, with no reviewer names) and makes one LLM call
-on that summary. The reply is checked (exactly 3 items, ranks 1-3, every
-field filled in, within length limits, a known area) before the 3 items are
-saved together in `dbo.sentiment_action_items`; a reply that fails the check
-is logged and nothing is saved. Every generation is kept.
+**newest review date in the database**, so the period doesn't shrink while no
+new files arrive, but never later than today: if a wrongly parsed review date
+lies in the future, the period ends today instead (those reviews are still
+counted) and a WARNING says so. If fewer than 100 reviews fall in the period,
+all dated reviews are used instead; if that's still fewer than 50, no items
+are generated and the log says why.
+
+**The summary.** The code summarises the reviews and makes one LLM call on
+that summary alone. It contains:
+
+- counts and negative shares by review type and source, by sector group, by
+  service aspect (under readable names such as "Shipping quality") and by
+  region, all sources together;
+- product reviews by **region and source together** -- the table for
+  comparing regions;
+- the products with the most negative reviews: up to 10, each with at least
+  3 negative reviews, by resolved SKU with their most common product name and
+  their region;
+- the total number of negative reviews, the most frequent complaint themes
+  (plural and word-order variants such as "product defect" / "defective
+  product" counted as one), the monthly negative share, and up to 10 short
+  negative quotes with no reviewer names.
+
+Every group carries its number of reviews, negatives, negative share and a
+`small_sample` flag for fewer than 30 reviews (`SMALL_SAMPLE_REVIEWS` in
+`domain/action_items.py`).
+
+**Rules the model is given.** Compare like with like: regions or other
+groups are compared only within the same review website. Amazon and
+Trustpilot reviewers are different customers (most Trustpilot reviews are
+invited by the company and skew positive), so a difference between the two
+sites is background, never a problem by itself. An item based mainly on a
+small-sample group asks the business to monitor or investigate, never to
+overhaul or fix, and is an "early signal". No claim that a difference is
+statistically significant or "not random". Theme counts overlap, so they are
+never added up or turned into a share of the negative reviews. Name the
+products concerned where the evidence supports it. Use "overall" for an issue
+that spans several areas, and "General / No Use Stated" only for an issue
+about that group itself.
+
+**Checks.** Before anything is saved, the reply must have exactly 3 items,
+ranks 1-3, every field filled in and within its length limit, a related area
+from the summary (any letter case; service aspects by their readable name),
+an evidence strength from the three allowed, "early signal" when the area is
+flagged `small_sample`, and **every number** in the description, rationale
+and evidence present in the summary. A percentage may also be the summary's
+figure rounded to a whole number; dates, years and periods such as
+"12 months" are not checked. A reply that fails is sent back to the model
+**once**, with the reasons; each failure is logged as a WARNING. If the second
+reply fails too, nothing is saved. The 3 items of a generation are saved
+together in `dbo.sentiment_action_items`; every generation is kept.
 
 **Flags.**
 
@@ -595,8 +638,8 @@ python -m daylight_sentiment.cli --action-items-only
 python -m daylight_sentiment.cli --action-items-only --action-items-months 6
 ```
 
-In a normal run, a failure here (the model's reply failed the check, the
-view is missing, a network error) logs one `ERROR` line starting
+In a normal run, a failure here (both replies failed the checks, the view is
+missing, a network error) logs one `ERROR` line starting
 `Action items were not generated` and doesn't change the exit code: the
 reviews are already saved. An invalid API key or exhausted credit still
 stops the run with exit code `1`, as everywhere else.
@@ -605,9 +648,11 @@ stops the run with exit code `1`, as everywhere else.
 (`SQL/views/vw_latest_action_items.sql`). It returns the 3 rows of the newest
 generation; sort by `item_rank`. Its `basis` column reads like "Based on 710
 reviews from 2025-08-21 to 2026-08-20", so readers can see how recent the
-reviews behind the advice are. The pipeline creates the table itself, but its
-database login can't create views: an administrator applies the view file in
-SSMS once (and again whenever it changes).
+reviews behind the advice are, and `evidence_strength` reads "Strong",
+"Moderate" or "Early signal". The pipeline creates the table and adds the
+`evidence_strength` column to an existing one itself, but its database login
+can't create views: an administrator applies the view file in SSMS once (and
+again whenever it changes).
 
 ## 8. Known things to watch
 
