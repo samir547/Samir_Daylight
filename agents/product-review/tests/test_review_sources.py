@@ -40,6 +40,25 @@ class TestFilePattern:
         assert not SourceFiles().trustpilot_service_pattern.matches(
             "trustpilot-product-reviews 873.xlsx")
 
+    def test_every_source_accepts_xlsx_and_csv_by_default(self):
+        src = SourceFiles()
+        for pattern, stem in [(src.trustpilot_product_pattern, "trustpilot-product-reviews"),
+                              (src.trustpilot_service_pattern, "TrustPilot Service Reviews"),
+                              (src.amazon_product_pattern, "amazon_product_reviews_all")]:
+            assert pattern.matches(f"{stem}.xlsx")
+            assert pattern.matches(f"{stem}.CSV")
+            assert not pattern.matches(f"{stem}.xls")
+            assert not pattern.matches(f"{stem}.csv.bak")
+
+    def test_describe(self):
+        assert SourceFiles().trustpilot_product_pattern.describe() == (
+            "*trustpilot*product*.{xlsx,csv}")
+        assert TP_PRODUCT.describe() == "*trustpilot*product*.xlsx"
+
+    def test_single_extension_string_is_accepted(self):
+        assert TP_PRODUCT.extensions == (".xlsx",)
+        assert FilePattern(("a",), (".CSV",)).extensions == (".csv",)
+
 
 class TestResolveSourceFile:
     def test_picks_newest_pattern_match(self, tmp_path):
@@ -54,6 +73,29 @@ class TestResolveSourceFile:
         os.utime(older, (now - 100, now - 100))
         os.utime(newest, (now, now))
         assert resolve_source_file(TP_PRODUCT, tmp_path) == newest
+
+    def test_newest_wins_across_xlsx_and_csv(self, tmp_path):
+        import os
+        pattern = SourceFiles().trustpilot_product_pattern
+        xlsx = tmp_path / "trustpilot-product-reviews 880.xlsx"
+        csv = tmp_path / "trustpilot-product-reviews 901.csv"
+        xlsx.write_bytes(b"x")
+        csv.write_bytes(b"y")
+        now = time.time()
+        os.utime(xlsx, (now - 100, now - 100))
+        os.utime(csv, (now, now))
+        assert resolve_source_file(pattern, tmp_path) == csv
+        os.utime(xlsx, (now + 100, now + 100))
+        assert resolve_source_file(pattern, tmp_path) == xlsx
+
+    def test_directories_named_like_a_match_are_ignored(self, tmp_path):
+        (tmp_path / "trustpilot product.csv").mkdir()
+        with pytest.raises(FileNotFoundError):
+            resolve_source_file(SourceFiles().trustpilot_product_pattern, tmp_path)
+
+    def test_missing_directory_raises_filenotfound(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="No file in .* matches"):
+            resolve_source_file(TP_PRODUCT, tmp_path / "absent")
 
     def test_no_match_raises_filenotfound(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="No file in .* matches"):
@@ -72,6 +114,20 @@ class TestSharePointSelection:
             items, [TP_PRODUCT, FilePattern(("trustpilot", "service"), ".xlsx")])
         assert [c["name"] for c in chosen] == [
             "trustpilot-product-reviews 901.xlsx", "TrustPilot Service Reviews.xlsx"]
+
+    def test_newest_wins_across_xlsx_and_csv(self):
+        pattern = SourceFiles().amazon_product_pattern
+        items = [self._item("amazon product reviews.csv", "2026-09-01T00:00:00Z"),
+                 self._item("amazon product reviews.xlsx", "2026-09-15T00:00:00Z")]
+        assert select_items_by_patterns(items, [pattern])[0]["name"] == (
+            "amazon product reviews.xlsx")
+        items[0]["lastModifiedDateTime"] = "2026-09-20T00:00:00Z"
+        assert select_items_by_patterns(items, [pattern])[0]["name"] == (
+            "amazon product reviews.csv")
+
+    def test_no_match_message_names_both_extensions(self):
+        with pytest.raises(RuntimeError, match=r"\*amazon\*product\*\.\{xlsx,csv\}"):
+            select_items_by_patterns([], [SourceFiles().amazon_product_pattern])
 
     def test_rename_is_tolerated(self):
         # Any name matching the pattern is picked -- nothing is ever

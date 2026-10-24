@@ -86,21 +86,33 @@ class DatabaseSettings:
         )
 
 
+# Every review source may be exported as Excel or CSV; the loaders pick the
+# reader from the file's own extension (see review_sources/base.read_table).
+REVIEW_FILE_EXTENSIONS = (".xlsx", ".csv")
+
+
 @dataclass(frozen=True)
 class FilePattern:
     """Loose filename match for a review export (ISSUE-01): every token must
-    appear in the name (case-insensitive) and the extension must match. This
-    is what survives a fresh export being renamed ("(2)" suffixes, new row
-    counts, date stamps) where an exact-filename match hard-fails."""
+    appear in the name (case-insensitive) and the name must end in one of the
+    extensions. This is what survives a fresh export being renamed ("(2)"
+    suffixes, new row counts, date stamps) where an exact-filename match
+    hard-fails. A single extension may be passed as a plain string."""
     tokens: tuple
-    extension: str
+    extensions: tuple = REVIEW_FILE_EXTENSIONS
+
+    def __post_init__(self):
+        exts = (self.extensions,) if isinstance(self.extensions, str) else self.extensions
+        object.__setattr__(self, "extensions", tuple(e.lower() for e in exts))
 
     def matches(self, name: str) -> bool:
         low = name.lower()
-        return low.endswith(self.extension) and all(t in low for t in self.tokens)
+        return low.endswith(self.extensions) and all(t in low for t in self.tokens)
 
     def describe(self) -> str:
-        return f"*{'*'.join(self.tokens)}*{self.extension}"
+        exts = [e.lstrip(".") for e in self.extensions]
+        suffix = exts[0] if len(exts) == 1 else "{" + ",".join(exts) + "}"
+        return f"*{'*'.join(self.tokens)}*.{suffix}"
 
 
 @dataclass
@@ -111,14 +123,14 @@ class SourceFiles:
     There is no fixed expected filename for any source -- every export
     (locally and on SharePoint) is resolved purely by FilePattern: the
     newest file in the directory whose name contains all of the pattern's
-    tokens. A rename, a "(2)" suffix, a fresh row count, a date stamp --
+    tokens and ends in .xlsx or .csv (either format, for every source). A rename, a "(2)" suffix, a fresh row count, a date stamp --
     none of it matters, because nothing ever compares against a specific
     name. See resolve_source_file() (infra/review_sources/base.py) and
     select_items_by_patterns() (infra/sharepoint_sync.py)."""
     reviews_dir: Path = BASE / "Reviews"
-    trustpilot_product_pattern: FilePattern = FilePattern(("trustpilot", "product"), ".xlsx")
-    trustpilot_service_pattern: FilePattern = FilePattern(("trustpilot", "service"), ".xlsx")
-    amazon_product_pattern: FilePattern = FilePattern(("amazon", "product"), ".csv")
+    trustpilot_product_pattern: FilePattern = FilePattern(("trustpilot", "product"))
+    trustpilot_service_pattern: FilePattern = FilePattern(("trustpilot", "service"))
+    amazon_product_pattern: FilePattern = FilePattern(("amazon", "product"))
     # SharePoint subfolders, relative to whatever SP_SHARE_URL resolves to -- scopes
     # the sync to files staged in "In Progress" only (never a sibling "Processed").
     sp_trustpilot_product_dir: str = "TrustPilot/Product/In Progress"

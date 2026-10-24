@@ -26,9 +26,10 @@ def resolve_source_file(pattern: FilePattern, directory: Path) -> Path:
     matters, since nothing is ever compared against a specific name (that
     used to be true only once an expected exact filename went missing;
     now it's true unconditionally, matching how the SharePoint side
-    already worked via select_items_by_patterns())."""
-    candidates = [p for p in directory.glob(f"*{pattern.extension}")
-                  if pattern.matches(p.name)]
+    already worked via select_items_by_patterns()). An .xlsx and a .csv
+    match compete on equal terms: the newest one wins, whatever its format."""
+    candidates = [p for p in (directory.iterdir() if directory.is_dir() else [])
+                  if p.is_file() and pattern.matches(p.name)]
     if candidates:
         return max(candidates, key=lambda p: p.stat().st_mtime)
     raise FileNotFoundError(
