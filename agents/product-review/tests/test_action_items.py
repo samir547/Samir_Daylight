@@ -15,14 +15,19 @@ from daylight_sentiment.config import ActionItemSettings
 from daylight_sentiment.domain import taxonomy
 from daylight_sentiment.domain.action_items import (
     ASPECT_NAMES,
+    BANNED_WORDS,
     ActionItemsValidationError,
     FIELD_MAX_CHARS,
+    MIN_TREND_COUNT,
     MIN_WINDOW_REVIEWS,
     SMALL_SAMPLE_REVIEWS,
+    STRONG_ACTION_VERBS,
     TREND_THEMES,
     ReviewWindow,
     aspect_name,
+    banned_wording,
     build_summary,
+    build_trend,
     count_negative_themes,
     format_action_items,
     months_before,
@@ -37,6 +42,7 @@ from daylight_sentiment.domain.action_items import (
     small_sample_areas,
     summary_areas,
     summary_numbers,
+    title_verb,
     unsupported_numbers,
     validate_action_items,
     window_label,
@@ -857,7 +863,8 @@ class TestTrend:
             "recent": {"reviews": 13, "negatives": 4, "negative_share_pct": 30.8,
                        "small_sample": True},
             "earlier": {"reviews": 60, "negatives": 30, "negative_share_pct": 50.0,
-                        "small_sample": False}}
+                        "small_sample": False},
+            "few_mentions": False}
         assert sectors["Art & Painting"]["recent"] == {
             "reviews": 5, "negatives": 3, "negative_share_pct": 60.0, "small_sample": True}
         assert sectors["Art & Painting"]["earlier"]["negative_share_pct"] == 5.0
@@ -894,7 +901,8 @@ class TestTrend:
             "recent": {"reviews": 18, "negatives_mentioning": 4,
                        "share_of_reviews_pct": 22.2, "small_sample": True},
             "earlier": {"reviews": 100, "negatives_mentioning": 30,
-                        "share_of_reviews_pct": 30.0, "small_sample": False}}
+                        "share_of_reviews_pct": 30.0, "small_sample": False},
+            "few_mentions": False}
         assert themes["glare"]["recent"]["negatives_mentioning"] == 7
         assert themes["glare"]["earlier"]["negatives_mentioning"] == 2
 
@@ -1315,3 +1323,187 @@ class TestGenerate:
         for prompt, _ in analyzer.calls:
             assert "Private Person" not in prompt
             assert '"reviews": 121' in prompt
+
+
+# -- wording, title verb and trend reliability checks --------------------------
+
+class TestTitleVerb:
+    def reply(self, title, strength="early signal"):
+        reply = good_reply()
+        reply["items"][1]["title"] = title  # rank 1, related_area Shipping quality
+        reply["items"][1]["evidence_strength"] = strength
+        if strength != "early signal":
+            reply["items"][1]["related_area"] = "overall"
+        return reply
+
+    @pytest.mark.parametrize("title", ["Fix delivery packaging", "fix: delivery packaging",
+                                       "  Overhaul packaging", "RESOLVE damage",
+                                       "Eliminate dents", "Stop the damage", "Eradicate dents"])
+    def test_strong_verb_on_an_early_signal_is_rejected(self, title):
+        with pytest.raises(ActionItemsValidationError) as exc:
+            validate_action_items(self.reply(title), AREAS)
+        assert "item 2 is an 'early signal' but its title starts with" in str(exc.value)
+        assert "start it with Monitor, Investigate or Review" in str(exc.value)
+
+    @pytest.mark.parametrize("title", ["Monitor delivery packaging", "Investigate dents",
+                                       "Review packaging", "Fixing is premature: monitor"])
+    def test_other_verbs_are_accepted_for_an_early_signal(self, title):
+        items = validate_action_items(self.reply(title), AREAS)
+        assert items[0]["title"] == title
+
+    @pytest.mark.parametrize("strength", ["moderate", "strong"])
+    def test_does_not_apply_to_moderate_or_strong(self, strength):
+        items = validate_action_items(self.reply("Fix delivery packaging", strength), AREAS)
+        assert items[0]["title"] == "Fix delivery packaging"
+
+    def test_the_verb_list(self):
+        assert STRONG_ACTION_VERBS == ("fix", "overhaul", "resolve", "eliminate", "stop",
+                                       "eradicate")
+        assert title_verb("  Fix: the stand") == "fix" and title_verb("") == ""
+
+
+class TestBannedWording:
+    @pytest.mark.parametrize("text, found", [
+        ("A significant rise.", ["significant"]),
+        ("Significantly more complaints.", ["significantly"]),
+        ("Statistically, this is MEANINGFUL.", ["statistically", "meaningful"]),
+        ("This is not random.", ["not random"]),
+        ("More than random variation.", ["random variation"]),
+        ("A non-significant gap.", ["significant"]),
+        ("significant and significant again", ["significant"]),
+    ])
+    def test_whole_words_any_case(self, text, found):
+        assert banned_wording(text) == found
+
+    @pytest.mark.parametrize("text", ["An insignificant gap.", "It matters meaningfully.",
+                                      "Not randomly chosen.", "No significance claimed.",
+                                      "A random sample of variation."])
+    def test_longer_or_other_words_are_accepted(self, text):
+        assert banned_wording(text) == []
+
+    def test_the_word_list(self):
+        assert BANNED_WORDS == ("significant", "significantly", "statistically",
+                                "meaningful", "not random", "random variation")
+
+    @pytest.mark.parametrize("field", ["title", "description", "rationale", "evidence"])
+    def test_reply_using_them_fails_and_names_them(self, field):
+        reply = good_reply()
+        reply["items"][0][field] = "Review a significant, not\nrandom stand fault."
+        with pytest.raises(ActionItemsValidationError,
+                           match=f"item 1 {field} uses wording the summary cannot support: "
+                                 "significant, not random"):
+            validate_action_items(reply, AREAS)
+
+    def test_related_area_is_not_checked(self):
+        reply = good_reply()
+        reply["items"][0]["related_area"] = "Meaningful Group"
+        validate_action_items(reply, summary_for(sector_groups=(("Meaningful Group", False),)))
+
+
+def few_mentions_rows(earlier_negatives, recent_negatives):
+    """One sector group with 50 earlier and 20 recent reviews, the given
+    numbers of them negative and mentioning "flicker"."""
+    rows, i = [], 0
+    for day, reviews, negatives in [(date(2026, 1, 10), 50, earlier_negatives),
+                                    (date(2026, 9, 1), 20, recent_negatives)]:
+        for k in range(reviews):
+            rows.append(review(i, day, "negative" if k < negatives else "positive",
+                               sector_group="Sewing & Needlecraft",
+                               key_themes='["flicker"]'))
+            i += 1
+    return rows
+
+
+class TestFewMentions:
+    @pytest.mark.parametrize("earlier, recent, few", [(6, 3, True), (7, 3, False),
+                                                     (0, 9, True), (0, 10, False)])
+    def test_flag_at_the_threshold(self, earlier, recent, few):
+        assert MIN_TREND_COUNT == 10
+        trend = build_summary(year_window(few_mentions_rows(earlier, recent)),
+                              15, 10, 300)["trend"]
+        [sewing] = trend["product_by_sector_group"]
+        assert sewing["few_mentions"] is few
+        [flicker] = trend["top_negative_themes"]
+        assert flicker["few_mentions"] is few
+        for section in ("by_review_type_and_source", "product_by_region_and_source"):
+            assert [row["few_mentions"] for row in trend[section]] == [few]
+
+    def test_threshold_can_be_passed_in(self):
+        window = year_window(few_mentions_rows(3, 2))
+        summary = build_summary(window, 15, 10, 300)
+        assert build_trend(window, summary, 30, min_trend_count=5)[
+            "product_by_sector_group"][0]["few_mentions"] is False
+        assert build_trend(window, summary, 30, min_trend_count=6)[
+            "top_negative_themes"][0]["few_mentions"] is True
+
+    def test_flag_adds_no_numbers_for_the_validator(self):
+        summary = build_summary(year_window(trend_rows()), 15, 10, 300)
+
+        def without_flag(value):
+            if isinstance(value, dict):
+                return {k: without_flag(v) for k, v in value.items() if k != "few_mentions"}
+            if isinstance(value, list):
+                return [without_flag(v) for v in value]
+            return value
+
+        assert '"few_mentions"' in json.dumps(summary)
+        assert summary_numbers(summary) == summary_numbers(without_flag(summary))
+
+
+class TestReliabilityPromptRules:
+    def prompt(self):
+        summary = build_summary(year_window(trend_rows()), 15, 10, 300)
+        return build_action_items_prompt(summary, summary_areas(summary))
+
+    def test_rules(self):
+        raw = self.prompt()
+        flat = " ".join(raw.split())
+        for rule in (
+                'A row is marked "few_mentions": true when its negative reviews (for a '
+                "topic, the negative reviews mentioning it) add up to fewer than 10 across "
+                "both parts: too few to tell whether it is rising or falling.",
+                'An "early signal" item\'s title follows rule 13.',
+                'Do not use these words anywhere in an item, in any sense: "significant", '
+                '"significantly", "statistically", "meaningful", "not random" or "random '
+                'variation".',
+                '"moderate" and "strong" also require that the key figures do not rest on '
+                'rows marked "small_sample": true or "few_mentions": true.',
+                'A topic or product with fewer than 10 negative reviews is an "early signal".',
+                'The title of an "early signal" item must start with one of "Monitor", '
+                '"Investigate" or "Review", never with one of "Fix", "Overhaul", "Resolve", '
+                '"Eliminate", "Stop" or "Eradicate".',
+                'For a row marked "small_sample": true or "few_mentions": true, never say '
+                "that it is rising, worsening, improving, increased or decreased; say that "
+                "there are too few reviews to tell.",
+                "16. This period alone. Write the items for this period only. Other periods "
+                "get their own items, so do not repeat an issue only because it appears in "
+                "another period."):
+            assert rule in flat, rule
+        assert '"few_mentions": false' in raw
+
+
+class TestRetryOnTheNewChecks:
+    def test_failing_checks_trigger_the_single_retry_with_the_errors(self):
+        bad = dataset_reply()
+        bad["items"][1]["title"] = "Fix delivery packaging"  # rank 1, early signal
+        bad["items"][0]["rationale"] = "A significant 40 of 120 product reviews."
+        analyzer = FakeAnalyzer(replies=[bad, dataset_reply()])
+        repo = FakeRepository(dataset())
+        outcome = TestGenerate().generate(analyzer, repo)
+        assert len(analyzer.calls) == 2 and len(repo.saved) == 1
+        assert not outcome.failed
+        retry = analyzer.calls[1][0]
+        assert ("item 1 rationale uses wording the summary cannot support: significant"
+                in retry)
+        assert ("item 2 is an 'early signal' but its title starts with 'Fix'; start it with "
+                "Monitor, Investigate or Review") in retry
+
+    def test_failing_twice_saves_nothing(self):
+        bad = dataset_reply()
+        bad["items"][1]["title"] = "Stop the damage"
+        analyzer = FakeAnalyzer(replies=[bad, bad])
+        repo = FakeRepository(dataset())
+        outcome = TestGenerate().generate(analyzer, repo)
+        [failed] = outcome.failed
+        assert "title starts with 'Stop'" in str(failed.error)
+        assert len(analyzer.calls) == 2 and repo.saved == []

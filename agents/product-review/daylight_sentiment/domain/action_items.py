@@ -36,6 +36,10 @@ PRODUCT_NAME_CHARS = 80
 # earlier two thirds, for the main groups and the TREND_THEMES most frequent
 # negative themes.
 TREND_THEMES = 10
+# A trend row (group or theme) whose negatives -- or, for a theme, negative
+# reviews mentioning it -- add up to fewer than this across both parts is
+# flagged few_mentions: too few to say whether it is rising or falling.
+MIN_TREND_COUNT = 10
 
 # Service-review aspect labels (domain/taxonomy.ASPECTS) as the reader sees
 # them: in the summary, in related_area and so in Power BI.
@@ -53,6 +57,18 @@ ITEM_FIELDS = ("title", "description", "rationale", "related_area", "evidence",
                "evidence_strength")
 EARLY_SIGNAL = "early signal"
 EVIDENCE_STRENGTHS = ("strong", "moderate", EARLY_SIGNAL)
+# An "early signal" item's title must not open with one of these verbs (they
+# claim a known cause), but with one of EARLY_SIGNAL_VERBS.
+STRONG_ACTION_VERBS = ("fix", "overhaul", "resolve", "eliminate", "stop", "eradicate")
+EARLY_SIGNAL_VERBS = ("Monitor", "Investigate", "Review")
+# Wording that claims more certainty than review counts can give; rejected
+# as whole words, in any case, in BANNED_WORDING_FIELDS.
+BANNED_WORDS = ("significant", "significantly", "statistically", "meaningful",
+                "not random", "random variation")
+BANNED_WORDING_FIELDS = ("title", "description", "rationale", "evidence")
+_BANNED = re.compile(r"\b(?:" + "|".join(w.replace(" ", r"\s+") for w in BANNED_WORDS)
+                     + r")\b", re.I)
+_FIRST_WORD = re.compile(r"[^\W\d_]+")
 
 # Caps follow dbo.sentiment_action_items: title NVARCHAR(200), related_area
 # NVARCHAR(100), evidence_strength NVARCHAR(20). The NVARCHAR(MAX) text
@@ -440,13 +456,16 @@ def recent_part_start(window: ReviewWindow) -> date:
     return window.end - timedelta(days=max(1, days // 3) - 1)
 
 
-def _trend_entry(recent: _Tally, earlier: _Tally, small_sample_reviews: int) -> Dict[str, Any]:
+def _trend_entry(recent: _Tally, earlier: _Tally, small_sample_reviews: int,
+                 min_count: int) -> Dict[str, Any]:
     return {"recent": recent.as_dict(small_sample_reviews),
-            "earlier": earlier.as_dict(small_sample_reviews)}
+            "earlier": earlier.as_dict(small_sample_reviews),
+            "few_mentions": recent.negatives + earlier.negatives < min_count}
 
 
 def _trend_groups(rows: Iterable[Dict[str, Any]], key, recent_start: date,
-                  order: Sequence[Any], small_sample_reviews: int) -> List[tuple]:
+                  order: Sequence[Any], small_sample_reviews: int,
+                  min_count: int) -> List[tuple]:
     """(group, trend entry) for each group in ``order``: its tally in the
     recent part and in the earlier part."""
     recent: Dict[Any, _Tally] = defaultdict(_Tally)
@@ -454,12 +473,13 @@ def _trend_groups(rows: Iterable[Dict[str, Any]], key, recent_start: date,
     for r in rows:
         part = recent if r["review_date_parsed"] >= recent_start else earlier
         part[key(r)].add(r.get("sentiment"))
-    return [(group, _trend_entry(recent[group], earlier[group], small_sample_reviews))
+    return [(group, _trend_entry(recent[group], earlier[group], small_sample_reviews,
+                                 min_count))
             for group in order]
 
 
 def _theme_trend(rows: Sequence[Dict[str, Any]], themes: Sequence[str], recent_start: date,
-                 small_sample_reviews: int) -> List[Dict[str, Any]]:
+                 small_sample_reviews: int, min_count: int) -> List[Dict[str, Any]]:
     """For each theme: how many negative reviews mention it in each part,
     as a share of ALL the reviews in that part (so the two parts compare
     whatever their size; never a share of the negative reviews)."""
@@ -478,17 +498,21 @@ def _theme_trend(rows: Sequence[Dict[str, Any]], themes: Sequence[str], recent_s
             entry[part] = {"reviews": totals[part], "negatives_mentioning": c,
                            "share_of_reviews_pct": _pct(c, totals[part]),
                            "small_sample": totals[part] < small_sample_reviews}
+        entry["few_mentions"] = (entry["recent"]["negatives_mentioning"]
+                                 + entry["earlier"]["negatives_mentioning"]) < min_count
         out.append(entry)
     return out
 
 
 def build_trend(window: ReviewWindow, summary: Dict[str, Any],
-                small_sample_reviews: int) -> Dict[str, Any]:
+                small_sample_reviews: int,
+                min_trend_count: int = MIN_TREND_COUNT) -> Dict[str, Any]:
     """The window's most recent third against its earlier two thirds, for
     the groups ``summary`` already lists (in the same order) and its first
-    TREND_THEMES negative themes."""
+    TREND_THEMES negative themes. A row is flagged few_mentions when its
+    count across both parts is below ``min_trend_count``."""
     rows = window.rows
-    n = small_sample_reviews
+    n, m = small_sample_reviews, min_trend_count
     recent_start = recent_part_start(window)
     product = [r for r in rows if r.get("review_type") == "product"]
     service = [r for r in rows if r.get("review_type") == "service"]
@@ -508,13 +532,13 @@ def build_trend(window: ReviewWindow, summary: Dict[str, Any],
                 rows, lambda r: (r.get("review_type") or "unknown",
                                  r.get("review_source") or "unknown"), recent_start,
                 [(x["review_type"], x["review_source"])
-                 for x in summary["by_review_type_and_source"]], n)],
+                 for x in summary["by_review_type_and_source"]], n, m)],
         "product_by_sector_group": named(_trend_groups(
             product, lambda r: r.get("sector_group") or "Unknown", recent_start,
-            [x["name"] for x in summary["product_by_sector_group"]], n)),
+            [x["name"] for x in summary["product_by_sector_group"]], n, m)),
         "service_by_aspect": named(_trend_groups(
             service, lambda r: aspect_name(r.get("primary_aspect")), recent_start,
-            [x["name"] for x in summary["service_by_aspect"]], n)),
+            [x["name"] for x in summary["service_by_aspect"]], n, m)),
     }
     if "product_by_region_and_source" in summary:
         trend["product_by_region_and_source"] = [
@@ -522,10 +546,10 @@ def build_trend(window: ReviewWindow, summary: Dict[str, Any],
                 [r for r in product if r.get("product_region")],
                 lambda r: (r["product_region"], r.get("review_source") or "unknown"),
                 recent_start, [(x["region"], x["review_source"])
-                               for x in summary["product_by_region_and_source"]], n)]
+                               for x in summary["product_by_region_and_source"]], n, m)]
     trend["top_negative_themes"] = _theme_trend(
         rows, [t["theme"] for t in summary["top_negative_themes"][:TREND_THEMES]],
-        recent_start, n)
+        recent_start, n, m)
     return trend
 
 
@@ -687,6 +711,23 @@ def unsupported_numbers(text: str, known: SummaryNumbers) -> List[str]:
             if not known.supports(value, percent)]
 
 
+def banned_wording(text: str) -> List[str]:
+    """The BANNED_WORDS in ``text`` (whole words, any case), lower-cased,
+    each once, in the order they first appear."""
+    found: List[str] = []
+    for m in _BANNED.finditer(text):
+        word = " ".join(m.group(0).lower().split())
+        if word not in found:
+            found.append(word)
+    return found
+
+
+def title_verb(title: str) -> str:
+    """The first word of ``title``, lower-cased ("" if it has none)."""
+    m = _FIRST_WORD.search(title)
+    return m.group(0).lower() if m else ""
+
+
 def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
                 threshold: Any, known: SummaryNumbers) -> tuple:
     """(clean item or None, problems) for one item of the reply."""
@@ -713,6 +754,11 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
             if bad:
                 problems.append(f"item {i} {name} has numbers that are not in the summary: "
                                 f"{', '.join(bad)}")
+        if name in BANNED_WORDING_FIELDS:
+            banned = banned_wording(value)
+            if banned:
+                problems.append(f"item {i} {name} uses wording the summary cannot support: "
+                                f"{', '.join(banned)}")
 
     if "related_area" in clean:
         area = canonical.get(clean["related_area"].casefold())
@@ -728,6 +774,12 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
                             f"is not one of {', '.join(EVIDENCE_STRENGTHS)}")
         else:
             clean["evidence_strength"] = strength
+            verb = title_verb(clean.get("title", ""))
+            if strength == EARLY_SIGNAL and verb in STRONG_ACTION_VERBS:
+                problems.append(
+                    f"item {i} is an {EARLY_SIGNAL!r} but its title starts with "
+                    f"{verb.capitalize()!r}; start it with "
+                    f"{', '.join(EARLY_SIGNAL_VERBS[:-1])} or {EARLY_SIGNAL_VERBS[-1]}")
             area = clean.get("related_area", "")
             if area.casefold() in small and strength != EARLY_SIGNAL:
                 problems.append(
@@ -744,7 +796,9 @@ def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str,
     canonical spelling and evidence_strength lower-case. Every number in
     the description, rationale and evidence must be in the summary (dates,
     years and periods aside; a percentage may be rounded to a whole
-    number). Anything short of
+    number). None of BANNED_WORDS may appear in the title, description,
+    rationale or evidence, and an "early signal" title may not start with
+    one of STRONG_ACTION_VERBS. Anything short of
     exactly ITEM_COUNT complete items raises ActionItemsValidationError,
     whose message lists every problem found: a partial set is never
     returned."""
