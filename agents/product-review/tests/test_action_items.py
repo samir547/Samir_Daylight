@@ -19,6 +19,7 @@ from daylight_sentiment.domain.action_items import (
     FIELD_MAX_CHARS,
     MIN_WINDOW_REVIEWS,
     SMALL_SAMPLE_REVIEWS,
+    TREND_THEMES,
     ReviewWindow,
     aspect_name,
     build_summary,
@@ -28,6 +29,7 @@ from daylight_sentiment.domain.action_items import (
     theme_key,
     parse_themes,
     products_most_negative,
+    recent_part_start,
     select_excerpts,
     select_windows,
     shorten,
@@ -389,11 +391,20 @@ class TestProducts:
     def test_most_negative_products_with_flags(self):
         products = build_summary(window_of(self.rows()), 15, 10, 300)["products_most_negative"]
         assert products == [
-            {"product": "Lumi Task Lamp", "sku": "D35500", "region": "UK", "reviews": 40,
+            {"product": "Lumi Task Lamp", "sku": "D35500", "region": "UK",
+             "reviews_by_source": {"trustpilot": 40}, "reviews": 40,
              "negatives": 6, "negative_share_pct": 15.0, "small_sample": False},
-            {"product": "Halo Floor Lamp", "sku": "U31000", "region": "US", "reviews": 12,
+            {"product": "Halo Floor Lamp", "sku": "U31000", "region": "US",
+             "reviews_by_source": {"trustpilot": 12}, "reviews": 12,
              "negatives": 3, "negative_share_pct": 25.0, "small_sample": True},
         ]
+
+    def test_reviews_by_source_per_product(self):
+        rows = ([review(i, date(2026, 6, 1), "negative", resolved_sku="D1",
+                        review_source="amazon") for i in range(7)]
+                + [review(100 + i, date(2026, 6, 1), resolved_sku="D1") for i in range(3)])
+        [p] = products_most_negative(rows, 30)
+        assert p["reviews_by_source"] == {"amazon": 7, "trustpilot": 3}
 
     def test_products_with_fewer_than_3_negatives_or_no_sku_left_out(self):
         skus = {p["sku"] for p in products_most_negative(self.rows(), 30)}
@@ -793,7 +804,8 @@ class TestPrompt:
                 'use "negative_reviews_total"',
                 'name them (from "products_most_negative")',
                 'Use "overall" for an issue that spans several',
-                'Use "General / No Use Stated" only for an issue about that group itself'):
+                'Use a catch-all group such as "General / No Use Stated" only as rule 14 '
+                "allows."):
             assert rule in flat, rule
 
     def test_summary_areas(self):
@@ -801,6 +813,245 @@ class TestPrompt:
         assert summary_areas(summary) == [
             "overall", "Sewing & Needlecraft", "Art & Painting",
             "Shipping quality", "Customer service", "UK", "EU"]
+
+
+def year_window(rows, end=date(2026, 10, 24)):
+    """A 12-month window from 2025-10-25 to ``end``; its recent third starts
+    on 2026-06-26."""
+    return ReviewWindow(12, rows, date(2025, 10, 25), end)
+
+
+def trend_rows():
+    """Sewing: 60 earlier reviews (30 negative), 13 recent (4 negative).
+    Art: 40 earlier (2 negative), 5 recent (3 negative)."""
+    rows, i = [], 0
+    for group, day, reviews, negatives, themes in [
+            ("Sewing & Needlecraft", date(2026, 1, 10), 60, 30, '["flicker"]'),
+            ("Sewing & Needlecraft", date(2026, 9, 1), 13, 4, '["flicker", "glare"]'),
+            ("Art & Painting", date(2026, 2, 1), 40, 2, '["glare"]'),
+            ("Art & Painting", date(2026, 9, 20), 5, 3, '["glare"]')]:
+        for k in range(reviews):
+            rows.append(review(i, day, "negative" if k < negatives else "positive",
+                               sector_group=group, key_themes=themes))
+            i += 1
+    return rows
+
+
+class TestTrend:
+    def test_recent_part_is_the_last_third_of_the_window(self):
+        assert recent_part_start(year_window([])) == date(2026, 6, 26)
+        w3 = ReviewWindow(3, [], date(2026, 7, 25), date(2026, 10, 24))
+        assert recent_part_start(w3) == date(2026, 9, 25)  # 92 days -> the last 30
+        tiny = ReviewWindow(1, [], date(2026, 10, 23), date(2026, 10, 24))
+        assert recent_part_start(tiny) == date(2026, 10, 24)
+
+    def test_parts_and_sector_group_counts_shares_and_flags(self):
+        trend = build_summary(year_window(trend_rows()), 15, 10, 300)["trend"]
+        assert trend["recent_part"] == {"start": "2026-06-26", "end": "2026-10-24",
+                                        "reviews": 18}
+        assert trend["earlier_part"] == {"start": "2025-10-25", "end": "2026-06-25",
+                                         "reviews": 100}
+        sectors = {e["name"]: e for e in trend["product_by_sector_group"]}
+        assert sectors["Sewing & Needlecraft"] == {
+            "name": "Sewing & Needlecraft",
+            "recent": {"reviews": 13, "negatives": 4, "negative_share_pct": 30.8,
+                       "small_sample": True},
+            "earlier": {"reviews": 60, "negatives": 30, "negative_share_pct": 50.0,
+                        "small_sample": False}}
+        assert sectors["Art & Painting"]["recent"] == {
+            "reviews": 5, "negatives": 3, "negative_share_pct": 60.0, "small_sample": True}
+        assert sectors["Art & Painting"]["earlier"]["negative_share_pct"] == 5.0
+        # Same groups, same order, as the main section.
+        main = build_summary(year_window(trend_rows()), 15, 10, 300)["product_by_sector_group"]
+        assert [e["name"] for e in trend["product_by_sector_group"]] == [e["name"] for e in main]
+
+    def test_sources_regions_and_aspects(self):
+        rows = trend_rows() + [
+            review(500 + k, date(2026, 9, 5), "negative" if k < 2 else "positive",
+                   review_type="service", primary_aspect="returns_refunds")
+            for k in range(4)]
+        rows += [review(600 + k, date(2026, 3, 1), "negative", review_source="amazon",
+                        product_region="EU") for k in range(3)]
+        trend = build_summary(year_window(rows), 15, 10, 300)["trend"]
+        sources = {(e["review_type"], e["review_source"]): e
+                   for e in trend["by_review_type_and_source"]}
+        assert sources[("service", "trustpilot")]["recent"] == {
+            "reviews": 4, "negatives": 2, "negative_share_pct": 50.0, "small_sample": True}
+        assert sources[("service", "trustpilot")]["earlier"]["reviews"] == 0
+        assert sources[("product", "amazon")]["earlier"]["negatives"] == 3
+        [aspect] = trend["service_by_aspect"]
+        assert aspect["name"] == "Returns & refunds" and aspect["recent"]["negatives"] == 2
+        regions = {(e["region"], e["review_source"]): e
+                   for e in trend["product_by_region_and_source"]}
+        assert regions[("EU", "amazon")]["earlier"]["reviews"] == 3
+        assert regions[("UK", "trustpilot")]["recent"]["reviews"] == 18
+
+    def test_negative_themes_per_part_as_a_share_of_all_reviews(self):
+        trend = build_summary(year_window(trend_rows()), 15, 10, 300)["trend"]
+        themes = {e["theme"]: e for e in trend["top_negative_themes"]}
+        assert themes["flicker"] == {
+            "theme": "flicker",
+            "recent": {"reviews": 18, "negatives_mentioning": 4,
+                       "share_of_reviews_pct": 22.2, "small_sample": True},
+            "earlier": {"reviews": 100, "negatives_mentioning": 30,
+                        "share_of_reviews_pct": 30.0, "small_sample": False}}
+        assert themes["glare"]["recent"]["negatives_mentioning"] == 7
+        assert themes["glare"]["earlier"]["negatives_mentioning"] == 2
+
+    def test_at_most_ten_themes(self):
+        rows = [review(i, date(2026, 9, 1), "negative", key_themes=json.dumps([f"t{i}"]))
+                for i in range(30)]
+        trend = build_summary(year_window(rows), 15, 10, 300)["trend"]
+        assert len(trend["top_negative_themes"]) == TREND_THEMES == 10
+
+    def test_window_with_a_tiny_recent_part(self):
+        recent_start = date(2026, 6, 26)
+        earlier = [r for r in trend_rows() if r["review_date_parsed"] < recent_start]
+        recent = [r for r in trend_rows() if r["review_date_parsed"] >= recent_start]
+        trend = build_summary(year_window(earlier + recent[:2]), 15, 10, 300)["trend"]
+        assert trend["recent_part"]["reviews"] == 2
+        sewing = {e["name"]: e for e in trend["product_by_sector_group"]}["Sewing & Needlecraft"]
+        assert sewing["recent"] == {"reviews": 2, "negatives": 2, "negative_share_pct": 100.0,
+                                    "small_sample": True}
+        assert sewing["earlier"]["small_sample"] is False
+        art = {e["name"]: e for e in trend["product_by_sector_group"]}["Art & Painting"]
+        assert art["recent"] == {"reviews": 0, "negatives": 0, "negative_share_pct": 0.0,
+                                 "small_sample": True}
+        flicker = {e["theme"]: e for e in trend["top_negative_themes"]}["flicker"]
+        assert flicker["recent"] == {"reviews": 2, "negatives_mentioning": 2,
+                                     "share_of_reviews_pct": 100.0, "small_sample": True}
+
+    def test_future_dated_reviews_count_as_recent(self):
+        rows = trend_rows() + [review(900, date(2026, 12, 1), "negative")]
+        trend = build_summary(year_window(rows), 15, 10, 300)["trend"]
+        assert trend["recent_part"]["reviews"] == 19
+
+    def test_trend_numbers_are_accepted_by_the_validator(self):
+        summary = build_summary(year_window(trend_rows()), 15, 10, 300)
+        text = ("Sewing: 4 of 13 recent reviews negative (30.8%) against 30 of 60 earlier "
+                "(50.0%); flicker in 22.2% of recent reviews.")
+        assert unsupported_numbers(text, summary_numbers(summary)) == []
+        del summary["trend"]
+        assert {"30.8%", "22.2%"} <= set(unsupported_numbers(text, summary_numbers(summary)))
+
+
+def by_source_rows():
+    rows, i = [], 0
+    for group, source, reviews, negatives in [
+            ("Sewing & Needlecraft", "amazon", 40, 10),
+            ("Sewing & Needlecraft", "trustpilot", 20, 1),
+            ("General / No Use Stated", "trustpilot", 35, 7)]:
+        for k in range(reviews):
+            rows.append(review(i, date(2026, 6, 1), "negative" if k < negatives else "positive",
+                               sector_group=group, review_source=source))
+            i += 1
+    for aspect, source, reviews, negatives in [("customer_service", "trustpilot", 12, 6),
+                                               ("customer_service", "amazon", 3, 1),
+                                               ("returns_refunds", "trustpilot", 8, 1)]:
+        for k in range(reviews):
+            rows.append(review(i, date(2026, 6, 1), "negative" if k < negatives else "positive",
+                               review_type="service", review_source=source,
+                               primary_aspect=aspect))
+            i += 1
+    return rows
+
+
+class TestGroupBySource:
+    def test_sector_group_by_source(self):
+        s = build_summary(window_of(by_source_rows()), 15, 10, 300)
+        assert s["product_by_sector_group_and_source"] == [
+            {"sector_group": "General / No Use Stated", "review_source": "trustpilot",
+             "reviews": 35, "negatives": 7, "negative_share_pct": 20.0, "small_sample": False},
+            {"sector_group": "Sewing & Needlecraft", "review_source": "amazon",
+             "reviews": 40, "negatives": 10, "negative_share_pct": 25.0, "small_sample": False},
+            {"sector_group": "Sewing & Needlecraft", "review_source": "trustpilot",
+             "reviews": 20, "negatives": 1, "negative_share_pct": 5.0, "small_sample": True},
+        ]
+
+    def test_aspect_by_source(self):
+        s = build_summary(window_of(by_source_rows()), 15, 10, 300)
+        assert s["service_by_aspect_and_source"] == [
+            {"aspect": "Customer service", "review_source": "amazon", "reviews": 3,
+             "negatives": 1, "negative_share_pct": 33.3, "small_sample": True},
+            {"aspect": "Customer service", "review_source": "trustpilot", "reviews": 12,
+             "negatives": 6, "negative_share_pct": 50.0, "small_sample": True},
+            {"aspect": "Returns & refunds", "review_source": "trustpilot", "reviews": 8,
+             "negatives": 1, "negative_share_pct": 12.5, "small_sample": True},
+        ]
+
+    def test_small_sample_threshold_applies(self):
+        s = build_summary(window_of(by_source_rows()), 15, 10, 300, small_sample_reviews=20)
+        flags = {(e["sector_group"], e["review_source"]): e["small_sample"]
+                 for e in s["product_by_sector_group_and_source"]}
+        assert flags[("Sewing & Needlecraft", "trustpilot")] is False
+
+    def test_by_source_figures_are_accepted_by_the_validator(self):
+        summary = build_summary(window_of(by_source_rows()), 15, 10, 300)
+        text = ("Within Trustpilot, Sewing has 1 of 20 negative (5.0%) and customer service "
+                "6 of 12 (50.0%).")
+        assert unsupported_numbers(text, summary_numbers(summary)) == []
+        for key in ("product_by_sector_group_and_source", "service_by_aspect_and_source"):
+            del summary[key]
+        assert {"5.0%", "50.0%"} <= set(unsupported_numbers(text, summary_numbers(summary)))
+
+
+class TestNewPromptRules:
+    def prompt_raw(self):
+        summary = build_summary(window_of(by_source_rows()), 15, 10, 300)
+        return build_action_items_prompt(summary, summary_areas(summary))
+
+    def prompt(self):
+        return " ".join(self.prompt_raw().split())
+
+    def test_like_for_like_extends_to_sector_groups_aspects_and_products(self):
+        flat = self.prompt()
+        assert ("The same applies to sector groups, service aspects and products: compare "
+                "them only within the same review website (use "
+                '"product_by_sector_group_and_source", "service_by_aspect_and_source" and '
+                '"reviews_by_source"), or say plainly that their mix of review websites '
+                "differs and treat the gap as background only.") in flat
+        assert ("A gap between groups whose mix of review websites differs must never be the "
+                "main reason for an item.") in flat
+        assert '"product_by_sector_group_and_source": [' in self.prompt_raw()
+
+    def test_catch_all_rule(self):
+        flat = self.prompt()
+        assert ('14. Catch-all groups are not findings. Groups such as "General / No Use '
+                'Stated", "Unknown", "No Region Data"') in flat
+        assert ("Never write an item whose only action is to investigate or monitor such a "
+                "group.") in flat
+        assert ("Use one only when the summary shows the cause inside it (particular "
+                "products, topics or aspects), and name that cause.") in flat
+
+    def test_evidence_strength_follows_the_evidence(self):
+        flat = self.prompt()
+        assert ("If the key figures behind an item (the products, groups or aspects it rests "
+                'on) are mostly marked "small_sample": true, use "early signal", even when '
+                '"related_area" is "overall".') in flat
+        assert ('Use "strong" only when the figures come from large groups and the same '
+                "pattern shows in more than one group, or in both the recent and the earlier "
+                'part of "trend".') in flat
+
+    def test_trend_rule(self):
+        flat = self.prompt()
+        assert ("If an issue's recent negative share is clearly lower than its earlier share, "
+                'and the recent part is not marked "small_sample": true, say that it may '
+                "already be improving, and rank it lower or say so plainly.") in flat
+        assert "If the recent share is clearly higher, say that it is getting worse." in flat
+        assert ('Never say that an issue is "fixed", "solved" or "resolved": reviews cannot '
+                "prove that.") in flat
+        assert '"trend": {' in self.prompt_raw()
+
+    def test_strong_on_a_small_sample_area_is_still_rejected(self):
+        summary = build_summary(window_of(by_source_rows()), 15, 10, 300)
+        assert "Customer service" in small_sample_areas(summary)
+        reply = {"items": [
+            {"rank": r, "title": "Check refunds", "description": "Do it.",
+             "rationale": "6 of 12.", "related_area": area, "evidence": "6 of 12.",
+             "evidence_strength": "strong"}
+            for r, area in ((1, "Customer service"), (2, "overall"), (3, "overall"))]}
+        with pytest.raises(ActionItemsValidationError, match="Customer service.*early signal"):
+            validate_action_items(reply, summary)
 
 
 def test_format_action_items():

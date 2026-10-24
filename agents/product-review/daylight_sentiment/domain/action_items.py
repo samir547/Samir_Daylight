@@ -32,6 +32,10 @@ SMALL_SAMPLE_REVIEWS = 30
 TOP_PRODUCTS = 10
 MIN_PRODUCT_NEGATIVES = 3
 PRODUCT_NAME_CHARS = 80
+# The trend section compares the most recent third of a window with the
+# earlier two thirds, for the main groups and the TREND_THEMES most frequent
+# negative themes.
+TREND_THEMES = 10
 
 # Service-review aspect labels (domain/taxonomy.ASPECTS) as the reader sees
 # them: in the summary, in related_area and so in Power BI.
@@ -393,6 +397,7 @@ def products_most_negative(product_rows: Iterable[Dict[str, Any]],
     tallies: Dict[str, _Tally] = defaultdict(_Tally)
     names: Dict[str, Counter] = defaultdict(Counter)
     regions: Dict[str, Counter] = defaultdict(Counter)
+    sources: Dict[str, Counter] = defaultdict(Counter)
     for r in product_rows:
         sku = (r.get("resolved_sku") or "").strip()
         if not sku:
@@ -403,6 +408,7 @@ def products_most_negative(product_rows: Iterable[Dict[str, Any]],
             names[sku][name] += 1
         if r.get("product_region"):
             regions[sku][r["product_region"]] += 1
+        sources[sku][r.get("review_source") or "unknown"] += 1
     kept = [(sku, t) for sku, t in tallies.items() if t.negatives >= MIN_PRODUCT_NEGATIVES]
     kept.sort(key=lambda kv: (-kv[1].negatives, -kv[1].reviews, kv[0]))
     out = []
@@ -410,8 +416,117 @@ def products_most_negative(product_rows: Iterable[Dict[str, Any]],
         entry = {"product": _product_name(names[sku], sku), "sku": sku}
         if regions[sku]:
             entry["region"] = regions[sku].most_common(1)[0][0]
+        entry["reviews_by_source"] = dict(sorted(sources[sku].items()))
         out.append({**entry, **t.as_dict(small_sample_reviews)})
     return out
+
+
+def _by_source(rows: Iterable[Dict[str, Any]], key, label: str,
+               small_sample_reviews: int) -> List[Dict[str, Any]]:
+    """Reviews per (group, review source), for comparisons within one
+    source: [{label: group, "review_source": ..., reviews, negatives, ...}]."""
+    tallies: Dict[tuple, _Tally] = defaultdict(_Tally)
+    for r in rows:
+        tallies[(key(r), r.get("review_source") or "unknown")].add(r.get("sentiment"))
+    return [{label: group, "review_source": src, **t.as_dict(small_sample_reviews)}
+            for (group, src), t in sorted(tallies.items())]
+
+
+def recent_part_start(window: ReviewWindow) -> date:
+    """First day of the most recent third of the window (its last third of
+    days, at least one day). Reviews dated after window.end, if any, count
+    as recent."""
+    days = (window.end - window.start).days + 1
+    return window.end - timedelta(days=max(1, days // 3) - 1)
+
+
+def _trend_entry(recent: _Tally, earlier: _Tally, small_sample_reviews: int) -> Dict[str, Any]:
+    return {"recent": recent.as_dict(small_sample_reviews),
+            "earlier": earlier.as_dict(small_sample_reviews)}
+
+
+def _trend_groups(rows: Iterable[Dict[str, Any]], key, recent_start: date,
+                  order: Sequence[Any], small_sample_reviews: int) -> List[tuple]:
+    """(group, trend entry) for each group in ``order``: its tally in the
+    recent part and in the earlier part."""
+    recent: Dict[Any, _Tally] = defaultdict(_Tally)
+    earlier: Dict[Any, _Tally] = defaultdict(_Tally)
+    for r in rows:
+        part = recent if r["review_date_parsed"] >= recent_start else earlier
+        part[key(r)].add(r.get("sentiment"))
+    return [(group, _trend_entry(recent[group], earlier[group], small_sample_reviews))
+            for group in order]
+
+
+def _theme_trend(rows: Sequence[Dict[str, Any]], themes: Sequence[str], recent_start: date,
+                 small_sample_reviews: int) -> List[Dict[str, Any]]:
+    """For each theme: how many negative reviews mention it in each part,
+    as a share of ALL the reviews in that part (so the two parts compare
+    whatever their size; never a share of the negative reviews)."""
+    totals = {"recent": 0, "earlier": 0}
+    counts: Dict[str, Counter] = {"recent": Counter(), "earlier": Counter()}
+    for r in rows:
+        part = "recent" if r["review_date_parsed"] >= recent_start else "earlier"
+        totals[part] += 1
+        if r.get("sentiment") == "negative":
+            counts[part].update({theme_key(t) for t in parse_themes(r.get("key_themes"))})
+    out = []
+    for theme in themes:
+        entry: Dict[str, Any] = {"theme": theme}
+        for part in ("recent", "earlier"):
+            c = counts[part][theme_key(theme)]
+            entry[part] = {"reviews": totals[part], "negatives_mentioning": c,
+                           "share_of_reviews_pct": _pct(c, totals[part]),
+                           "small_sample": totals[part] < small_sample_reviews}
+        out.append(entry)
+    return out
+
+
+def build_trend(window: ReviewWindow, summary: Dict[str, Any],
+                small_sample_reviews: int) -> Dict[str, Any]:
+    """The window's most recent third against its earlier two thirds, for
+    the groups ``summary`` already lists (in the same order) and its first
+    TREND_THEMES negative themes."""
+    rows = window.rows
+    n = small_sample_reviews
+    recent_start = recent_part_start(window)
+    product = [r for r in rows if r.get("review_type") == "product"]
+    service = [r for r in rows if r.get("review_type") == "service"]
+    recent_rows = sum(1 for r in rows if r["review_date_parsed"] >= recent_start)
+
+    def named(pairs):
+        return [{"name": g, **e} for g, e in pairs]
+
+    trend: Dict[str, Any] = {
+        "recent_part": {"start": recent_start.isoformat(), "end": window.end.isoformat(),
+                        "reviews": recent_rows},
+        "earlier_part": {"start": window.start.isoformat(),
+                         "end": (recent_start - timedelta(days=1)).isoformat(),
+                         "reviews": len(rows) - recent_rows},
+        "by_review_type_and_source": [
+            {"review_type": t, "review_source": s, **e} for (t, s), e in _trend_groups(
+                rows, lambda r: (r.get("review_type") or "unknown",
+                                 r.get("review_source") or "unknown"), recent_start,
+                [(x["review_type"], x["review_source"])
+                 for x in summary["by_review_type_and_source"]], n)],
+        "product_by_sector_group": named(_trend_groups(
+            product, lambda r: r.get("sector_group") or "Unknown", recent_start,
+            [x["name"] for x in summary["product_by_sector_group"]], n)),
+        "service_by_aspect": named(_trend_groups(
+            service, lambda r: aspect_name(r.get("primary_aspect")), recent_start,
+            [x["name"] for x in summary["service_by_aspect"]], n)),
+    }
+    if "product_by_region_and_source" in summary:
+        trend["product_by_region_and_source"] = [
+            {"region": g, "review_source": s, **e} for (g, s), e in _trend_groups(
+                [r for r in product if r.get("product_region")],
+                lambda r: (r["product_region"], r.get("review_source") or "unknown"),
+                recent_start, [(x["region"], x["review_source"])
+                               for x in summary["product_by_region_and_source"]], n)]
+    trend["top_negative_themes"] = _theme_trend(
+        rows, [t["theme"] for t in summary["top_negative_themes"][:TREND_THEMES]],
+        recent_start, n)
+    return trend
 
 
 def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
@@ -420,7 +535,8 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
     """Compact, JSON-serialisable summary of the window's reviews -- the only
     thing the model is shown. Every grouped section gives reviews,
     negatives, the negative share and small_sample (fewer than
-    ``small_sample_reviews`` reviews)."""
+    ``small_sample_reviews`` reviews); "trend" splits the main groups
+    between the window's most recent third and its earlier two thirds."""
     rows = window.rows
     overall = _Tally()
     for r in rows:
@@ -461,8 +577,12 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
         ],
         "product_by_sector_group": _grouped(
             product, lambda r: r.get("sector_group") or "Unknown", n),
+        "product_by_sector_group_and_source": _by_source(
+            product, lambda r: r.get("sector_group") or "Unknown", "sector_group", n),
         "service_by_aspect": _grouped(
             service, lambda r: aspect_name(r.get("primary_aspect")), n),
+        "service_by_aspect_and_source": _by_source(
+            service, lambda r: aspect_name(r.get("primary_aspect")), "aspect", n),
     }
     regional = [r for r in product if r.get("product_region")]
     if regional:
@@ -482,6 +602,7 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
     summary["monthly_negative"] = [
         {"month": m, **monthly[m].as_dict(n)} for m in sorted(monthly)
     ]
+    summary["trend"] = build_trend(window, summary, n)
     summary["negative_excerpts"] = select_excerpts(rows, max_excerpts, excerpt_chars)
     return summary
 
