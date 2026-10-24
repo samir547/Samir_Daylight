@@ -1,21 +1,19 @@
-"""Trustpilot review sources (product + service Excel exports)."""
+"""Trustpilot review sources (product + service exports, .xlsx or .csv)."""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-import pandas as pd
-
 from daylight_sentiment.config import SourceFiles
-from daylight_sentiment.infra.review_sources.base import resolve_source_file
+from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
 from daylight_sentiment.infra.review_sources.coercion import _clean_str, _safe_int
 
 logger = logging.getLogger("multi_source_sentiment")
 
 
 def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
-    df = pd.read_excel(path)
+    df = read_table(path)
     reviews = []
     for _, row in df.iterrows():
         reviews.append({
@@ -34,7 +32,7 @@ def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
 
 
 def load_trustpilot_service(path: Path) -> List[Dict[str, Any]]:
-    df = pd.read_excel(path)
+    df = read_table(path)
     reviews = []
     for _, row in df.iterrows():
         title = _clean_str(row.get("Review Title"))

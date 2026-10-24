@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
+import pandas as pd
+
 from daylight_sentiment.config import FilePattern
 
 logger = logging.getLogger("multi_source_sentiment")
@@ -34,6 +36,19 @@ def resolve_source_file(pattern: FilePattern, directory: Path) -> Path:
         return max(candidates, key=lambda p: p.stat().st_mtime)
     raise FileNotFoundError(
         f"No file in {directory} matches {pattern.describe()}")
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    """Read a review export by its real extension: .xlsx through read_excel,
+    .csv through read_csv. Every loader goes through here, so a source can be
+    supplied in either format and the column handling after it is shared."""
+    suffix = path.suffix.lower()
+    if suffix == ".xlsx":
+        return pd.read_excel(path)
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"{path}: unsupported review file type {path.suffix!r} "
+                     f"(expected .xlsx or .csv)")
 
 
 def load_reviews(sources: List[ReviewSource]) -> List[Dict[str, Any]]:

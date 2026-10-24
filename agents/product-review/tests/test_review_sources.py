@@ -14,7 +14,7 @@ from daylight_sentiment.infra.review_sources import (
     build_default_sources,
     load_reviews,
 )
-from daylight_sentiment.infra.review_sources.base import resolve_source_file
+from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
 from daylight_sentiment.infra.sharepoint_sync import select_items_by_patterns
 
 TP_PRODUCT = FilePattern(("trustpilot", "product"), ".xlsx")
@@ -198,6 +198,26 @@ class TestSourceLoaders:
         assert out[0]["text"] == "Wow\n\nBright"
         assert out[0]["verified_purchase"] is True
 
+    def test_trustpilot_product_from_csv(self, tmp_path):
+        cfg = _sources_config(tmp_path)
+        pd.DataFrame([{"review_id": "r1", "stars": 5, "product_name": "Lamp",
+                       "product_sku": "U25090", "content": "Great light",
+                       "consumer_name": "Pat", "created_at": "2026-01-01"}]
+                     ).to_csv(tmp_path / "trustpilot-product-reviews.csv", index=False)
+        out = TrustpilotProductSource(cfg).fetch()
+        assert out[0]["review_id"] == "r1" and out[0]["rating"] == 5
+
+    def test_amazon_from_xlsx(self, tmp_path):
+        cfg = _sources_config(tmp_path)
+        pd.DataFrame([{"review_id": "a1", "rating": 4, "product_name": "Lamp", "asin": "B01",
+                       "model_number": "u25090", "review_country": "us",
+                       "review_header": "Wow", "review_text": "Bright", "author_name": "A",
+                       "review_posted_date": "2026-03-03", "is_verified": False}]
+                     ).to_excel(tmp_path / "amazon_product_reviews_all.xlsx", index=False)
+        out = AmazonBrightDataSource(cfg).fetch()
+        assert out[0]["rating"] == 4
+        assert out[0]["verified_purchase"] is False
+
     def test_loader_matches_any_pattern_conforming_name(self, tmp_path):
         # There's no expected filename at all -- any name matching the
         # pattern (a "(2)" suffix, a fresh row count, whatever) works.
@@ -209,6 +229,27 @@ class TestSourceLoaders:
                                 index=False)
         out = TrustpilotProductSource(cfg).fetch()
         assert len(out) == 1
+
+
+class TestReadTable:
+    def test_reads_by_real_extension(self, tmp_path):
+        df = pd.DataFrame([{"a": "x", "b": 1}])
+        df.to_excel(tmp_path / "t.XLSX", index=False)
+        df.to_csv(tmp_path / "t.csv", index=False)
+        for name in ("t.XLSX", "t.csv"):
+            assert read_table(tmp_path / name).to_dict("records") == [{"a": "x", "b": 1}]
+
+    def test_csv_content_in_a_file_named_xlsx_is_not_guessed(self, tmp_path):
+        # The extension decides the reader; a mislabelled file fails loudly.
+        (tmp_path / "t.xlsx").write_text("a,b\nx,1\n", encoding="utf-8")
+        with pytest.raises(Exception):
+            read_table(tmp_path / "t.xlsx")
+
+    def test_unsupported_extension_raises(self, tmp_path):
+        path = tmp_path / "t.xls"
+        path.write_bytes(b"")
+        with pytest.raises(ValueError, match=r"t\.xls.*expected \.xlsx or \.csv"):
+            read_table(path)
 
 
 class TestLoadReviews:
