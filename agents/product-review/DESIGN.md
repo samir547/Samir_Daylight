@@ -524,6 +524,25 @@ percentages, or that percentage rounded half up to a whole number. Dates
 `D35500` are not numbers. All problems found are reported together in one
 `ActionItemsValidationError`.
 
+**Wording and reliability checks.** For an `early signal` item, the
+title's first word (`title_verb()`, case-insensitive) must not be one of
+`STRONG_ACTION_VERBS` (fix, overhaul, resolve, eliminate, stop,
+eradicate); the error asks for one of `EARLY_SIGNAL_VERBS` (Monitor,
+Investigate, Review). `title`, `description`, `rationale` and `evidence`
+must contain none of `BANNED_WORDS` ("significant", "significantly",
+"statistically", "meaningful", "not random", "random variation"), matched
+as whole words in any case by `banned_wording()`, so "insignificant" and
+"meaningfully" pass while "non-significant" does not; the error names the
+words found. Each trend row carries `few_mentions` when its `negatives`
+(for a theme, `negatives_mentioning`) across both parts total less than
+`MIN_TREND_COUNT` (10). Rules 13 and 15 forbid trend claims and
+"moderate"/"strong" evidence on rows flagged `small_sample` or
+`few_mentions`, and treat a theme or product with fewer than 10 negatives
+as an "early signal"; those rules rest on the prompt. The flag is a
+boolean, so `summary_numbers()` skips it and the accepted numbers are
+unchanged. Rule 16 asks for each window's items to stand on that window
+alone, without repeating an issue only because another window has it.
+
 **Retry.** If validation fails, one retry: the same prompt plus "Your
 previous reply failed because: <the errors>". Each failure is logged as a
 WARNING naming the window, with the reason only. If the retry fails

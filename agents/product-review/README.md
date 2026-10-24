@@ -672,6 +672,19 @@ The code can only check evidence strength against the related area itself:
 for an item whose related area is "overall", the rule that small-sample
 figures make it an "early signal" rests on the prompt.
 
+Three more checks send a reply back for its one retry. An "early signal"
+item's title may not start with Fix, Overhaul, Resolve, Eliminate, Stop or
+Eradicate (it should start with Monitor, Investigate or Review). The title,
+description, rationale and evidence may not use "significant",
+"significantly", "statistically", "meaningful", "not random" or "random
+variation" (whole words, any letter case, so "insignificant" is allowed).
+And every trend row is flagged `few_mentions` when its negatives, or a
+theme's mentions, add up to fewer than 10 across both parts
+(`MIN_TREND_COUNT`); the prompt forbids calling such a row, or a
+small-sample one, rising, worsening or improving, and forbids "moderate"
+or "strong" evidence that rests on it. That last rule rests on the prompt;
+the flag adds no number to the ones a reply may quote.
+
 **Flags.**
 
 - `--skip-action-items` — don't generate them in this run.
