@@ -19,6 +19,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 ITEM_COUNT = 3
 OVERALL_AREA = "overall"
 
+# A review window with fewer analysed reviews than this is skipped: too few
+# to base three items on. It is never widened, so its label stays true.
+MIN_WINDOW_REVIEWS = 100
+
 # A group (sector group, aspect, region, source, product...) with fewer
 # reviews than this is flagged small_sample in the summary: too few to
 # support more than an early signal.
@@ -87,17 +91,22 @@ class ActionItemsValidationError(ValueError):
 
 @dataclass
 class ReviewWindow:
-    """The reviews a generation is based on, and the period they cover."""
+    """The reviews one generation is based on: the last ``months`` months,
+    and the period they cover."""
+    months: int
     rows: List[Dict[str, Any]]
     start: Optional[date]
     end: Optional[date]
-    widened: bool = False
     undated_excluded: int = 0
     skip_reason: Optional[str] = None
     # Set when the newest review date is after today, so the window was
     # ended today instead; future_dated counts the reviews dated after today.
     capped_from: Optional[date] = None
     future_dated: int = 0
+
+    @property
+    def label(self) -> str:
+        return window_label(self.months)
 
     @property
     def skipped(self) -> bool:
@@ -161,19 +170,18 @@ def months_before(end: date, months: int) -> date:
     return date(year, month, min(end.day, calendar.monthrange(year, month)[1]))
 
 
-def select_window(rows: Iterable[Dict[str, Any]], months: int,
-                  min_window_reviews: int, min_total_reviews: int,
-                  today: Optional[date] = None) -> ReviewWindow:
-    """Pick the analysed reviews to base the items on.
+def select_windows(rows: Iterable[Dict[str, Any]], windows_months: Sequence[int],
+                   today: Optional[date] = None,
+                   min_reviews: int = MIN_WINDOW_REVIEWS) -> List[ReviewWindow]:
+    """One window of analysed reviews per entry of ``windows_months``.
 
-    The window is the ``months`` months ending on the NEWEST review date in
-    the data, so it doesn't shrink while no new files arrive -- or on
-    ``today`` (default: the current date) if that is earlier, so a wrongly
-    parsed future date can't push the window forward. Reviews dated after
-    today stay in it. Fewer than ``min_window_reviews`` in it widens to
-    every dated review; fewer than ``min_total_reviews`` even then skips
-    generation. Rows with no sentiment or no parsed review date are left
-    out.
+    Every window ends on the NEWEST review date in the data, so it doesn't
+    shrink while no new files arrive -- or on ``today`` (default: the
+    current date) if that is earlier, so a wrongly parsed future date can't
+    push the windows forward. Reviews dated after today stay in them. A
+    window with fewer than ``min_reviews`` reviews is returned skipped (with
+    a skip_reason), never widened, so its label always describes it. Rows
+    with no sentiment or no parsed review date are left out.
     """
     today = today or date.today()
     analysed = [r for r in rows if r.get("sentiment")]
@@ -185,25 +193,25 @@ def select_window(rows: Iterable[Dict[str, Any]], months: int,
     undated = len(analysed) - len(dated)
 
     if not dated:
-        return ReviewWindow([], None, None, undated_excluded=undated,
-                            skip_reason="no analysed reviews with a review date")
+        return [ReviewWindow(m, [], None, None, undated_excluded=undated,
+                             skip_reason="no analysed reviews with a review date")
+                for m in windows_months]
 
     newest = max(r["review_date_parsed"] for r in dated)
     end = min(newest, today)
     capped = {"capped_from": newest if newest > today else None,
               "future_dated": sum(1 for r in dated if r["review_date_parsed"] > today)}
-    start = months_before(end, months) + timedelta(days=1)
-    in_window = [r for r in dated if r["review_date_parsed"] >= start]
-    if len(in_window) >= min_window_reviews:
-        return ReviewWindow(in_window, start, end, undated_excluded=undated, **capped)
-
-    earliest = min(min(r["review_date_parsed"] for r in dated), end)
-    if len(dated) < min_total_reviews:
-        return ReviewWindow(
-            dated, earliest, end, widened=True, undated_excluded=undated,
-            skip_reason=(f"only {len(dated)} dated, analysed reviews in total "
-                         f"(minimum {min_total_reviews})"), **capped)
-    return ReviewWindow(dated, earliest, end, widened=True, undated_excluded=undated, **capped)
+    windows = []
+    for months in windows_months:
+        start = months_before(end, months) + timedelta(days=1)
+        in_window = [r for r in dated if r["review_date_parsed"] >= start]
+        skip_reason = None
+        if len(in_window) < min_reviews:
+            skip_reason = (f"only {len(in_window)} analysed reviews from {start.isoformat()} "
+                           f"to {end.isoformat()} (minimum {min_reviews})")
+        windows.append(ReviewWindow(months, in_window, start, end, undated_excluded=undated,
+                                    skip_reason=skip_reason, **capped))
+    return windows
 
 
 def parse_themes(raw: Any) -> List[str]:
@@ -433,10 +441,10 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
     n = small_sample_reviews
     summary: Dict[str, Any] = {
         "window": {
+            "label": window.label,
             "start": window.start.isoformat(),
             "end": window.end.isoformat(),
             "reviews": window.review_count,
-            "widened_to_all_dates": window.widened,
         },
         "small_sample_threshold_reviews": n,
         "sentiment": {
@@ -648,7 +656,7 @@ def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str,
 
 def format_action_items(items: Sequence[Dict[str, Any]], window: ReviewWindow) -> str:
     """Plain-text rendering for the console (dry runs)."""
-    lines = [f"Top {len(items)} to-do items -- {window.basis()}", ""]
+    lines = [f"{window.label}: top {len(items)} to-do items -- {window.basis()}", ""]
     for item in items:
         lines += [
             f"{item['rank']}. {item['title']}  [{item['related_area']}]",

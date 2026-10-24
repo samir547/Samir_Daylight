@@ -17,6 +17,7 @@ from daylight_sentiment.domain.action_items import (
     ASPECT_NAMES,
     ActionItemsValidationError,
     FIELD_MAX_CHARS,
+    MIN_WINDOW_REVIEWS,
     SMALL_SAMPLE_REVIEWS,
     ReviewWindow,
     aspect_name,
@@ -28,7 +29,7 @@ from daylight_sentiment.domain.action_items import (
     parse_themes,
     products_most_negative,
     select_excerpts,
-    select_window,
+    select_windows,
     shorten,
     single_spaced,
     small_sample_areas,
@@ -36,6 +37,7 @@ from daylight_sentiment.domain.action_items import (
     summary_numbers,
     unsupported_numbers,
     validate_action_items,
+    window_label,
 )
 from daylight_sentiment.domain.action_items_prompt import (
     build_action_items_prompt,
@@ -64,96 +66,124 @@ def review(i, day, sentiment="positive", review_type="product", **extra):
     return row
 
 
-def window_of(rows):
+def window_of(rows, months=12):
     dates = [r["review_date_parsed"] for r in rows]
-    return ReviewWindow(rows, min(dates), max(dates))
+    return ReviewWindow(months, rows, min(dates), max(dates))
 
 
-class TestSelectWindow:
-    def test_window_end_is_newest_review_date_not_today(self):
+TODAY = date(2026, 10, 24)
+
+
+def windows_by_months(rows, months=(3, 6, 12), today=TODAY, **kw):
+    return {w.months: w for w in select_windows(rows, months, today=today, **kw)}
+
+
+class TestSelectWindows:
+    def test_end_is_newest_review_date_not_today(self):
         rows = [review(i, date(2024, 3, 1 + i % 28)) for i in range(120)]
-        w = select_window(rows, 12, 100, 50)
+        [w] = select_windows(rows, [12], today=TODAY)
         assert w.end == date(2024, 3, 28)
         assert w.start == date(2023, 3, 29)
-        assert not w.widened and w.review_count == 120
+        assert not w.skipped and w.review_count == 120
 
-    def test_filters_to_last_n_months(self):
-        recent = [review(i, date(2026, 8, 20)) for i in range(100)]
-        old = [review(1000 + i, date(2025, 8, 20)) for i in range(30)]
-        boundary = [review(2000, date(2025, 8, 21))]
-        w = select_window(recent + old + boundary, 12, 100, 50)
-        assert w.start == date(2025, 8, 21) and w.end == date(2026, 8, 20)
-        assert w.review_count == 101
-        assert all(r["review_date_parsed"] >= w.start for r in w.rows)
+    def test_starts_for_3_6_and_12_months(self):
+        rows = [review(i, date(2026, 8, 20)) for i in range(150)]
+        w = windows_by_months(rows)
+        assert {m: (w[m].start, w[m].end) for m in w} == {
+            3: (date(2026, 5, 21), date(2026, 8, 20)),
+            6: (date(2026, 2, 21), date(2026, 8, 20)),
+            12: (date(2025, 8, 21), date(2026, 8, 20)),
+        }
+        assert [x.label for x in select_windows(rows, (3, 6, 12), today=TODAY)] == [
+            "Last 3 months", "Last 6 months", "Last 12 months"]
 
-    def test_months_setting_changes_the_window(self):
+    def test_each_window_holds_only_its_own_months(self):
         rows = ([review(i, date(2026, 8, 1)) for i in range(100)]
-                + [review(1000 + i, date(2026, 3, 1)) for i in range(100)])
-        assert select_window(rows, 3, 100, 50).review_count == 100
-        assert select_window(rows, 12, 100, 50).review_count == 200
+                + [review(1000 + i, date(2026, 4, 1)) for i in range(60)]
+                + [review(2000 + i, date(2025, 10, 1)) for i in range(40)]
+                + [review(3000 + i, date(2024, 1, 1)) for i in range(5)])
+        w = windows_by_months(rows)
+        assert (w[3].review_count, w[6].review_count, w[12].review_count) == (100, 160, 200)
+        for x in w.values():
+            assert all(r["review_date_parsed"] >= x.start for r in x.rows)
 
-    def test_widens_to_all_dated_reviews_when_window_is_thin(self):
-        rows = ([review(i, date(2026, 8, 1)) for i in range(40)]
-                + [review(1000 + i, date(2020, 1, 1)) for i in range(40)])
-        w = select_window(rows, 12, 100, 50)
-        assert w.widened and not w.skipped
-        assert w.review_count == 80
-        assert w.start == date(2020, 1, 1) and w.end == date(2026, 8, 1)
+    def test_boundary_day_is_in_the_window(self):
+        rows = ([review(i, date(2026, 8, 20)) for i in range(100)]
+                + [review(1000, date(2025, 8, 20)), review(2000, date(2025, 8, 21))])
+        [w] = select_windows(rows, [12], today=TODAY)
+        assert w.start == date(2025, 8, 21) and w.review_count == 101
 
-    def test_skips_when_under_minimum_in_total(self):
-        rows = [review(i, date(2026, 8, 1)) for i in range(49)]
-        w = select_window(rows, 12, 100, 50)
-        assert w.skipped and "49" in w.skip_reason
+    def test_thin_window_is_skipped_not_widened(self):
+        rows = ([review(i, date(2026, 8, 1)) for i in range(60)]
+                + [review(1000 + i, date(2026, 3, 1)) for i in range(60)])
+        w = windows_by_months(rows)
+        assert w[3].skipped and not w[6].skipped and not w[12].skipped
+        assert w[3].review_count == 60  # its own months only, not every review
+        assert w[3].start == date(2026, 5, 2)
+        assert w[3].skip_reason == (
+            "only 60 analysed reviews from 2026-05-02 to 2026-08-01 (minimum 100)")
+
+    @pytest.mark.parametrize("count, skipped", [(99, True), (100, False)])
+    def test_minimum_is_100_reviews(self, count, skipped):
+        assert MIN_WINDOW_REVIEWS == 100
+        rows = [review(i, date(2026, 8, 1)) for i in range(count)]
+        [w] = select_windows(rows, [3], today=TODAY)
+        assert w.skipped is skipped
+
+    def test_every_window_skipped_when_data_is_thin(self):
+        rows = [review(i, date(2026, 8, 1)) for i in range(40)]
+        assert all(w.skipped for w in select_windows(rows, (3, 6, 12), today=TODAY))
 
     def test_undated_and_unanalysed_rows_are_excluded_and_counted(self):
         rows = ([review(i, date(2026, 8, 1)) for i in range(100)]
                 + [review(500 + i, None) for i in range(7)]
                 + [review(900, "not a date")]
                 + [review(950, date(2026, 8, 1), sentiment=None)])
-        w = select_window(rows, 12, 100, 50)
+        [w] = select_windows(rows, [12], today=TODAY)
         assert w.review_count == 100
         assert w.undated_excluded == 8
 
-    def test_no_dated_reviews_skips(self):
-        w = select_window([review(1, None)], 12, 100, 50)
-        assert w.skipped and w.undated_excluded == 1
+    def test_no_dated_reviews_skips_every_window(self):
+        windows = select_windows([review(1, None)], (3, 12), today=TODAY)
+        assert [w.months for w in windows] == [3, 12]
+        assert all(w.skipped and w.undated_excluded == 1 for w in windows)
 
     def test_accepts_datetimes_and_iso_strings(self):
         rows = ([review(i, datetime(2026, 8, 1, 12)) for i in range(60)]
                 + [review(100 + i, "2026-07-01") for i in range(60)])
-        w = select_window(rows, 12, 100, 50)
+        [w] = select_windows(rows, [12], today=TODAY)
         assert w.review_count == 120 and w.end == date(2026, 8, 1)
 
-    def test_future_date_does_not_move_the_window_past_today(self):
+    def test_future_date_does_not_move_the_windows_past_today(self):
         rows = ([review(i, date(2026, 8, 20)) for i in range(120)]
                 + [review(500, date(2027, 5, 1))])
-        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
-        assert w.end == date(2026, 10, 24) and w.start == date(2025, 10, 25)
-        assert w.capped_from == date(2027, 5, 1) and w.future_dated == 1
-        assert w.review_count == 121  # the future-dated review is kept
+        w = windows_by_months(rows)
+        assert {x.end for x in w.values()} == {TODAY}
+        assert w[12].start == date(2025, 10, 25) and w[3].start == date(2026, 7, 25)
+        assert w[12].capped_from == date(2027, 5, 1) and w[12].future_dated == 1
+        assert w[12].review_count == 121  # the future-dated review is kept
 
     def test_no_cap_when_the_newest_date_is_not_in_the_future(self):
-        rows = [review(i, date(2026, 10, 24)) for i in range(120)]
-        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
-        assert w.end == date(2026, 10, 24)
+        rows = [review(i, TODAY) for i in range(120)]
+        [w] = select_windows(rows, [12], today=TODAY)
+        assert w.end == TODAY
         assert w.capped_from is None and w.future_dated == 0
-
-    def test_cap_applies_to_a_widened_window(self):
-        rows = ([review(i, date(2020, 1, 1)) for i in range(60)]
-                + [review(500, date(2030, 1, 1))])
-        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
-        assert w.widened and w.end == date(2026, 10, 24) and w.start == date(2020, 1, 1)
-        assert w.capped_from == date(2030, 1, 1)
 
     def test_defaults_to_the_current_date(self):
         future = date.today() + timedelta(days=400)
         rows = [review(i, future) for i in range(120)]
-        w = select_window(rows, 12, 100, 50)
+        [w] = select_windows(rows, [12])
         assert w.end == date.today() and w.start <= w.end
 
     def test_months_before_clamps_short_months(self):
         assert months_before(date(2026, 3, 31), 1) == date(2026, 2, 28)
         assert months_before(date(2026, 1, 15), 12) == date(2025, 1, 15)
+
+    def test_window_label(self):
+        assert window_label(3) == "Last 3 months"
+        assert window_label(12) == "Last 12 months"
+        assert window_label(1) == "Last 1 month"
+        assert len(window_label(255)) <= 30  # window_label NVARCHAR(30)
 
 
 class TestParseThemes:
@@ -189,8 +219,8 @@ class TestBuildSummary:
 
     def test_counts_and_shares(self):
         s = build_summary(window_of(self.rows()), 15, 10, 300)
-        assert s["window"] == {"start": "2026-05-02", "end": "2026-06-15",
-                               "reviews": 6, "widened_to_all_dates": False}
+        assert s["window"] == {"label": "Last 12 months", "start": "2026-05-02",
+                               "end": "2026-06-15", "reviews": 6}
         assert s["sentiment"] == {"reviews": 6, "positive": 2, "negative": 3,
                                   "neutral": 1, "negative_share_pct": 50.0}
         sectors = {e["name"]: e for e in s["product_by_sector_group"]}
@@ -776,7 +806,8 @@ class TestPrompt:
 def test_format_action_items():
     rows = [review(i, date(2026, 6, 1)) for i in range(3)]
     text = format_action_items(validate_action_items(good_reply(), AREAS), window_of(rows))
-    assert text.startswith("Top 3 to-do items -- Based on 3 reviews from 2026-06-01 to 2026-06-01")
+    assert text.startswith("Last 12 months: top 3 to-do items -- Based on 3 reviews from "
+                           "2026-06-01 to 2026-06-01")
     assert "1. Monitor delivery packaging  [Shipping quality]" in text
     assert "   Evidence strength: early signal" in text
 
@@ -821,7 +852,7 @@ class FakeRepository:
                                window_end=window_end, reviews_analysed=reviews_analysed,
                                llm_provider=llm_provider, llm_model=llm_model,
                                run_timestamp=run_timestamp))
-        return "generation-1"
+        return f"generation-{len(self.saved)}"
 
 
 def dataset(n=120):
@@ -843,41 +874,88 @@ def dataset_reply():
 
 
 class TestGenerate:
-    def run(self, reply=None, error=None, rows=None, dry_run=False):
-        analyzer = FakeAnalyzer(reply if reply is not None else dataset_reply(), error)
+    def run(self, reply=None, error=None, rows=None, dry_run=False, replies=None,
+            settings=None):
+        analyzer = FakeAnalyzer(reply if reply is not None else dataset_reply(), error,
+                                replies=replies)
         repo = FakeRepository(rows if rows is not None else dataset())
-        outcome = generate_action_items(analyzer, repo, ActionItemSettings(), "claude",
-                                        "model-x", run_timestamp="2026-10-24T10:00:00",
-                                        dry_run=dry_run)
+        outcome = generate_action_items(analyzer, repo, settings or ActionItemSettings(),
+                                        "claude", "model-x",
+                                        run_timestamp="2026-10-24T10:00:00",
+                                        dry_run=dry_run, today=TODAY)
         return outcome, analyzer, repo
 
-    def test_one_call_and_saved_with_window(self):
+    def test_one_call_and_one_saved_set_per_window(self):
         outcome, analyzer, repo = self.run()
-        assert len(analyzer.calls) == 1  # valid first time: no retry
-        assert analyzer.calls[0][1] == ACTION_ITEMS_MAX_TOKENS
-        assert outcome.generation_id == "generation-1"
-        [saved] = repo.saved
-        assert [i["rank"] for i in saved["items"]] == [1, 2, 3]
-        assert saved["window_start"] == date(2025, 8, 21)
-        assert saved["window_end"] == date(2026, 8, 20)
-        assert saved["reviews_analysed"] == 121
-        assert (saved["llm_provider"], saved["llm_model"]) == ("claude", "model-x")
-        assert saved["run_timestamp"] == "2026-10-24T10:00:00"
+        assert len(analyzer.calls) == 3  # valid first time: no retries
+        assert {c[1] for c in analyzer.calls} == {ACTION_ITEMS_MAX_TOKENS}
+        assert [(s["window_label"], s["window_months"], s["window_start"]) for s in repo.saved] == [
+            ("Last 3 months", 3, date(2026, 5, 21)),
+            ("Last 6 months", 6, date(2026, 2, 21)),
+            ("Last 12 months", 12, date(2025, 8, 21))]
+        for saved in repo.saved:
+            assert [i["rank"] for i in saved["items"]] == [1, 2, 3]
+            assert saved["window_end"] == date(2026, 8, 20)
+            assert saved["reviews_analysed"] == 121
+            assert (saved["llm_provider"], saved["llm_model"]) == ("claude", "model-x")
+            assert saved["run_timestamp"] == "2026-10-24T10:00:00"
+        ids = [w.generation_id for w in outcome.windows]
+        assert len(set(ids)) == 3 and None not in ids
+        assert outcome.failed == [] and len(outcome.generated) == 3
+
+    def test_each_prompt_is_built_from_its_own_window(self):
+        rows = dataset() + [review(1000 + i, date(2026, 1, 10)) for i in range(30)]
+        _, analyzer, _ = self.run(rows=rows)
+        prompts = [c[0] for c in analyzer.calls]
+        assert "covers 121\nreviews dated 2026-05-21 to 2026-08-20 (last 3 months)" in prompts[0]
+        assert "covers 151\nreviews dated 2025-08-21 to 2026-08-20 (last 12 months)" in prompts[2]
+
+    def test_number_check_uses_that_windows_summary(self):
+        # 150 reviews exist only in the 12-month window, so a reply citing it
+        # passes there and is retried (then fails) in the shorter windows.
+        rows = dataset() + [review(1000 + i, date(2026, 1, 10)) for i in range(30)]
+        reply = dataset_reply()
+        for item in reply["items"]:
+            item["rationale"] = "40 negative product reviews."
+            item["evidence"] = "150 product reviews in total."
+        outcome, analyzer, repo = self.run(rows=rows, reply=reply)
+        assert [s["window_label"] for s in repo.saved] == ["Last 12 months"]
+        assert [w.window.label for w in outcome.failed] == ["Last 3 months", "Last 6 months"]
+        assert "150" in str(outcome.failed[0].error)
+        assert len(analyzer.calls) == 5  # 2 + 2 + 1
 
     def test_dry_run_saves_nothing(self):
         outcome, analyzer, repo = self.run(dry_run=True)
-        assert len(outcome.items) == 3 and outcome.generation_id is None
+        assert [len(w.items) for w in outcome.windows] == [3, 3, 3]
+        assert all(w.generation_id is None for w in outcome.windows)
         assert repo.saved == []
 
-    def test_invalid_reply_saves_nothing(self):
-        reply = good_reply()
-        reply["items"].pop()
-        with pytest.raises(ActionItemsValidationError):
-            self.run(reply=reply)
+    def test_one_failing_window_does_not_stop_the_others(self):
+        bad = {"items": []}
+        replies = [dataset_reply(), bad, bad, dataset_reply()]
+        outcome, analyzer, repo = self.run(replies=replies)
+        assert [s["window_label"] for s in repo.saved] == ["Last 3 months", "Last 12 months"]
+        [failed] = outcome.failed
+        assert failed.window.label == "Last 6 months" and failed.items == []
+        assert isinstance(failed.error, ActionItemsValidationError)
+        assert failed.generation_id is None
 
-    def generate(self, analyzer, repo, dry_run=False):
-        return generate_action_items(analyzer, repo, ActionItemSettings(), "claude", "m",
-                                     dry_run=dry_run)
+    def test_a_save_error_fails_only_that_window(self):
+        class FlakyRepository(FakeRepository):
+            def save(self, items, window_label, *args, **kwargs):
+                if window_label == "Last 3 months":
+                    raise RuntimeError("connection dropped")
+                return super().save(items, window_label, *args, **kwargs)
+
+        repo = FlakyRepository(dataset())
+        outcome = generate_action_items(FakeAnalyzer(dataset_reply()), repo,
+                                        ActionItemSettings(), "claude", "m", today=TODAY)
+        assert [w.window.label for w in outcome.failed] == ["Last 3 months"]
+        assert [s["window_label"] for s in repo.saved] == ["Last 6 months", "Last 12 months"]
+
+    def generate(self, analyzer, repo, dry_run=False, months=(12,)):
+        return generate_action_items(analyzer, repo, ActionItemSettings(windows_months=months),
+                                     "claude", "m", dry_run=dry_run, today=TODAY)
 
     def test_invalid_then_valid_reply_is_saved_once(self, caplog):
         bad = dataset_reply()
@@ -887,7 +965,7 @@ class TestGenerate:
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             outcome = self.generate(analyzer, repo)
         assert len(analyzer.calls) == 2 and len(repo.saved) == 1
-        assert [i["rank"] for i in outcome.items] == [1, 2, 3]
+        assert [i["rank"] for i in outcome.windows[0].items] == [1, 2, 3]
         first, retry = analyzer.calls[0][0], analyzer.calls[1][0]
         assert retry.startswith(first)
         assert ("Your previous reply failed because: item 1 rationale has numbers that are "
@@ -895,6 +973,7 @@ class TestGenerate:
         assert analyzer.calls[1][1] == ACTION_ITEMS_MAX_TOKENS
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
+        assert "Last 12 months" in warnings[0].getMessage()
         assert "retrying once" in warnings[0].getMessage()
         assert "47.3%" in warnings[0].getMessage()
         assert warnings[0].exc_info is None
@@ -903,8 +982,10 @@ class TestGenerate:
         analyzer = FakeAnalyzer(replies=[{"items": []}, {"items": [1, 2, 3]}])
         repo = FakeRepository(dataset())
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
-            with pytest.raises(ActionItemsValidationError, match="item 1 is not an object"):
-                self.generate(analyzer, repo)
+            outcome = self.generate(analyzer, repo)
+        [failed] = outcome.failed
+        assert isinstance(failed.error, ActionItemsValidationError)
+        assert "item 1 is not an object" in str(failed.error)
         assert len(analyzer.calls) == 2 and repo.saved == []
         assert "expected 3 items, got 0" in analyzer.calls[1][0]
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
@@ -916,15 +997,15 @@ class TestGenerate:
     def test_both_invalid_in_a_dry_run_saves_nothing(self):
         analyzer = FakeAnalyzer(replies=[{"items": []}, {"items": []}])
         repo = FakeRepository(dataset())
-        with pytest.raises(ActionItemsValidationError):
-            self.generate(analyzer, repo, dry_run=True)
-        assert repo.saved == []
+        outcome = self.generate(analyzer, repo, dry_run=True)
+        assert len(outcome.failed) == 1 and repo.saved == []
 
-    def test_provider_error_is_not_retried(self):
+    def test_provider_error_is_not_retried_and_stops_every_window(self):
         analyzer = FakeAnalyzer(error=FatalProviderError("bad key"))
+        repo = FakeRepository(dataset())
         with pytest.raises(FatalProviderError):
-            self.generate(analyzer, FakeRepository(dataset()))
-        assert len(analyzer.calls) == 1
+            self.generate(analyzer, repo, months=(3, 6, 12))
+        assert len(analyzer.calls) == 1 and repo.saved == []
 
     def test_retry_prompt(self):
         assert build_retry_prompt("PROMPT", "x; y") == (
@@ -932,38 +1013,54 @@ class TestGenerate:
             "again, following every rule above, and respond ONLY with\nJSON in the same "
             "shape.")
 
-    def test_invalid_reply_repository_untouched(self):
-        repo = FakeRepository(dataset())
-        with pytest.raises(ActionItemsValidationError):
-            generate_action_items(FakeAnalyzer({"items": []}), repo, ActionItemSettings(),
-                                  "claude", "m")
-        assert repo.saved == []
+    def test_thin_window_is_skipped_without_calling_the_model(self, caplog):
+        rows = ([review(i, date(2026, 8, 20)) for i in range(60)]
+                + [review(1000 + i, date(2026, 4, 1)) for i in range(60)]
+                + [review(9000, date(2026, 8, 20), "negative", review_type="service")])
+        reply = dataset_reply()
+        for item in reply["items"]:
+            item["rationale"] = item["evidence"] = "Most reviews are positive."
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            outcome, analyzer, repo = self.run(rows=rows, reply=reply)
+        assert [w.skipped for w in outcome.windows] == [True, False, False]
+        assert outcome.windows[0].items == [] and outcome.failed == []
+        assert len(analyzer.calls) == 2
+        assert [s["window_label"] for s in repo.saved] == ["Last 6 months", "Last 12 months"]
+        assert ("Action items for Last 3 months: skipped -- only 61 analysed reviews"
+                in caplog.text)
 
-    def test_thin_data_skips_without_calling_the_model(self, caplog):
+    def test_all_windows_skipped_saves_nothing_and_is_not_a_failure(self, caplog):
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             outcome, analyzer, repo = self.run(rows=dataset(10))
-        assert outcome.skipped and outcome.items == []
+        assert all(w.skipped for w in outcome.windows)
+        assert outcome.failed == [] and outcome.generated == []
         assert analyzer.calls == [] and repo.saved == []
-        assert "not generated" in caplog.text
+        assert caplog.text.count("skipped") == 3
 
-    def test_window_cap_is_logged(self, caplog):
-        rows = dataset() + [review(9999, date.today() + timedelta(days=30), review_type="service")]
+    def test_window_cap_is_logged_once(self, caplog):
+        future = TODAY + timedelta(days=30)
+        rows = dataset() + [review(9999, future, review_type="service")]
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             outcome, _, repo = self.run(rows=rows)
-        assert repo.saved[0]["window_end"] == date.today()
-        assert outcome.window.capped_from == date.today() + timedelta(days=30)
-        assert "is after today, so the window ends today" in caplog.text
+        assert {s["window_end"] for s in repo.saved} == {TODAY}
+        assert outcome.windows[0].window.capped_from == future
+        assert caplog.text.count("is after today, so the windows end today") == 1
         assert "1 review(s) dated after today" in caplog.text
 
-    def test_provider_error_propagates(self):
-        with pytest.raises(FatalProviderError):
-            self.run(error=FatalProviderError("bad key"))
+    def test_fetch_error_propagates(self):
+        class BrokenRepository(FakeRepository):
+            def fetch_analysed_rows(self):
+                raise RuntimeError("Invalid object name 'dbo.vw_review_analysis'")
+
+        with pytest.raises(RuntimeError):
+            generate_action_items(FakeAnalyzer(dataset_reply()), BrokenRepository([]),
+                                  ActionItemSettings(), "claude", "m", today=TODAY)
 
     def test_prompt_is_built_from_the_summary_only(self):
         rows = dataset()
         for r in rows:
             r["reviewer_name"] = "Private Person"
         _, analyzer, _ = self.run(rows=rows)
-        prompt = analyzer.calls[0][0]
-        assert "Private Person" not in prompt
-        assert '"reviews": 121' in prompt
+        for prompt, _ in analyzer.calls:
+            assert "Private Person" not in prompt
+            assert '"reviews": 121' in prompt

@@ -19,7 +19,7 @@ from daylight_sentiment.application.aggregator import AnalysisAggregator
 from daylight_sentiment.application.checkpoint import load_checkpoint
 from daylight_sentiment.application.output_generator import OutputGenerator
 from daylight_sentiment.application.pipeline import MultiSourcePipeline
-from daylight_sentiment.config import Config, LLMProvider
+from daylight_sentiment.config import Config, LLMProvider, parse_window_months
 from daylight_sentiment.domain.action_items import format_action_items
 from daylight_sentiment.logging_setup import configure_logging as _configure_logging
 from daylight_sentiment.infra.analyzers import (
@@ -53,14 +53,11 @@ from daylight_sentiment.infra.sharepoint_sync import (
 logger = logging.getLogger("multi_source_sentiment")
 
 
-def _positive_int(value: str) -> int:
+def _window_months(value: str) -> tuple:
     try:
-        n = int(value)
-    except ValueError:
-        n = 0
-    if n < 1:
-        raise argparse.ArgumentTypeError(f"must be a whole number of 1 or more, got {value!r}")
-    return n
+        return parse_window_months(value, name="--action-items-months")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -117,16 +114,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Don't generate the top 3 business to-do items after the database "
                         "load. They are otherwise generated whenever this run analysed and "
                         "loaded new reviews.")
-    p.add_argument("--action-items-months", type=_positive_int, metavar="N",
-                   help="Base the to-do items on the last N months of reviews, counted back "
-                        "from the newest review date in the database (default 12, or "
-                        "ACTION_ITEMS_WINDOW_MONTHS)")
+    p.add_argument("--action-items-months", type=_window_months, metavar="N[,N...]",
+                   help="The review windows to generate to-do items for, in months, "
+                        "comma-separated: one set of items for each 'last N months', "
+                        "counted back from the newest review date in the database "
+                        "(default 3,6,12, or ACTION_ITEMS_WINDOWS_MONTHS)")
     p.add_argument("--action-items-only", action="store_true",
                    help="Skip SharePoint sync, loading and analysis entirely -- just generate "
-                        "the to-do items from the reviews already in the database, then exit")
+                        "the to-do items for every review window from the reviews already in "
+                        "the database, then exit (1 if any window failed)")
     p.add_argument("--action-items-dry-run", action="store_true",
-                   help="Generate and print the to-do items but don't save them to the "
-                        "database. Combine with --action-items-only to preview them.")
+                   help="Generate and print every window's to-do items but don't save them "
+                        "to the database. Combine with --action-items-only to preview them.")
     return p.parse_args(argv)
 
 
@@ -141,7 +140,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if args.model:
         getattr(config, config.llm_provider.value).model = args.model
     if args.action_items_months is not None:
-        config.action_items.window_months = args.action_items_months
+        config.action_items.windows_months = args.action_items_months
     config.output_dir.mkdir(parents=True, exist_ok=True)
     return config
 
@@ -353,44 +352,54 @@ def count_newly_analysed(results: List[Dict[str, Any]],
 
 
 def run_action_items(config: Config, analyzer: SentimentAnalyzer,
-                     run_timestamp: Optional[str] = None, dry_run: bool = False) -> None:
-    """Generate the top 3 business to-do items from the reviews in the
-    database and save them (see application/action_items.py). Raises on
-    failure; nothing is saved unless all 3 items pass validation."""
-    logger.info("Generating the top 3 action items from the stored review results...")
+                     run_timestamp: Optional[str] = None, dry_run: bool = False) -> int:
+    """Generate the top 3 business to-do items for each review window from
+    the reviews in the database and save them (see
+    application/action_items.py). Logs one ERROR line per window that
+    failed and returns how many failed; a skipped window (too few reviews)
+    is not a failure. Raises if the reviews can't be read at all, and on a
+    FatalProviderError."""
+    logger.info("Generating the top 3 action items for the review windows %s from the "
+                "stored review results...",
+                ", ".join(str(m) for m in config.action_items.windows_months))
     outcome = generate_action_items(
         analyzer, ActionItemRepository(config.db), config.action_items,
         config.llm_provider.value, config.model_name,
         run_timestamp=run_timestamp, dry_run=dry_run)
-    if not outcome.items:
-        return
-    if dry_run:
-        print("\n" + format_action_items(outcome.items, outcome.window))
-    else:
-        logger.info("Action items saved: %s",
-                    "; ".join(f"{i['rank']}. {i['title']}" for i in outcome.items))
+    for result in outcome.windows:
+        if result.failed:
+            report_action_items_failure(result.error, result.window.label)
+        elif result.items and dry_run:
+            print("\n" + format_action_items(result.items, result.window))
+        elif result.items:
+            logger.info("Action items saved for %s: %s", result.window.label,
+                        "; ".join(f"{i['rank']}. {i['title']}" for i in result.items))
+    return len(outcome.failed)
 
 
-def report_action_items_failure(exc: Exception) -> None:
+def report_action_items_failure(exc: Exception, window_label: Optional[str] = None) -> None:
     message = str(exc)
-    logger.error("Action items were not generated: %s%s", type(exc).__name__,
+    which = f" for {window_label}" if window_label else ""
+    logger.error("Action items were not generated%s: %s%s", which, type(exc).__name__,
                  f": {message}" if message else "")
 
 
 def action_items_only(config: Config, dry_run: bool) -> int:
-    """--action-items-only: generate from what's already in the database."""
+    """--action-items-only: generate every review window from what's already
+    in the database. Exit 1 if any window failed (a skipped window is not a
+    failure)."""
     if not config.db.configured:
         logger.error("--action-items-only needs the database: set DB_SERVER/DB_NAME/"
                      "DB_USER/DB_PASSWORD in .env")
         return 1
     try:
-        run_action_items(config, build_analyzer(config), dry_run=dry_run)
+        failed = run_action_items(config, build_analyzer(config), dry_run=dry_run)
     except FatalProviderError as exc:
         return report_fatal_provider_error(config, exc)
     except Exception as exc:  # noqa: BLE001
         report_action_items_failure(exc)
         return 1
-    return 0
+    return 1 if failed else 0
 
 
 def report_fatal_provider_error(config: Config, exc: FatalProviderError) -> int:
@@ -519,8 +528,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info("DB_SERVER/DB_USER/DB_PASSWORD not set; not translating")
 
     # After the load, the move and translation, so the items see this run's
-    # reviews with their English text. A failure here doesn't fail the run:
-    # the reviews are already saved.
+    # reviews with their English text. A failure here (of any window, or of
+    # all of them) doesn't fail the run: the reviews are already saved.
     if args.skip_action_items:
         logger.info("--skip-action-items set; not generating action items")
     elif not loaded:

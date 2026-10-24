@@ -191,6 +191,7 @@ class TestMainPhases:
             state["action_kwargs"].append(kwargs)
             if state["action"]:
                 raise state["action"]
+            return state.get("action_failed", 0)
 
         summary = {"total_reviews_analyzed": 0, "failed_reviews": 0, "overall_sentiment": {}}
         monkeypatch.setattr(cli, "sync_sharepoint", fake_sync)
@@ -278,25 +279,33 @@ class TestActionItemsWiring:
     run = TestMainPhases.run
 
     def test_parse_args_flags(self):
-        args = parse_args(["--skip-action-items", "--action-items-months", "6",
+        args = parse_args(["--skip-action-items", "--action-items-months", "3,6,12",
                            "--action-items-only", "--action-items-dry-run"])
         assert args.skip_action_items and args.action_items_only
-        assert args.action_items_dry_run and args.action_items_months == 6
+        assert args.action_items_dry_run and args.action_items_months == (3, 6, 12)
+        assert parse_args(["--action-items-months", "6"]).action_items_months == (6,)
         defaults = parse_args([])
         assert defaults.action_items_months is None
         assert not (defaults.skip_action_items or defaults.action_items_only
                     or defaults.action_items_dry_run)
 
-    @pytest.mark.parametrize("value", ["0", "-3", "six"])
-    def test_months_must_be_positive(self, value):
+    @pytest.mark.parametrize("value", ["0", "-3", "six", "3,,6", "3,0", ""])
+    def test_months_must_be_positive_whole_numbers(self, value, capsys):
         with pytest.raises(SystemExit):
             parse_args(["--action-items-months", value])
+        assert "--action-items-months must be one or more whole numbers" in capsys.readouterr().err
 
     def test_months_flag_overrides_config(self, monkeypatch):
-        monkeypatch.setenv("ACTION_ITEMS_WINDOW_MONTHS", "18")
-        assert build_config(parse_args([])).action_items.window_months == 18
-        config = build_config(parse_args(["--action-items-months", "6"]))
-        assert config.action_items.window_months == 6
+        monkeypatch.setenv("ACTION_ITEMS_WINDOWS_MONTHS", "1,18")
+        assert build_config(parse_args([])).action_items.windows_months == (1, 18)
+        config = build_config(parse_args(["--action-items-months", "6,3"]))
+        assert config.action_items.windows_months == (3, 6)
+
+    def test_help_shows_the_windows_flag(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        out = " ".join(capsys.readouterr().out.split())
+        assert "--action-items-months N[,N...]" in out and "default 3,6,12" in out
 
     def test_runs_after_load_move_and_translation(self, run):
         code, calls = run(sync=_sync_results("trustpilot_product"))
@@ -392,6 +401,16 @@ class TestActionItemsWiring:
         assert code == 1
         assert "Stopping: the claude API rejected the request" in caplog.text
 
+    def test_only_mode_exits_1_when_a_window_failed(self, run):
+        run.state["action_failed"] = 1
+        code, calls = run(["--action-items-only"])
+        assert code == 1 and calls == ["build_analyzer", "run_action_items"]
+
+    def test_failed_windows_keep_a_normal_runs_exit_code(self, run):
+        run.state["action_failed"] = 2
+        code, calls = run(sync=_sync_results("trustpilot_product"))
+        assert code == 0 and calls[-1] == "run_action_items"
+
     def test_only_mode_without_database_exits_1(self, run):
         run.config.db = DatabaseSettings()
         code, calls = run(["--action-items-only"])
@@ -460,37 +479,67 @@ class TestActionItemsEndToEndOffline:
         self.prompts = prompts
         return config, saved
 
-    def test_second_provider_generates_and_saves(self, monkeypatch):
+    def test_second_provider_generates_and_saves_every_window(self, monkeypatch):
         config, saved = self._setup(monkeypatch, self.REPLY)
         assert cli.action_items_only(config, dry_run=False) == 0
-        [(items, args)] = saved
-        assert [i["rank"] for i in items] == [1, 2, 3]
-        assert args[:2] == ("Last 12 months", 12)
-        assert args[4:7] == (150, "fake", "fake-model")
+        assert [args[:2] for _, args in saved] == [
+            ("Last 3 months", 3), ("Last 6 months", 6), ("Last 12 months", 12)]
+        for items, args in saved:
+            assert [i["rank"] for i in items] == [1, 2, 3]
+            assert args[4:7] == (150, "fake", "fake-model")
+        assert len(self.prompts) == 3
 
-    def test_dry_run_prints_and_writes_nothing(self, monkeypatch, capsys):
+    def test_dry_run_prints_every_window_and_writes_nothing(self, monkeypatch, capsys):
         config, saved = self._setup(monkeypatch, self.REPLY)
         assert cli.action_items_only(config, dry_run=True) == 0
         assert saved == []
         out = capsys.readouterr().out
-        assert "Based on 150 reviews from 2025-07-02 to 2026-07-01" in out
-        assert "1. Reduce glare 1  [Beauty]" in out
+        assert "Last 3 months: top 3 to-do items -- Based on 150 reviews from 2026-04-02" in out
+        assert "Last 6 months: top 3 to-do items -- Based on 150 reviews from 2026-01-02" in out
+        assert ("Last 12 months: top 3 to-do items -- Based on 150 reviews from 2025-07-02 "
+                "to 2026-07-01") in out
+        assert out.count("1. Reduce glare 1  [Beauty]") == 3
 
-    def test_invalid_reply_saves_nothing_and_exits_1(self, monkeypatch):
+    def test_invalid_reply_saves_nothing_and_exits_1(self, monkeypatch, caplog):
         config, saved = self._setup(monkeypatch, {"items": self.REPLY["items"][:2]})
         assert cli.action_items_only(config, dry_run=False) == 1
         assert saved == []
-        assert len(self.prompts) == 2  # the first try and one retry
+        assert len(self.prompts) == 6  # each window: the first try and one retry
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert errors == [
+            f"Action items were not generated for {label}: ActionItemsValidationError: "
+            "expected 3 items, got 2"
+            for label in ("Last 3 months", "Last 6 months", "Last 12 months")]
+
+    def test_one_failed_window_exits_1_and_the_others_are_saved(self, monkeypatch):
+        bad = {"items": []}
+        config, saved = self._setup(monkeypatch, self.REPLY, bad, bad, self.REPLY)
+        assert cli.action_items_only(config, dry_run=False) == 1
+        assert [args[0] for _, args in saved] == ["Last 3 months", "Last 12 months"]
 
     def test_invalid_then_valid_reply_is_saved_and_exits_0(self, monkeypatch):
         config, saved = self._setup(monkeypatch, {"items": []}, self.REPLY)
         assert cli.action_items_only(config, dry_run=False) == 0
-        assert len(saved) == 1 and len(self.prompts) == 2
+        assert len(saved) == 3 and len(self.prompts) == 4
         assert "Your previous reply failed because: expected 3 items, got 0" in self.prompts[1]
+
+    def test_every_window_skipped_exits_0_and_saves_nothing(self, monkeypatch, caplog):
+        config, saved = self._setup(monkeypatch, self.REPLY)
+        config.action_items.windows_months = (3,)
+        from daylight_sentiment.application import action_items as app
+        monkeypatch.setattr(app, "select_windows",
+                            lambda rows, months, today=None: [
+                                app.ReviewWindow(3, rows[:10], None, None,
+                                                 skip_reason="only 10 analysed reviews")])
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            assert cli.action_items_only(config, dry_run=False) == 0
+        assert saved == [] and self.prompts == []
+        assert "Action items for Last 3 months: skipped -- only 10 analysed reviews" in caplog.text
+        assert "ERROR" not in [r.levelname for r in caplog.records]
 
     run = TestMainPhases.run
 
-    def test_both_invalid_in_a_normal_run_keeps_exit_0(self, run, monkeypatch, caplog):
+    def test_every_window_invalid_in_a_normal_run_keeps_exit_0(self, run, monkeypatch, caplog):
         config, saved = self._setup(monkeypatch, {"items": []})
         config.output_dir = run.config.output_dir
         monkeypatch.setattr(cli, "build_config", lambda args: config)
@@ -499,7 +548,22 @@ class TestActionItemsEndToEndOffline:
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             code, _ = run(sync=_sync_results("trustpilot_product"))
         assert code == 0
-        assert saved == [] and len(self.prompts) == 2
+        assert saved == [] and len(self.prompts) == 6
         levels = [r.levelname for r in caplog.records]
-        assert levels.count("WARNING") == 2 and levels.count("ERROR") == 1
-        assert "Action items were not generated: ActionItemsValidationError" in caplog.text
+        assert levels.count("WARNING") == 6 and levels.count("ERROR") == 3
+        assert ("Action items were not generated for Last 6 months: "
+                "ActionItemsValidationError") in caplog.text
+
+    def test_one_failed_window_in_a_normal_run_keeps_exit_0(self, run, monkeypatch, caplog):
+        bad = {"items": []}
+        config, saved = self._setup(monkeypatch, self.REPLY, bad, bad, self.REPLY)
+        config.output_dir = run.config.output_dir
+        monkeypatch.setattr(cli, "build_config", lambda args: config)
+        monkeypatch.setattr(cli, "build_analyzer", REAL_BUILD_ANALYZER)
+        monkeypatch.setattr(cli, "run_action_items", REAL_RUN_ACTION_ITEMS)
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            code, _ = run(sync=_sync_results("trustpilot_product"))
+        assert code == 0
+        assert [args[0] for _, args in saved] == ["Last 3 months", "Last 12 months"]
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1 and "for Last 6 months" in errors[0]

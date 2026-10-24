@@ -14,12 +14,11 @@ Power BI report. It is based on customer reviews from Trustpilot and Amazon
 that have already been classified as positive, negative or neutral.
 
 The summary below is ALL the information you have. It covers {review_count}
-reviews dated {window_start} to {window_end}.
+reviews dated {window_start} to {window_end} ({window_label}).
 
 How to read the summary:
-- "window": the review dates and number of reviews covered. When
-  "widened_to_all_dates" is true there were too few recent reviews, so all
-  dated reviews are used and the period is longer than usual.
+- "window": the period ("label"), its review dates and the number of
+  reviews covered.
 - "sentiment": how many reviews were positive, negative and neutral.
 - "negative_reviews_total": how many negative reviews there are in total.
 - Every group below gives "reviews" (how many reviews), "negatives" (how
@@ -136,6 +135,7 @@ def build_action_items_prompt(summary: Dict[str, Any], areas: Sequence[str]) -> 
         review_count=window["reviews"],
         window_start=window["start"],
         window_end=window["end"],
+        window_label=window["label"].lower(),
         summary=json.dumps(summary, indent=2, ensure_ascii=False),
         areas=", ".join(json.dumps(a, ensure_ascii=False) for a in areas),
     )
