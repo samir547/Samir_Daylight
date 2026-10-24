@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Repo root -- daylight_sentiment/ sits directly under it.
 BASE = Path(__file__).resolve().parent.parent
@@ -173,6 +173,50 @@ class Tuning:
     max_review_chars: int = 6000  # guards against a runaway review body
 
 
+# A window's length is stored in a TINYINT column (window_months).
+MAX_WINDOW_MONTHS = 255
+
+
+def parse_window_months(raw: str, name: str = "ACTION_ITEMS_WINDOWS_MONTHS") -> Tuple[int, ...]:
+    """Comma-separated window lengths in months ("3,6,12", or a single
+    number), returned sorted with repeats removed. Raises ValueError, naming
+    ``name``, for an empty list or any value that is not a whole number from
+    1 to MAX_WINDOW_MONTHS."""
+    parts = [p.strip() for p in str(raw).split(",")]
+    months = set()
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError:
+            value = 0
+        if not 1 <= value <= MAX_WINDOW_MONTHS:
+            raise ValueError(
+                f"{name} must be one or more whole numbers of months from 1 to "
+                f"{MAX_WINDOW_MONTHS}, separated by commas (e.g. 3,6,12); got {raw!r}")
+        months.add(value)
+    return tuple(sorted(months))
+
+
+@dataclass
+class ActionItemSettings:
+    """The business to-do items generated after a run (see
+    application/action_items.py): one set per review window. Each window is
+    the last N months ending on the newest review date in the data (or
+    today, if that is earlier); windows_months is overridable with
+    ACTION_ITEMS_WINDOWS_MONTHS and, per run, --action-items-months."""
+    windows_months: Tuple[int, ...] = (3, 6, 12)
+    top_themes: int = 15
+    max_excerpts: int = 10
+    excerpt_chars: int = 300
+
+    @classmethod
+    def from_env(cls) -> "ActionItemSettings":
+        raw = os.getenv("ACTION_ITEMS_WINDOWS_MONTHS")
+        if not raw:
+            return cls()
+        return cls(windows_months=parse_window_months(raw))
+
+
 # Legacy flat attribute -> (sub-config field, attribute). The compat layer for
 # every call site written against the old single flat dataclass.
 _FLAT_ALIASES = {
@@ -213,6 +257,7 @@ class Config:
     sources: SourceFiles = field(default_factory=SourceFiles)
     output: OutputSettings = field(default_factory=OutputSettings)
     tuning: Tuning = field(default_factory=Tuning)
+    action_items: ActionItemSettings = field(default_factory=ActionItemSettings)
 
     @property
     def model_name(self) -> str:
@@ -235,6 +280,7 @@ class Config:
             sharepoint=SharePointSettings.from_env(),
             db=DatabaseSettings.from_env(),
             sources=SourceFiles.from_env(),
+            action_items=ActionItemSettings.from_env(),
         )
 
     # -- legacy flat-attribute compatibility (reads AND writes) --------------

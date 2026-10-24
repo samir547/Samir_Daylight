@@ -7,6 +7,7 @@ from daylight_sentiment.config import (
     DatabaseSettings,
     LLMProvider,
     SharePointSettings,
+    parse_window_months,
 )
 
 ENV_KEYS = {
@@ -104,3 +105,45 @@ def test_configured_properties():
     assert DatabaseSettings(server="s", user="u", password="p").configured
     assert not SharePointSettings().configured
     assert SharePointSettings(share_url="s", username="u", password="p").configured
+
+
+def test_action_item_defaults():
+    settings = Config().action_items
+    assert settings.windows_months == (3, 6, 12)
+    assert (settings.top_themes, settings.max_excerpts, settings.excerpt_chars) == (15, 10, 300)
+    assert not hasattr(settings, "window_months")
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("3,6,12", (3, 6, 12)),
+    (" 12 , 3,6 ", (3, 6, 12)),
+    ("6", (6,)),
+    ("6,6,3", (3, 6)),
+])
+def test_parse_window_months(raw, expected):
+    assert parse_window_months(raw) == expected
+
+
+def test_action_items_windows_months_from_env(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_WINDOWS_MONTHS", raising=False)
+    assert Config.from_env(dotenv=False).action_items.windows_months == (3, 6, 12)
+    monkeypatch.setenv("ACTION_ITEMS_WINDOWS_MONTHS", "1,24")
+    assert Config.from_env(dotenv=False).action_items.windows_months == (1, 24)
+    monkeypatch.setenv("ACTION_ITEMS_WINDOWS_MONTHS", "6")
+    assert Config.from_env(dotenv=False).action_items.windows_months == (6,)
+    assert Config().action_items.windows_months == (3, 6, 12)  # plain Config ignores env
+
+
+def test_old_singular_setting_is_not_read(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_WINDOWS_MONTHS", raising=False)
+    monkeypatch.setenv("ACTION_ITEMS_WINDOW_MONTHS", "18")
+    assert Config.from_env(dotenv=False).action_items.windows_months == (3, 6, 12)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "twelve", "3,,12", "3;6", "3,0", "1.5", "256",
+                                 ","])
+def test_action_items_windows_months_rejects_bad_values(monkeypatch, raw):
+    monkeypatch.setenv("ACTION_ITEMS_WINDOWS_MONTHS", raw)
+    with pytest.raises(ValueError, match="ACTION_ITEMS_WINDOWS_MONTHS must be one or more "
+                                         "whole numbers of months from 1 to 255"):
+        Config.from_env(dotenv=False)

@@ -15,6 +15,7 @@ from daylight_sentiment.config import DatabaseSettings
 
 REVIEWS_TABLE = "sentiment_analysis_reviews"
 RUNS_TABLE = "sentiment_analysis_runs"
+ACTION_ITEMS_TABLE = "sentiment_action_items"
 
 
 def connect(settings: DatabaseSettings):
@@ -105,6 +106,46 @@ BEGIN
         CONSTRAINT UQ_{RUNS_TABLE}_timestamp UNIQUE (run_timestamp)
     );
 END"""),
+    ("create_action_items_table", f"""
+IF OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.{ACTION_ITEMS_TABLE} (
+        item_id            INT IDENTITY PRIMARY KEY,
+        generation_id      UNIQUEIDENTIFIER NOT NULL,
+        generated_at       DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+        run_timestamp      DATETIME2        NULL,
+        [rank]             TINYINT          NOT NULL,
+        title              NVARCHAR(200)    NOT NULL,
+        description        NVARCHAR(MAX)    NOT NULL,
+        rationale          NVARCHAR(MAX)    NOT NULL,
+        related_area       NVARCHAR(100)    NOT NULL,
+        evidence           NVARCHAR(MAX)    NOT NULL,
+        window_start       DATE             NOT NULL,
+        window_end         DATE             NOT NULL,
+        reviews_analysed   INT              NOT NULL,
+        llm_provider       NVARCHAR(50)     NULL,
+        llm_model          NVARCHAR(100)    NULL,
+        CONSTRAINT UQ_{ACTION_ITEMS_TABLE}_generation_rank UNIQUE (generation_id, [rank])
+    );
+END"""),
+    ("add_action_items_evidence_strength", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'evidence_strength')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD evidence_strength NVARCHAR(20) NULL;
+"""),
+    ("add_action_items_window_label", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'window_label')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD window_label NVARCHAR(30) NULL;
+"""),
+    ("add_action_items_window_months", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'window_months')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD window_months TINYINT NULL;
+"""),
 ]
 
 
