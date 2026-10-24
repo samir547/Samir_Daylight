@@ -646,9 +646,9 @@ months"), so the windows slide forward whenever newer reviews are loaded.
 They never end later than today: if a wrongly parsed review date lies in the
 future, the windows end today instead (those reviews are still counted) and a
 WARNING says so. Reviews with no parsed review date are left out, and the log
-says how many. A window with **fewer than 100 analysed reviews is skipped**
-(a WARNING names it); it is never stretched to cover more months, so its
-label is always true. If every window is skipped, nothing is saved and the
+says how many. A window with **fewer than 50 analysed reviews is skipped**
+(a WARNING names it and the minimum that applied); it is never stretched to
+cover more months, so its label is always true. If every window is skipped, nothing is saved and the
 run carries on as normal.
 
 A run that analyses nothing new generates nothing, so the stored items stay
@@ -657,10 +657,14 @@ already in the database.
 
 The windows are set with `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`
 (comma-separated, default `3,6,12`) or `--action-items-months 3,6,12` for one
-run; a single number gives one window. Rule of thumb: the 3-month window
-needs 100 reviews, so it works while reviews arrive at about 35 or more a
-month; if monthly review volume grows well beyond about 150, try shorter
-windows (for example `1,3,6`).
+run; a single number gives one window. The minimum is set with
+`ACTION_ITEMS_MIN_REVIEWS` in `.env` (default `50`) or
+`--action-items-min-reviews 50` for one run; it must be a whole number of 10
+or more, and anything lower stops the run with an error naming the setting.
+Rule of thumb: an N-month window needs about minimum / N reviews a month, so
+with the default of 50 the 3-month window works while reviews arrive at about
+17 or more a month (34 a month at a minimum of 100). If monthly review volume
+grows well beyond about 150, try shorter windows (for example `1,3,6`).
 
 **Why fixed windows, not the report's date slicer.** The items are written
 by an LLM at run time and stored; Power BI only reads them. A date slicer
@@ -767,6 +771,9 @@ for plain words such as "small sample" or "too few reviews to tell").
 - `--skip-action-items` — don't generate them in this run.
 - `--action-items-months 3,6,12` — the windows for this run, in months
   (or set `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`; default `3,6,12`).
+- `--action-items-min-reviews 50` — skip a window with fewer analysed
+  reviews than this in this run; 10 or more (or set
+  `ACTION_ITEMS_MIN_REVIEWS` in `.env`; default `50`).
 - `--action-items-only` — skip SharePoint, loading and analysis; generate
   every window from what's already in the database, then exit. Exit code `1`
   if any window failed (a skipped window isn't a failure).
