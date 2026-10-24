@@ -1,12 +1,15 @@
 """ISSUE-01/02: FilePattern matching, local file resolution, SharePoint
 pattern selection (pure, no network), source loaders (synthetic files), and
 load_reviews() uid assignment."""
+import re
 import time
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
 
 from daylight_sentiment.config import FilePattern, SourceFiles
+from daylight_sentiment.domain.action_items import _as_date
 from daylight_sentiment.infra.review_sources import (
     AmazonBrightDataSource,
     TrustpilotProductSource,
@@ -395,6 +398,73 @@ class TestXlsxCsvParity:
         pd.DataFrame([TP_SERVICE_ROW]).to_csv(path, index=False, encoding="utf-8-sig")
         [review] = TrustpilotServiceSource(_sources_config(tmp_path)).fetch()
         assert review["review_id"] == "s1"
+
+
+def _write(folder, name, rows):
+    folder.mkdir()
+    df = pd.DataFrame(rows, dtype=object)
+    if name.endswith(".xlsx"):
+        df.to_excel(folder / name, index=False)
+    else:
+        df.to_csv(folder / name, index=False)
+
+
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+
+class TestReviewDates:
+    """review_date is stored as text and parsed later (vw_review_analysis,
+    then _as_date on review_date_parsed). A real Excel date cell must end up
+    as the same text the CSV export carries for that moment."""
+
+    MOMENT = datetime(2026, 10, 7, 17, 24, 58, 498000)
+
+    @pytest.mark.parametrize("source_cls, stem, row, date_col", [
+        (TrustpilotProductSource, "trustpilot-product-reviews", TP_PRODUCT_ROW, "created_at"),
+        (TrustpilotServiceSource, "TrustPilot Service Reviews", TP_SERVICE_ROW,
+         "Review Created (UTC)"),
+    ])
+    def test_trustpilot_excel_datetime_matches_csv_text(
+            self, tmp_path, source_cls, stem, row, date_col):
+        _write(tmp_path / "x", f"{stem}.xlsx", [{**row, date_col: self.MOMENT}])
+        _write(tmp_path / "c", f"{stem}.csv", [{**row, date_col: "2026-10-07T17:24:58.498Z"}])
+        [from_xlsx] = source_cls(_sources_config(tmp_path / "x")).fetch()
+        [from_csv] = source_cls(_sources_config(tmp_path / "c")).fetch()
+        assert from_xlsx == from_csv
+        assert from_csv["review_date"] == "2026-10-07T17:24:58.498Z"
+        assert ISO_UTC.match(from_xlsx["review_date"])  # the style-127 shape
+
+    def test_trustpilot_excel_cell_holding_text_is_untouched(self, tmp_path):
+        # Today's real Trustpilot .xlsx exports hold the timestamp as text.
+        _write(tmp_path / "x", "trustpilot-product-reviews.xlsx",
+               [{**TP_PRODUCT_ROW, "created_at": "2021-07-15T13:03:18.514Z"}])
+        [review] = TrustpilotProductSource(_sources_config(tmp_path / "x")).fetch()
+        assert review["review_date"] == "2021-07-15T13:03:18.514Z"
+
+    def test_amazon_excel_datetime_stored_as_day(self, tmp_path):
+        _write(tmp_path / "x", "amazon_product_reviews_all.xlsx",
+               [{**AMAZON_ROW, "review_posted_date": self.MOMENT}])
+        [review] = AmazonBrightDataSource(_sources_config(tmp_path / "x")).fetch()
+        assert review["review_date"] == "2026-10-07"
+
+    def test_amazon_text_dates_kept_as_exported(self, tmp_path):
+        text = "Reviewed in the United States on October 7, 2026"
+        rows = [{**AMAZON_ROW, "review_posted_date": text}]
+        from_xlsx, from_csv = _load_both_ways(
+            tmp_path, AmazonBrightDataSource, "amazon_product_reviews_all", rows)
+        assert from_xlsx[0]["review_date"] == from_csv[0]["review_date"] == text
+
+    @pytest.mark.parametrize("stored, expected", [
+        ("2026-10-07T17:24:58.498Z", date(2026, 10, 7)),   # CSV / normalised Excel
+        ("2026-10-07 17:24:58.498000", date(2026, 10, 7)),  # str() of an Excel datetime
+        ("2026-10-07", date(2026, 10, 7)),
+        (datetime(2026, 10, 7, 17, 24), date(2026, 10, 7)),  # DATE column from the view
+        (date(2026, 10, 7), date(2026, 10, 7)),
+        ("Reviewed in the United States on October 7, 2026", None),
+        ("", None),
+    ])
+    def test_as_date_reads_both_forms_to_the_same_day(self, stored, expected):
+        assert _as_date(stored) == expected
 
 
 class TestLoadReviews:

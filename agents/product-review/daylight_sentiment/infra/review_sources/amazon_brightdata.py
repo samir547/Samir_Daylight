@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 from daylight_sentiment.config import SourceFiles
 from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
 from daylight_sentiment.infra.review_sources.coercion import (
+    _clean_date,
     _clean_str,
     _safe_bool,
     _safe_int,
@@ -69,7 +70,9 @@ def load_amazon_product(path: Path) -> List[Dict[str, Any]]:
             "title": header,
             "text": text,
             "reviewer_name": _clean_str(row.get("author_name")),
-            "review_date": _clean_str(row.get("review_posted_date")),
+            # Day only: the view parses Amazon dates with TRY_PARSE, where a
+            # trailing Z could shift the day by the server's time zone.
+            "review_date": _clean_date(row.get("review_posted_date"), with_time=False),
             "verified_purchase": _safe_bool(row.get("is_verified")),
         })
     logger.info("Loaded %d Amazon product reviews", len(reviews))

@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 
 from daylight_sentiment.config import SourceFiles
 from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
-from daylight_sentiment.infra.review_sources.coercion import _clean_str, _safe_int
+from daylight_sentiment.infra.review_sources.coercion import _clean_date, _clean_str, _safe_int
 
 logger = logging.getLogger("multi_source_sentiment")
 
@@ -35,7 +35,7 @@ def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
             "product_sku": _clean_str(row.get("product_sku")),
             "text": _clean_str(row.get("content")),
             "reviewer_name": _clean_str(row.get("consumer_name")),
-            "review_date": _clean_str(row.get("created_at")),
+            "review_date": _clean_date(row.get("created_at")),
         })
     logger.info("Loaded %d Trustpilot product reviews", len(reviews))
     return reviews
@@ -58,7 +58,7 @@ def load_trustpilot_service(path: Path) -> List[Dict[str, Any]]:
             "title": title,
             "text": text,
             "reviewer_name": _clean_str(row.get("Review Username")),
-            "review_date": _clean_str(row.get("Review Created (UTC)")),
+            "review_date": _clean_date(row.get("Review Created (UTC)")),
         })
     logger.info("Loaded %d Trustpilot service reviews", len(reviews))
     return reviews
