@@ -62,6 +62,24 @@ FIELD_MAX_CHARS = {
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 _PHONE = re.compile(r"\+?\d[\d ()-]{7,}\d")
 
+# Every number in these fields must be one of the summary's numbers.
+NUMBER_CHECKED_FIELDS = ("description", "rationale", "evidence")
+_MONTHS = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+           r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?")
+# Dates, years and periods ("the last 12 months") -- not figures to check.
+_NOT_FIGURES = re.compile(
+    r"\b\d{4}-\d{1,2}(?:-\d{1,2})?\b"
+    r"|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b"
+    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{_MONTHS})\b\.?(?:,?\s+\d{{4}})?"
+    rf"|\b(?:{_MONTHS})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?\b(?:,?\s+\d{{4}})?"
+    r"|\b(?:19|20)\d{2}\b"
+    r"|\b\d+\s*(?:months?|years?|weeks?|days?)\b",
+    re.I)
+# A number standing on its own (not part of a code such as "D35500"), with
+# an optional percent sign or "per cent".
+_NUMBER = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?!\w)"
+                     r"(\s*(?:%|per\s?cent\b))?", re.I)
+
 
 class ActionItemsValidationError(ValueError):
     """The model's reply isn't a complete, well-formed set of items."""
@@ -450,8 +468,66 @@ def small_sample_areas(summary: Dict[str, Any]) -> List[str]:
             if entry.get("small_sample")]
 
 
+@dataclass
+class SummaryNumbers:
+    """The numbers a reply may use: every number in the summary (rounded to
+    1 decimal place) and, separately, its percentages."""
+    values: set
+    percentages: set
+
+    def supports(self, value: float, percent: bool) -> bool:
+        value = round(value, 1)
+        if not percent:
+            return value in self.values
+        if value in self.percentages:
+            return True
+        # "16%" for a summary share of 15.6 (round half up, as people do).
+        return value == int(value) and any(
+            int(p + 0.5) == value for p in self.percentages)
+
+
+def _numbers_in(text: str):
+    """(value, is_percentage, as written) for each figure in ``text``,
+    leaving out dates, years and periods."""
+    text = _NOT_FIGURES.sub(" ", text)
+    for m in _NUMBER.finditer(text):
+        yield float(m.group(1).replace(",", "")), bool(m.group(2)), m.group(0).strip()
+
+
+def summary_numbers(summary: Any) -> SummaryNumbers:
+    numbers = SummaryNumbers(set(), set())
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            numbers.values.add(round(float(value), 1))
+            if key.endswith("_pct"):
+                numbers.percentages.add(round(float(value), 1))
+        elif isinstance(value, str):
+            for number, percent, _ in _numbers_in(value):
+                numbers.values.add(round(number, 1))
+                if percent:
+                    numbers.percentages.add(round(number, 1))
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, k)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v, key)
+
+    walk(summary)
+    return numbers
+
+
+def unsupported_numbers(text: str, known: SummaryNumbers) -> List[str]:
+    """The figures in ``text``, as written, that the summary doesn't give."""
+    return [written for value, percent, written in _numbers_in(text)
+            if not known.supports(value, percent)]
+
+
 def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
-                threshold: Any) -> tuple:
+                threshold: Any, known: SummaryNumbers) -> tuple:
     """(clean item or None, problems) for one item of the reply."""
     if not isinstance(item, dict):
         return None, [f"item {i} is not an object"]
@@ -471,6 +547,11 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
                             f"(limit {FIELD_MAX_CHARS[name]})")
             continue
         clean[name] = value
+        if name in NUMBER_CHECKED_FIELDS:
+            bad = unsupported_numbers(value, known)
+            if bad:
+                problems.append(f"item {i} {name} has numbers that are not in the summary: "
+                                f"{', '.join(bad)}")
 
     if "related_area" in clean:
         area = canonical.get(clean["related_area"].casefold())
@@ -498,7 +579,10 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
 def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Check the model's reply against the summary it was given and return
     the items ordered by rank, with text stripped, related_area in its
-    canonical spelling and evidence_strength lower-case. Anything short of
+    canonical spelling and evidence_strength lower-case. Every number in
+    the description, rationale and evidence must be in the summary (dates,
+    years and periods aside; a percentage may be rounded to a whole
+    number). Anything short of
     exactly ITEM_COUNT complete items raises ActionItemsValidationError,
     whose message lists every problem found: a partial set is never
     returned."""
@@ -511,10 +595,11 @@ def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str,
     canonical = {a.casefold(): a for a in summary_areas(summary)}
     small = {a.casefold() for a in small_sample_areas(summary)}
     threshold = summary.get("small_sample_threshold_reviews", SMALL_SAMPLE_REVIEWS)
+    known = summary_numbers(summary)
     out: List[Dict[str, Any]] = []
     problems: List[str] = []
     for i, item in enumerate(items, start=1):
-        clean, found = _check_item(i, item, canonical, small, threshold)
+        clean, found = _check_item(i, item, canonical, small, threshold, known)
         problems += found
         if clean is not None:
             out.append(clean)

@@ -30,6 +30,8 @@ from daylight_sentiment.domain.action_items import (
     select_window,
     small_sample_areas,
     summary_areas,
+    summary_numbers,
+    unsupported_numbers,
     validate_action_items,
 )
 from daylight_sentiment.domain.action_items_prompt import build_action_items_prompt
@@ -458,6 +460,11 @@ def summary_for(sector_groups=(("Sewing & Needlecraft", False),),
         return [{"name": n, "reviews": 10 if small else 100, "small_sample": small}
                 for n, small in entries]
     return {"small_sample_threshold_reviews": 30,
+            # The figures good_reply() quotes.
+            "by_review_type_and_source": [
+                {"reviews": 40, "negatives": 12, "negative_share_pct": 30.0},
+                {"reviews": 10, "negatives": 9, "negative_share_pct": 90.0},
+                {"reviews": 4, "negatives": 4, "negative_share_pct": 15.6}],
             "product_by_sector_group": section(sector_groups),
             "service_by_aspect": section(aspects),
             "product_by_region": section(regions)}
@@ -586,6 +593,68 @@ class TestValidate:
             validate_action_items(reply, AREAS)
 
 
+class TestNumberCheck:
+    def known(self):
+        return summary_numbers(summary_for())
+
+    def test_accepts_numbers_from_the_summary(self):
+        text = ("12 of 40 reviews (30.0%) and 9 of 10 (90%); 15.6% and 15.6 per cent; "
+                "about 16% when rounded.")
+        assert unsupported_numbers(text, self.known()) == []
+
+    def test_thousands_separator(self):
+        known = summary_numbers({"reviews": 1234})
+        assert unsupported_numbers("1,234 reviews", known) == []
+
+    def test_rejects_an_invented_percentage(self):
+        assert unsupported_numbers("47.3% of buyers complain", self.known()) == ["47.3%"]
+
+    def test_rejects_a_number_not_in_the_summary(self):
+        assert unsupported_numbers("99 reviews mention it", self.known()) == ["99"]
+
+    def test_a_count_is_not_a_percentage(self):
+        # 40 is a count in the summary, never a share.
+        assert unsupported_numbers("40% are negative", self.known()) == ["40%"]
+
+    def test_rounding_only_to_one_decimal_or_a_whole_number(self):
+        assert unsupported_numbers("15.60%", self.known()) == []
+        assert unsupported_numbers("15.5%", self.known()) == ["15.5%"]
+        assert unsupported_numbers("15%", self.known()) == ["15%"]
+
+    @pytest.mark.parametrize("text", [
+        "Reviews from 2025-08-12 to 2026-08-11",
+        "since August 2025", "in 2026", "on 12 August 2025", "on August 12, 2025",
+        "on 12/08/2025", "over the last 18 months", "within 3 weeks",
+        "product D35500 and E1234",
+    ])
+    def test_ignores_dates_years_periods_and_codes(self, text):
+        assert unsupported_numbers(text, self.known()) == []
+
+    def test_numbers_inside_summary_text_count(self):
+        summary = {"negative_excerpts": [{"text": "It broke after 3 uses, 50% dimmer"}],
+                   "window": {"start": "2025-08-12"}}
+        known = summary_numbers(summary)
+        assert unsupported_numbers("3 uses and 50%", known) == []
+        assert unsupported_numbers("8 uses", known) == ["8"]
+
+    def test_bools_are_not_numbers(self):
+        assert summary_numbers({"small_sample": True}).values == set()
+
+    @pytest.mark.parametrize("field", ["description", "rationale", "evidence"])
+    def test_reply_with_an_unsupported_number_fails_and_lists_it(self, field):
+        reply = good_reply()
+        reply["items"][0][field] = "Around 47.3% of buyers, 99 reviews, since 2025."
+        with pytest.raises(ActionItemsValidationError,
+                           match=rf"item 1 {field} has numbers that are not in the summary: "
+                                 r"47\.3%, 99"):
+            validate_action_items(reply, AREAS)
+
+    def test_title_is_not_number_checked(self):
+        reply = good_reply()
+        reply["items"][0]["title"] = "Review the 5 worst products"
+        validate_action_items(reply, AREAS)
+
+
 class TestPrompt:
     def test_includes_summary_areas_and_rules(self):
         rows = TestBuildSummary().rows()
@@ -687,9 +756,19 @@ def dataset(n=120):
     return rows
 
 
+def dataset_reply():
+    """A valid reply for dataset(): 40 of the 120 product reviews are
+    negative (33.3%); the 1 service review is negative."""
+    reply = good_reply()
+    for item in reply["items"]:
+        item["rationale"] = "40 of 120 product reviews are negative (33.3%)."
+        item["evidence"] = "40 negative reviews; 1 service review."
+    return reply
+
+
 class TestGenerate:
     def run(self, reply=None, error=None, rows=None, dry_run=False):
-        analyzer = FakeAnalyzer(reply if reply is not None else good_reply(), error)
+        analyzer = FakeAnalyzer(reply if reply is not None else dataset_reply(), error)
         repo = FakeRepository(rows if rows is not None else dataset())
         outcome = generate_action_items(analyzer, repo, ActionItemSettings(), "claude",
                                         "model-x", run_timestamp="2026-10-24T10:00:00",
