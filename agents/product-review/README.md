@@ -683,7 +683,11 @@ theme's mentions, add up to fewer than 10 across both parts
 (`MIN_TREND_COUNT`); the prompt forbids calling such a row, or a
 small-sample one, rising, worsening or improving, and forbids "moderate"
 or "strong" evidence that rests on it. That last rule rests on the prompt;
-the flag adds no number to the ones a reply may quote.
+the flag adds no number to the ones a reply may quote. A reply is also
+sent back when its title, description, rationale or evidence copies a
+field name from the data, meaning any lower-case word joined by an
+underscore such as `small_sample` or `few_mentions` (prompt rule 17 asks
+for plain words such as "small sample" or "too few reviews to tell").
 
 **Flags.**
 

@@ -29,6 +29,7 @@ from daylight_sentiment.domain.action_items import (
     build_summary,
     build_trend,
     count_negative_themes,
+    field_identifiers,
     format_action_items,
     months_before,
     theme_key,
@@ -1400,6 +1401,44 @@ class TestBannedWording:
         validate_action_items(reply, summary_for(sector_groups=(("Meaningful Group", False),)))
 
 
+class TestFieldIdentifiers:
+    @pytest.mark.parametrize("text, found", [
+        ("Marked small_sample: true.", ["small_sample"]),
+        ("few_mentions and negative_share_pct", ["few_mentions", "negative_share_pct"]),
+        ("(review_source) and review_source again", ["review_source"]),
+        ("share_of_reviews_pct was 12.5%", ["share_of_reviews_pct"]),
+        ("top_3_themes", ["top_3_themes"]),
+    ])
+    def test_snake_case_words_are_found(self, text, found):
+        assert field_identifiers(text) == found
+
+    @pytest.mark.parametrize("text", [
+        "A small sample: too few reviews to tell.",
+        "40 of 120 reviews (33.3%) were negative in 2026-09.",
+        "Check the well-known E27 bulb from 1 March 2026.",
+        "Product D35500 had 1,200 reviews, 12 per cent negative.",
+        "A Mixed_Case or ALL_CAPS name, and _leading or trailing_ underscores.",
+    ])
+    def test_ordinary_text_is_accepted(self, text):
+        assert field_identifiers(text) == []
+
+    @pytest.mark.parametrize("field", ["title", "description", "rationale", "evidence"])
+    def test_reply_using_them_fails_and_names_them(self, field):
+        reply = good_reply()
+        reply["items"][0][field] = "Review the stand: small_sample and few_mentions."
+        with pytest.raises(ActionItemsValidationError,
+                           match=f"item 1 {field} copies field names from the data: "
+                                 "small_sample, few_mentions; write them in plain words "
+                                 'such as "small sample" or "too few reviews"'):
+            validate_action_items(reply, AREAS)
+
+    def test_plain_reply_is_accepted(self):
+        reply = good_reply()
+        reply["items"][0]["rationale"] = ("A small sample, so there are too few reviews "
+                                          "to tell; a well-known, low-cost fix.")
+        validate_action_items(reply, AREAS)
+
+
 def few_mentions_rows(earlier_negatives, recent_negatives):
     """One sector group with 50 earlier and 20 recent reviews, the given
     numbers of them negative and mentioning "flicker"."""
@@ -1477,7 +1516,9 @@ class TestReliabilityPromptRules:
                 "there are too few reviews to tell.",
                 "16. This period alone. Write the items for this period only. Other periods "
                 "get their own items, so do not repeat an issue only because it appears in "
-                "another period."):
+                "another period.",
+                "17. Never copy field names, flags or true/false values from the data into "
+                'an item. Say "small sample" or "too few reviews to tell" in plain words.'):
             assert rule in flat, rule
         assert '"few_mentions": false' in raw
 
@@ -1497,6 +1538,19 @@ class TestRetryOnTheNewChecks:
                 in retry)
         assert ("item 2 is an 'early signal' but its title starts with 'Fix'; start it with "
                 "Monitor, Investigate or Review") in retry
+
+    def test_field_name_triggers_the_single_retry_with_the_error(self):
+        bad = dataset_reply()
+        bad["items"][0]["evidence"] = "This group is marked small_sample: true."
+        analyzer = FakeAnalyzer(replies=[bad, dataset_reply()])
+        repo = FakeRepository(dataset())
+        outcome = TestGenerate().generate(analyzer, repo)
+        assert len(analyzer.calls) == 2 and len(repo.saved) == 1
+        assert not outcome.failed
+        assert ("item 1 evidence copies field names from the data: small_sample; write "
+                'them in plain words such as "small sample" or "too few reviews"'
+                in analyzer.calls[1][0])
+        assert "small_sample" not in json.dumps(repo.saved, default=str)
 
     def test_failing_twice_saves_nothing(self):
         bad = dataset_reply()

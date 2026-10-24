@@ -542,6 +542,10 @@ as an "early signal"; those rules rest on the prompt. The flag is a
 boolean, so `summary_numbers()` skips it and the accepted numbers are
 unchanged. Rule 16 asks for each window's items to stand on that window
 alone, without repeating an issue only because another window has it.
+The same four fields must contain no lower-case snake_case word
+(`field_identifiers()`, e.g. `small_sample`, `negative_share_pct`), so no
+field name or flag reaches the reader; the error names each one and asks
+for plain words, and prompt rule 17 says the same.
 
 **Retry.** If validation fails, one retry: the same prompt plus "Your
 previous reply failed because: <the errors>". Each failure is logged as a

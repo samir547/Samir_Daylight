@@ -69,6 +69,12 @@ BANNED_WORDING_FIELDS = ("title", "description", "rationale", "evidence")
 _BANNED = re.compile(r"\b(?:" + "|".join(w.replace(" ", r"\s+") for w in BANNED_WORDS)
                      + r")\b", re.I)
 _FIRST_WORD = re.compile(r"[^\W\d_]+")
+# Field names and flags from the summary ("small_sample", "few_mentions",
+# "negative_share_pct"...) mean nothing to the reader; a lower-case
+# snake_case word is rejected in IDENTIFIER_FIELDS.
+IDENTIFIER_FIELDS = ("title", "description", "rationale", "evidence")
+IDENTIFIER_PLAIN_WORDS = ('"small sample"', '"too few reviews"')
+_IDENTIFIER = re.compile(r"(?<!\w)[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?!\w)")
 
 # Caps follow dbo.sentiment_action_items: title NVARCHAR(200), related_area
 # NVARCHAR(100), evidence_strength NVARCHAR(20). The NVARCHAR(MAX) text
@@ -722,6 +728,16 @@ def banned_wording(text: str) -> List[str]:
     return found
 
 
+def field_identifiers(text: str) -> List[str]:
+    """The lower-case snake_case words in ``text`` ("small_sample"), each
+    once, in the order they first appear."""
+    found: List[str] = []
+    for m in _IDENTIFIER.finditer(text):
+        if m.group(0) not in found:
+            found.append(m.group(0))
+    return found
+
+
 def title_verb(title: str) -> str:
     """The first word of ``title``, lower-cased ("" if it has none)."""
     m = _FIRST_WORD.search(title)
@@ -759,6 +775,12 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
             if banned:
                 problems.append(f"item {i} {name} uses wording the summary cannot support: "
                                 f"{', '.join(banned)}")
+        if name in IDENTIFIER_FIELDS:
+            identifiers = field_identifiers(value)
+            if identifiers:
+                problems.append(f"item {i} {name} copies field names from the data: "
+                                f"{', '.join(identifiers)}; write them in plain words such "
+                                f"as {' or '.join(IDENTIFIER_PLAIN_WORDS)}")
 
     if "related_area" in clean:
         area = canonical.get(clean["related_area"].casefold())
@@ -797,7 +819,8 @@ def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str,
     the description, rationale and evidence must be in the summary (dates,
     years and periods aside; a percentage may be rounded to a whole
     number). None of BANNED_WORDS may appear in the title, description,
-    rationale or evidence, and an "early signal" title may not start with
+    rationale or evidence, nor may a snake_case field name such as
+    "small_sample", and an "early signal" title may not start with
     one of STRONG_ACTION_VERBS. Anything short of
     exactly ITEM_COUNT complete items raises ActionItemsValidationError,
     whose message lists every problem found: a partial set is never

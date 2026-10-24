@@ -160,6 +160,8 @@ Rules:
 16. This period alone. Write the items for this period only. Other periods
     get their own items, so do not repeat an issue only because it appears
     in another period.
+17. Never copy field names, flags or true/false values from the data into
+    an item. Say "small sample" or "too few reviews to tell" in plain words.
 
 Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
 {{"items": [
