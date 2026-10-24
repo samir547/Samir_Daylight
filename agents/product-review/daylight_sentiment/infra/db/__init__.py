@@ -2,7 +2,8 @@
 API (ISSUE-07):
 
     connection.py         connect() + the idempotent schema-migration registry
-    review_repository.py  ReviewRepository -- review-row upserts
+    review_repository.py  ReviewRepository -- review-row upserts and the
+                          lookup of uids that already have an analysis
     run_repository.py     RunRepository -- run-summary upserts
     action_item_repository.py
                           ActionItemRepository -- reads analysed reviews from
@@ -18,6 +19,9 @@ from daylight_sentiment.infra.db.connection import (  # noqa: F401
     connect,
     ensure_schema,
 )
-from daylight_sentiment.infra.db.review_repository import ReviewRepository  # noqa: F401
+from daylight_sentiment.infra.db.review_repository import (  # noqa: F401
+    ExistingReviewsReadError,
+    ReviewRepository,
+)
 from daylight_sentiment.infra.db.run_repository import RunRepository  # noqa: F401
 from daylight_sentiment.infra.db.action_item_repository import ActionItemRepository  # noqa: F401

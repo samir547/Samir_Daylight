@@ -57,6 +57,13 @@ class TestFilePattern:
             assert not pattern.matches(f"{stem}.xls")
             assert not pattern.matches(f"{stem}.csv.bak")
 
+    def test_excel_lock_files_never_match(self):
+        src = SourceFiles()
+        assert not src.trustpilot_product_pattern.matches("~$trustpilot-product-reviews.xlsx")
+        assert not src.amazon_product_pattern.matches("~$amazon_product_reviews_all.csv")
+        # Only a leading "~$" marks a lock file.
+        assert src.amazon_product_pattern.matches("amazon ~$ product.xlsx")
+
     def test_describe(self):
         assert SourceFiles().trustpilot_product_pattern.describe() == (
             "*trustpilot*product*.{xlsx,csv}")
@@ -95,6 +102,22 @@ class TestResolveSourceFile:
         os.utime(xlsx, (now + 100, now + 100))
         assert resolve_source_file(pattern, tmp_path) == xlsx
 
+    def test_newer_excel_lock_file_is_ignored(self, tmp_path):
+        import os
+        export = tmp_path / "trustpilot-product-reviews 901.xlsx"
+        lock = tmp_path / "~$trustpilot-product-reviews 901.xlsx"
+        export.write_bytes(b"x")
+        lock.write_bytes(b"owner")
+        now = time.time()
+        os.utime(export, (now - 100, now - 100))
+        os.utime(lock, (now, now))
+        assert resolve_source_file(TP_PRODUCT, tmp_path) == export
+
+    def test_only_a_lock_file_is_no_match(self, tmp_path):
+        (tmp_path / "~$trustpilot-product-reviews.xlsx").write_bytes(b"owner")
+        with pytest.raises(FileNotFoundError, match="No file in .* matches"):
+            resolve_source_file(TP_PRODUCT, tmp_path)
+
     def test_directories_named_like_a_match_are_ignored(self, tmp_path):
         (tmp_path / "trustpilot product.csv").mkdir()
         with pytest.raises(FileNotFoundError):
@@ -131,6 +154,17 @@ class TestSharePointSelection:
         items[0]["lastModifiedDateTime"] = "2026-09-20T00:00:00Z"
         assert select_items_by_patterns(items, [pattern])[0]["name"] == (
             "amazon product reviews.csv")
+
+    def test_newer_excel_lock_file_is_not_picked(self):
+        items = [self._item("trustpilot-product-reviews 901.xlsx", "2026-09-01T00:00:00Z"),
+                 self._item("~$trustpilot-product-reviews 901.xlsx", "2026-09-15T00:00:00Z")]
+        assert select_items_by_patterns(items, [TP_PRODUCT])[0]["name"] == (
+            "trustpilot-product-reviews 901.xlsx")
+
+    def test_only_a_lock_file_is_no_match(self):
+        with pytest.raises(RuntimeError, match="no file matching"):
+            select_items_by_patterns([self._item("~$trustpilot-product-reviews.xlsx")],
+                                     [TP_PRODUCT])
 
     def test_no_match_message_names_both_extensions(self):
         with pytest.raises(RuntimeError, match=r"\*amazon\*product\*\.\{xlsx,csv\}"):

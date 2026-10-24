@@ -105,6 +105,20 @@ supported indefinitely.
 
 6. all_reviews = load_reviews(build_default_sources(config.sources))
        each ReviewSource fetches + normalises; uid = f"{source}:{type}:{review_id}"
+   all_reviews = all_reviews[:--limit]             [if --limit]
+   all_reviews = drop_already_analysed(...)        [if DB_* set, not --fresh-start /
+                                                    --reanalyse-existing]
+       ReviewRepository.fetch_analysed_uids(): uids already stored with
+       sentiment IS NOT NULL are left out (history is frozen once scored);
+       --rerun-product-reviews / --rerun-service-reviews exempt that type;
+       blank review_ids (uid ...:row<N>) are never matched, WARNING with count.
+       ExistingReviewsReadError (database unreadable) -> logged at ERROR,
+       main() exits 1 before anything is analysed
+   if the lookup left out every loaded review:
+       finish_without_new_reviews()
+       move_synced_files_to_processed()            [if a sync ran, not --skip-db-load]
+       return 0                                    <-- early exit
+       # nothing analysed, written, loaded or translated; no action items
 
 7. analyzer = build_analyzer(config)               -> analyzer registered for
                                                       config.llm_provider (Claude)
@@ -154,23 +168,33 @@ supported indefinitely.
   trusted from the checkpoint — a failed rerun can't blank out good data.
 - Translation state (`review_text_en IS NULL`) is independent of the sentiment
   checkpoint in both directions.
+- A review already stored with a sentiment is never re-analysed or
+  re-upserted unless a flag asks for it, and a database that can't be read
+  stops the run rather than making every review look new.
+- A SharePoint file moves to Processed only once its reviews are confirmed
+  in the database: by step 11's load, or by step 6's lookup finding all of
+  them already stored.
 - A run with nothing new in SharePoint does no work at all. The cost: rows
   whose translation failed earlier (normally retried on every run) are not
   retried on such a run; they are picked up by the next run that has new
   files, or by `python -m scripts.translate_reviews`.
 
-**Exit codes:** `0` finished, including the "nothing new in SharePoint" early
-exit; `1` fatal LLM provider error (`FatalProviderError`), or
-`--action-items-only` failed; `2` SharePoint sign-in needed
+**Exit codes:** `0` finished, including the "nothing new in SharePoint" and
+"every review already in the database" early exits; `1` fatal LLM provider
+error (`FatalProviderError`), the stored analyses couldn't be read
+(`ExistingReviewsReadError`), or `--action-items-only` failed; `2` SharePoint sign-in needed
 (`SharePointSignInRequiredError`).
 
 ## 4. Data sources & the `uid` key
 
 | Source | ReviewSource | Format | Rows |
 |---|---|---|---|
-| Trustpilot product | `TrustpilotProductSource` | `.xlsx` | 872 |
-| Trustpilot service | `TrustpilotServiceSource` | `.xlsx` | 1,395 |
-| Amazon product | `AmazonBrightDataSource` | `.csv` | 666 (of 672 — 6 dropped for scrape errors) |
+| Trustpilot product | `TrustpilotProductSource` | `.xlsx` or `.csv` | 872 |
+| Trustpilot service | `TrustpilotServiceSource` | `.xlsx` or `.csv` | 1,395 |
+| Amazon product | `AmazonBrightDataSource` | `.xlsx` or `.csv` | 666 (of 672 — 6 dropped for scrape errors) |
+
+Every source accepts either format; `read_table()` picks the reader from the
+file's own extension.
 
 New sources implement the `ReviewSource` protocol (`name` +
 `fetch() -> list[dict]`) and get added to `build_default_sources()` — not
@@ -286,9 +310,15 @@ individually, so when one review in a batch fails, the others in the batch
 are still checkpointed as done and only the failed one is analysed again
 next run.
 
-**Resume is the default**; `--fresh-start` is the only way to force a full
-reprocess. `--rerun-product-reviews` / `--rerun-service-reviews`
-(`apply_rerun_flags()`) reopen just one review type — use after a taxonomy or
+**Resume is the default**, and the checkpoint is not the only record of
+what's done: before analysis, `drop_already_analysed()` leaves out every
+loaded review the database already holds a sentiment for (§3 step 6), since
+the checkpoint is only a local file (a new machine or a fresh checkout has
+none) and the database is the durable record. `--fresh-start` is the only way
+to force a full reprocess (it ignores both). `--reanalyse-existing` ignores
+only the database check, for every source. `--rerun-product-reviews` /
+`--rerun-service-reviews` (`apply_rerun_flags()`, plus the same exemption in
+the database check) reopen just one review type — use after a taxonomy or
 prompt change; combine both to reopen everything without `--fresh-start`.
 
 ## 7. SharePoint sync (`infra/sharepoint_sync.py`)
@@ -300,7 +330,8 @@ whatever differently-named stale file was already there, rather than
 overwriting it.
 
 **Pattern matching:** files are selected purely by `FilePattern` (name tokens
-+ extension, e.g. *trustpilot*product*.xlsx); the newest match always wins,
++ an `.xlsx` or `.csv` extension, e.g. `*trustpilot*product*.{xlsx,csv}`;
+Excel `~$` lock files never match); the newest match always wins,
 on both sides — `select_items_by_patterns()` on SharePoint and
 `resolve_source_file()` locally. Neither side has a preferred/expected
 filename to check first: a renamed export — "(2)" suffix, fresh row count,
@@ -624,9 +655,10 @@ refactor; keep them green.
 | `--model` | Override the provider's model for this run (wins over `CLAUDE_MODEL`) |
 | `--limit N` | Smoke-test on the first N reviews |
 | `--workers`, `--batch-size` | Worker threads / reviews per unit of work (defaults 8 / 10, defined in Config only) |
-| `--fresh-start` | Ignore the checkpoint; reprocess every review |
-| `--rerun-product-reviews` | Reopen only product reviews (both sources) for reprocessing |
-| `--rerun-service-reviews` | Reopen only service reviews; combine with the above to reopen all |
+| `--fresh-start` | Ignore the checkpoint and the stored results; reprocess every review |
+| `--reanalyse-existing` | Analyse reviews even if the database already has a sentiment for them (every source); still resumes from the checkpoint |
+| `--rerun-product-reviews` | Reopen only product reviews (both sources) for reprocessing, including ones already in the database |
+| `--rerun-service-reviews` | Reopen only service reviews, including ones already in the database; combine with the above to reopen all |
 | `--skip-sharepoint-sync` | Use whatever's already in `Reviews/` |
 | `--skip-db-load` | Analyze and write JSON, but don't load the DB (or delete JSON) |
 | `--skip-translation` | Don't run the translation pass |

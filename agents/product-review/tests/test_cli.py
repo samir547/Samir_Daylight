@@ -10,6 +10,7 @@ from daylight_sentiment import cli
 from daylight_sentiment.application.checkpoint import CheckpointWriter, load_checkpoint
 from daylight_sentiment.cli import apply_rerun_flags, build_config, parse_args
 from daylight_sentiment.config import Config, DatabaseSettings, LLMProvider
+from daylight_sentiment.infra.db import review_repository
 from daylight_sentiment.infra.sharepoint_sync import (
     SharePointSignInRequiredError,
     SourceSyncResult,
@@ -135,6 +136,37 @@ REAL_BUILD_ANALYZER = cli.build_analyzer
 REAL_RUN_ACTION_ITEMS = cli.run_action_items
 
 
+class FakeReviewsConn:
+    """Answers the two statements fetch_analysed_uids() sends, from
+    state["stored"], and records which uids were asked about."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def cursor(self):
+        state = self.state
+
+        class Cursor:
+            def execute(self, sql, params=()):
+                if sql.startswith("SELECT OBJECT_ID"):
+                    self._rows = [(1,)]
+                    return
+                assert "sentiment IS NOT NULL" in sql
+                state["asked"] = (state["asked"] or []) + list(params)
+                self._rows = [(u,) for u in params if state["stored"].get(u) is not None]
+
+            def fetchone(self):
+                return self._rows[0]
+
+            def fetchall(self):
+                return self._rows
+
+        return Cursor()
+
+    def close(self):
+        pass
+
+
 def _sync_results(*synced_keys):
     results = {}
     for key in SOURCE_KEYS:
@@ -153,7 +185,8 @@ class TestMainPhases:
     def run(self, monkeypatch, tmp_path):
         calls = []
         state = {"sync": None, "move": None, "results": [NEW_RESULT], "done": {},
-                 "action": None, "action_kwargs": []}
+                 "action": None, "action_kwargs": [], "reviews": [], "stored": {},
+                 "db_error": None, "connects": 0, "asked": None, "analysed": None}
         config = Config(db=DatabaseSettings(server="s", name="n", user="u", password="p"))
         config.output_dir = tmp_path
 
@@ -177,9 +210,22 @@ class TestMainPhases:
             def __init__(self, config, analyzer):
                 pass
 
-            def process_all_reviews(self, *a, **k):
+            def process_all_reviews(self, reviews, *a, **k):
                 calls.append("process_all_reviews")
+                state["analysed"] = [r["uid"] for r in reviews]
                 return list(state["results"])
+
+        def fake_load_reviews(sources):
+            calls.append("load_reviews")
+            return [dict(r) for r in state["reviews"]]
+
+        def fake_connect(settings):
+            # Behind the real ReviewRepository.fetch_analysed_uids(): the
+            # stored rows are state["stored"] = {uid: sentiment or None}.
+            state["connects"] += 1
+            if state["db_error"]:
+                raise state["db_error"]
+            return FakeReviewsConn(state)
 
         def fake_move(config, sync_results):
             calls.append("move_synced_files_to_processed")
@@ -195,7 +241,8 @@ class TestMainPhases:
 
         summary = {"total_reviews_analyzed": 0, "failed_reviews": 0, "overall_sentiment": {}}
         monkeypatch.setattr(cli, "sync_sharepoint", fake_sync)
-        monkeypatch.setattr(cli, "load_reviews", record("load_reviews", []))
+        monkeypatch.setattr(cli, "load_reviews", fake_load_reviews)
+        monkeypatch.setattr(review_repository, "connect", fake_connect)
         monkeypatch.setattr(cli, "build_analyzer", record("build_analyzer", object()))
         monkeypatch.setattr(cli, "resume_state", lambda *a: dict(state["done"]))
         monkeypatch.setattr(cli, "MultiSourcePipeline", FakePipeline)
@@ -270,6 +317,167 @@ class TestMainPhases:
     def test_sync_only_with_nothing_new_exits_0(self, run):
         code, calls = run(["--sync-sharepoint-only"], sync=_sync_results())
         assert code == 0 and calls == ["sync_sharepoint"]
+
+
+def _review(review_id, review_type="product", source="trustpilot", idx=0):
+    rid = review_id or f"row{idx}"
+    return {"review_id": review_id, "review_type": review_type, "review_source": source,
+            "uid": f"{source}:{review_type}:{rid}", "text": "fine"}
+
+
+P1, P2 = _review("p1"), _review("p2", source="amazon")
+S1 = _review("s1", review_type="service")
+LOADED = [P1, P2, S1]
+ALL_STORED = {r["uid"]: "positive" for r in LOADED}
+# Everything after the existing-review lookup that analyses, writes, loads,
+# translates or generates.
+ANALYSIS_PHASES = WORK_PHASES - {"load_reviews", "move_synced_files_to_processed"}
+
+
+class TestSkipAlreadyAnalysed:
+    """Reviews the database already holds a sentiment for are left out before
+    analysis. The real drop_already_analysed() and
+    ReviewRepository.fetch_analysed_uids() run against a fake connection."""
+
+    run = TestMainPhases.run
+
+    @pytest.fixture(autouse=True)
+    def _info_logs(self, caplog):
+        caplog.set_level("INFO", logger="multi_source_sentiment")
+
+    def _go(self, run, argv=(), stored=None, reviews=LOADED, **kw):
+        run.state["reviews"] = reviews
+        run.state["stored"] = dict(stored or {})
+        return run(list(argv), **kw)
+
+    def test_parse_args_flag(self):
+        assert parse_args(["--reanalyse-existing"]).reanalyse_existing
+        assert not parse_args([]).reanalyse_existing
+
+    def test_none_existing_analyses_everything(self, run, caplog):
+        code, calls = self._go(run)
+        assert code == 0 and WORK_PHASES - {"move_synced_files_to_processed"} <= set(calls)
+        assert run.state["analysed"] == [r["uid"] for r in LOADED]
+        assert sorted(run.state["asked"]) == sorted(r["uid"] for r in LOADED)
+        assert ("Reviews loaded: 3; already analysed in the database (skipped): 0; "
+                "to analyse: 3") in caplog.text
+
+    def test_mixed_analyses_only_the_new_ones(self, run, caplog):
+        code, calls = self._go(run, stored={P1["uid"]: "negative"})
+        assert code == 0 and "run_action_items" in calls
+        assert run.state["analysed"] == [P2["uid"], S1["uid"]]
+        assert ("Reviews loaded: 3; already analysed in the database (skipped): 1; "
+                "to analyse: 2") in caplog.text
+
+    def test_all_existing_does_no_work(self, run, caplog):
+        code, calls = self._go(run, stored=ALL_STORED)
+        assert code == 0
+        assert calls == ["sync_sharepoint", "load_reviews"]
+        assert ("Reviews loaded: 3; already analysed in the database (skipped): 3; "
+                "to analyse: 0") in caplog.text
+        assert "Every loaded review is already analysed in the database" in caplog.text
+
+    def test_failed_analysis_row_is_retried(self, run):
+        # A stored row with no sentiment (its analysis failed) isn't "existing".
+        code, _ = self._go(run, stored={P1["uid"]: None, P2["uid"]: "positive",
+                                        S1["uid"]: "neutral"})
+        assert code == 0 and run.state["analysed"] == [P1["uid"]]
+
+    @pytest.mark.parametrize("error", [OSError("Login timeout expired"),
+                                       RuntimeError("Communication link failure")])
+    def test_database_unreachable_stops_before_any_analysis(self, run, caplog, error):
+        run.state["db_error"] = error
+        code, calls = self._go(run, sync=_sync_results("trustpilot_product"))
+        assert code == 1
+        assert calls == ["sync_sharepoint", "load_reviews"]
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 2
+        assert "Stopping before any analysis: Could not read the stored analyses" in errors[0]
+        assert str(error) in errors[0]
+        assert "--reanalyse-existing" in errors[1]
+
+    def test_rerun_product_reanalyses_stored_product_reviews_only(self, run):
+        code, _ = self._go(run, ["--rerun-product-reviews"], stored=ALL_STORED)
+        assert code == 0
+        assert run.state["analysed"] == [P1["uid"], P2["uid"]]
+        assert run.state["asked"] == [S1["uid"]]
+
+    def test_rerun_service_reanalyses_stored_service_reviews_only(self, run):
+        code, _ = self._go(run, ["--rerun-service-reviews"], stored=ALL_STORED)
+        assert code == 0 and run.state["analysed"] == [S1["uid"]]
+        assert sorted(run.state["asked"]) == sorted([P1["uid"], P2["uid"]])
+
+    def test_both_rerun_flags_reanalyse_everything_without_a_lookup(self, run):
+        code, _ = self._go(run, ["--rerun-product-reviews", "--rerun-service-reviews"],
+                           stored=ALL_STORED)
+        assert code == 0 and run.state["analysed"] == [r["uid"] for r in LOADED]
+        assert run.state["connects"] == 0
+
+    @pytest.mark.parametrize("flag", ["--fresh-start", "--reanalyse-existing"])
+    def test_flag_turns_the_skip_off_for_every_source(self, run, caplog, flag):
+        code, calls = self._go(run, [flag], stored=ALL_STORED)
+        assert code == 0 and "run_action_items" in calls
+        assert run.state["analysed"] == [r["uid"] for r in LOADED]
+        assert run.state["connects"] == 0
+        assert f"{flag}: not skipping reviews already analysed in the database" in caplog.text
+
+    def test_database_not_configured_turns_the_skip_off(self, run, caplog):
+        run.config.db = DatabaseSettings()
+        code, _ = self._go(run, stored=ALL_STORED)
+        assert code == 0 and run.state["analysed"] == [r["uid"] for r in LOADED]
+        assert run.state["connects"] == 0
+        assert caplog.text.count("can't skip reviews already analysed in the database") == 1
+
+    def test_blank_review_id_is_never_skipped_and_warns(self, run, caplog):
+        blank = [_review(None, idx=0), _review("", source="amazon", idx=1)]
+        stored = {**ALL_STORED, **{r["uid"]: "positive" for r in blank}}
+        code, _ = self._go(run, stored=stored, reviews=LOADED + blank)
+        assert code == 0
+        assert run.state["analysed"] == [r["uid"] for r in blank]
+        assert sorted(run.state["asked"]) == sorted(r["uid"] for r in LOADED)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1 and warnings[0].startswith("2 loaded review(s) have no review_id")
+
+    def test_limit_applies_before_the_lookup(self, run):
+        code, _ = self._go(run, ["--limit", "2"])
+        assert code == 0 and sorted(run.state["asked"]) == sorted([P1["uid"], P2["uid"]])
+
+    def test_sharepoint_all_existing_moves_files_and_does_nothing_else(self, run, caplog):
+        code, calls = self._go(run, stored=ALL_STORED,
+                               sync=_sync_results("trustpilot_product", "amazon_brightdata"))
+        assert code == 0
+        assert calls == ["sync_sharepoint", "load_reviews", "move_synced_files_to_processed"]
+        assert not ANALYSIS_PHASES & set(calls)
+        assert "nothing new to analyse, load, translate or generate action items" in caplog.text
+
+    def test_sharepoint_all_existing_with_skip_db_load_moves_nothing(self, run, caplog):
+        code, calls = self._go(run, ["--skip-db-load"], stored=ALL_STORED,
+                               sync=_sync_results("trustpilot_product"))
+        assert code == 0 and calls == ["sync_sharepoint", "load_reviews"]
+        assert "not moving any SharePoint files to Processed" in caplog.text
+
+    def test_sharepoint_all_existing_sign_in_required_on_move_exits_2(self, run):
+        code, calls = self._go(run, stored=ALL_STORED,
+                               sync=_sync_results("trustpilot_product"),
+                               move=SharePointSignInRequiredError("sign in please"))
+        assert code == 2 and calls[-1] == "move_synced_files_to_processed"
+
+    def test_sharepoint_mixed_runs_the_normal_path_and_moves_after_load(self, run):
+        code, calls = self._go(run, stored={P1["uid"]: "positive"},
+                               sync=_sync_results("trustpilot_product"))
+        assert code == 0 and WORK_PHASES <= set(calls)
+        assert calls.index("load_database") < calls.index("move_synced_files_to_processed")
+        assert run.state["analysed"] == [P2["uid"], S1["uid"]]
+
+    @pytest.mark.parametrize("argv, expected", [
+        (["--load-db-only"], ["load_database", "delete_analysis_outputs"]),
+        (["--action-items-only"], ["build_analyzer", "run_action_items"]),
+    ])
+    def test_load_db_only_and_action_items_only_never_look_up(self, run, argv, expected):
+        code, calls = self._go(run, argv, stored=ALL_STORED,
+                               sync=_sync_results("trustpilot_product"))
+        assert code == 0 and calls == expected
+        assert run.state["connects"] == 0
 
 
 class TestActionItemsWiring:

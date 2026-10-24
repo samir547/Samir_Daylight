@@ -90,6 +90,10 @@ class DatabaseSettings:
 # reader from the file's own extension (see review_sources/base.read_table).
 REVIEW_FILE_EXTENSIONS = (".xlsx", ".csv")
 
+# Excel writes "~$<name>.xlsx" next to a workbook while it is open: a tiny
+# owner file, not an export, that would otherwise match and (being newest) win.
+OFFICE_LOCK_FILE_PREFIX = "~$"
+
 
 @dataclass(frozen=True)
 class FilePattern:
@@ -97,7 +101,9 @@ class FilePattern:
     appear in the name (case-insensitive) and the name must end in one of the
     extensions. This is what survives a fresh export being renamed ("(2)"
     suffixes, new row counts, date stamps) where an exact-filename match
-    hard-fails. A single extension may be passed as a plain string."""
+    hard-fails. A single extension may be passed as a plain string. Office
+    lock files ("~$..." names) never match, so neither the local lookup nor
+    the SharePoint pick-up can choose one."""
     tokens: tuple
     extensions: tuple = REVIEW_FILE_EXTENSIONS
 
@@ -106,6 +112,8 @@ class FilePattern:
         object.__setattr__(self, "extensions", tuple(e.lower() for e in exts))
 
     def matches(self, name: str) -> bool:
+        if name.startswith(OFFICE_LOCK_FILE_PREFIX):
+            return False
         low = name.lower()
         return low.endswith(self.extensions) and all(t in low for t in self.tokens)
 

@@ -167,6 +167,23 @@ class TestSyncFromSubfolders:
         assert ("No new file waiting in SharePoint's TrustPilot/Service/In Progress for "
                 "trustpilot_service -- skipping this source for this run") in caplog.text
 
+    def test_excel_lock_files_are_never_downloaded(self, syncer, monkeypatch, tmp_path):
+        # Someone has the export open in Excel: its "~$" owner file sits next
+        # to it (newer) in one folder, and alone in the other.
+        lock = {"id": "LOCK", "name": "~$trustpilot-product-reviews 901.xlsx",
+                "lastModifiedDateTime": "2026-09-21T00:00:00Z"}
+        listed = {"TrustPilot/Product/In Progress": [self.PRODUCT_ITEM, lock],
+                  "TrustPilot/Service/In Progress": [
+                      {"id": "LOCK2", "name": "~$TrustPilot Service Reviews.xlsx"}]}
+        monkeypatch.setattr(syncer, "_list_items_in", lambda sub: listed[sub])
+        downloaded = []
+        monkeypatch.setattr(syncer, "_download_item",
+                            lambda item, d: downloaded.append(item["name"]) or d / item["name"])
+        results = syncer.sync_from_subfolders(tmp_path, self.SPECS)
+        assert results["trustpilot_product"].item is self.PRODUCT_ITEM
+        assert not results["trustpilot_service"].synced
+        assert downloaded == ["trustpilot-product-reviews 901.xlsx"]
+
     def test_all_empty_completes_with_nothing_synced(self, syncer, monkeypatch, tmp_path):
         monkeypatch.setattr(syncer, "_list_items_in", lambda sub: [])
         monkeypatch.setattr(syncer, "_download_item",

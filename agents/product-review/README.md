@@ -36,9 +36,10 @@ without touching the pipeline (see §5).
  └─────────────────┘
         │
         ▼
- ┌─────────────────┐   _load_checkpoint() (always, unless --fresh-start)
- │  3. CHECKPOINT    │  filters out uids already successfully analyzed
- │     FILTER        │  in a prior run
+ ┌─────────────────┐   drop_already_analysed() (if DB_* set), then
+ │  3. ALREADY-DONE  │  _load_checkpoint() (unless --fresh-start): leaves
+ │     FILTER        │  out uids the database already holds a sentiment
+ │                    │  for, then uids the checkpoint has as analysed
  └─────────────────┘
         │
         ▼
@@ -98,7 +99,9 @@ vars aren't set or `--skip-sharepoint-sync` is passed — see §7.4. Stages 8
 and 9 are each independently skippable (`--skip-db-load`, `--skip-translation`)
 and both depend on `DB_*` being set at all — see §7.4 and §8. Stage 10 runs
 only when stage 8 loaded reviews analysed in this run; `--skip-action-items`
-skips it (§7.6).
+skips it (§7.6). When stage 3 finds every loaded review already analysed in
+the database, the run stops there: stages 4–10 don't run, and only the
+synced SharePoint files are moved to "Processed" (§4.6).
 
 Step 5 happens continuously during step 4 (not after) — every individual
 result is flushed to the checkpoint file as soon as it's done, which is what
@@ -115,7 +118,9 @@ extension of `.xlsx` or `.csv`), and `resolve_source_file()`
 (`infra/review_sources/base.py`) always picks the newest file in `Reviews/`
 matching that pattern, whichever of the two formats it is. A renamed
 export — "(2)" suffix, fresh row count, date stamp — is resolved exactly
-like any other name; only a pattern with zero matches fails the run.
+like any other name; only a pattern with zero matches fails the run. Excel
+lock files (names starting with `~$`, which Excel leaves next to a workbook
+while it is open) never match, locally or in SharePoint.
 
 Every source can be supplied as Excel or CSV. `read_table()` (same module)
 reads the file by its real extension (`.xlsx` → `read_excel`, `.csv` →
@@ -162,8 +167,11 @@ Two cleanup steps happen here that don't happen for the Trustpilot sources:
 After loading, every review is a dict with at minimum:
 `review_id, review_type (product|service), review_source (trustpilot|amazon), rating, text, reviewer_name, review_date, uid`.
 `uid` is built as `{source}:{type}:{review_id}` (falling back to `row{index}`
-if `review_id` is blank) — this is the checkpoint key and the reason resume
-works safely across sources.
+if `review_id` is blank) — this is the checkpoint key, the database key, and
+the reason resume works safely across sources. The `row{index}` fallback is
+only the review's position in that run's combined load, so it can't be
+matched against stored results: such reviews are analysed on every run
+(§4.6).
 
 ## 4. Core logic implemented
 
@@ -228,7 +236,36 @@ translation pass sizes the limit to the text it sends
 two characters plus 200, at least 500 and at most 4,096, so a full
 6,000-character review gets 3,200.
 
-### 4.6 Checkpointing & resume
+### 4.6 Reviews already in the database, checkpointing & resume
+**History is frozen once scored.** Before anything is analysed, the run asks
+the database which of the reviews it just loaded (after `--limit`) already
+have a stored result — `ReviewRepository.fetch_analysed_uids()`, a read of
+`dbo.sentiment_analysis_reviews` for those `uid`s with `sentiment IS NOT
+NULL` — and leaves them out. They cost no LLM calls and their stored
+sentiment is never overwritten. The run logs the three counts:
+
+```
+Reviews loaded: 912; already analysed in the database (skipped): 870; to analyse: 42
+```
+
+- A stored row whose analysis failed (no sentiment) is not "existing": that
+  review is analysed again.
+- A review with a blank `review_id` is never skipped this way (its uid is
+  only a row position, see §3); a WARNING gives how many there are.
+- `--fresh-start` and `--reanalyse-existing` turn the check off for every
+  source. `--rerun-product-reviews` / `--rerun-service-reviews` turn it off
+  for that review type only. `--reanalyse-existing` still resumes from the
+  checkpoint; `--fresh-start` doesn't.
+- With no database configured (`DB_*` unset) the check is off and the log
+  says so once. If the database is configured but can't be read, the run
+  stops with exit code 1 before analysing anything — it never treats every
+  review as new.
+- If every loaded review is already in the database, there is nothing to
+  do: no analysis, no output files, no run row, no translation pass and no
+  action items. Files pulled from SharePoint are still moved to "Processed",
+  because the lookup has just confirmed their reviews are in the database
+  (with `--skip-db-load` they stay in "In Progress").
+
 Every completed result (success or failure) is appended to
 `multi_source_checkpoint.jsonl` as one JSON object per line, flushed
 immediately. Every run resumes from this file by default — `_load_checkpoint()`
@@ -236,7 +273,7 @@ reads it and keeps only rows with a non-null `analysis`; anything that
 previously errored is retried, not skipped. Because reviews fail
 individually, a run in which one review of a batch failed checkpoints the
 rest of that batch as done, and the next run analyses only the failed
-review. Pass `--fresh-start` to ignore it
+review. Pass `--fresh-start` to ignore it (and the database check above)
 and reprocess everything. The checkpoint is also filtered to only uids present
 in the *current* load of `Reviews/` (`wanted = {r["uid"] for r in all_reviews}`),
 so a stale checkpoint entry for data that's since been removed from the source
@@ -356,9 +393,9 @@ privately.
 ### 7.2 Run
 
 A plain run does all five steps in sequence: pull the 3 review exports from
-SharePoint into `Reviews/` (`SP_*` in `.env`), analyse every review (always
-resuming from the checkpoint — nothing is reprocessed unless you force it),
-load the two JSON outputs into SQL Server (`DB_*` in `.env`), delete those
+SharePoint into `Reviews/` (`SP_*` in `.env`), analyse every review that
+isn't already analysed in the database (§4.6), resuming from the checkpoint
+(nothing is reprocessed unless you force it), load the two JSON outputs into SQL Server (`DB_*` in `.env`), delete those
 two JSON files now that they're durable in the database, then translate any
 non-English reviews already in the database straight to `review_text_en`
 (skip with `--skip-translation`; see §7.4). The checkpoint
@@ -369,7 +406,11 @@ When SharePoint is configured and none of the three "In Progress" folders
 has a new file, the run logs `No new review files waiting in SharePoint;
 nothing to do` and exits with code 0 straight after the sync: no analysis,
 no output files, no database rows and no translation pass. This makes it
-safe to schedule the pipeline more often than new exports arrive.
+safe to schedule the pipeline more often than new exports arrive. A new
+file whose reviews are all already in the database is handled the same way
+after loading it — `Every loaded review is already analysed in the
+database; ...`, exit code 0, nothing analysed, written or translated — except
+that the file is moved to "Processed".
 
 ```bash
 # Smoke test — 20 reviews
@@ -382,8 +423,12 @@ python -m daylight_sentiment.cli --limit 20 --model <model-id>
 # loads to DB, deletes the JSON outputs once loaded
 python -m daylight_sentiment.cli --provider claude
 
-# Force a full reprocess, ignoring the checkpoint
+# Force a full reprocess, ignoring the checkpoint and the stored results
 python -m daylight_sentiment.cli --provider claude --fresh-start
+
+# Re-analyse reviews even if the database already has a result for them
+# (overwritten on load), still resuming from the checkpoint
+python -m daylight_sentiment.cli --provider claude --reanalyse-existing
 
 # Skip analysis entirely -- just load whatever's currently in
 # Trustpilot_Result/*.json into the database (and then delete them)
@@ -396,16 +441,21 @@ python -m daylight_sentiment.cli --provider claude --workers 4 --batch-size 5
 Flags: `--provider {claude}` (default `claude`), `--model <override>`
 (overrides `CLAUDE_MODEL`), `--limit N`, `--workers N` (default 8),
 `--batch-size N` (reviews per unit of work handed to a worker, default 10),
-`--fresh-start` (ignore the checkpoint), `--skip-sharepoint-sync`,
+`--fresh-start` (ignore the checkpoint and the stored results),
+`--reanalyse-existing` (analyse reviews the database already has a result
+for), `--rerun-product-reviews` / `--rerun-service-reviews` (the same, for one
+review type), `--skip-sharepoint-sync`,
 `--skip-db-load`, `--skip-translation`, `--load-db-only`,
 `--sync-sharepoint-only` (download the new files into `Reviews/` and stop),
 `--keep-output-files` (don't delete the JSON outputs after a successful DB
 load), `--skip-action-items`, `--action-items-months 3,6,12`,
 `--action-items-only`, `--action-items-dry-run` (see §7.6).
 
-Exit codes: `0` finished (including "nothing new in SharePoint"), `1` the
-Claude API rejected the run (key, billing or model — see §4.5), or
-`--action-items-only` couldn't produce the items for a window, `2`
+Exit codes: `0` finished (including "nothing new in SharePoint" and "every
+review already in the database"), `1` the Claude API rejected the run (key,
+billing or model — see §4.5), the database couldn't be read to find the
+reviews already analysed (§4.6), or `--action-items-only` couldn't produce
+the items for a window, `2`
 SharePoint sign-in is needed (see §7.5).
 
 Operator tools live in `scripts/` and are run as modules from the repo root
@@ -494,7 +544,9 @@ configured via env vars, skipped cleanly if they're absent:
   loading. Each source's "In Progress" folder may hold `.xlsx` or `.csv`
   files; the newest file matching the source's pattern wins, whichever
   format it is, and it is downloaded under its original name and moved to
-  "Processed" after a confirmed database load, exactly as before. Auth is MSAL against Microsoft Graph's `/shares` endpoint;
+  "Processed" after a confirmed database load, exactly as before (or, when
+  every review in it is already in the database, right after that is
+  confirmed — §4.6). Excel `~$` lock files are never picked. Auth is MSAL against Microsoft Graph's `/shares` endpoint;
   plain username/password (ROPC) is tried first but this account has MFA
   enforced, so it always falls back to an interactive device-code sign-in
   (prints a `microsoft.com/device` URL + code — a human has to complete it
