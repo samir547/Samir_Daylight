@@ -11,9 +11,15 @@ from daylight_sentiment.infra.review_sources.coercion import _clean_str, _safe_i
 
 logger = logging.getLogger("multi_source_sentiment")
 
+# Every column each loader reads; a file missing any of them is rejected.
+PRODUCT_COLUMNS = ("review_id", "stars", "product_name", "product_sku", "content",
+                   "consumer_name", "created_at")
+SERVICE_COLUMNS = ("Review Id", "Review Stars", "Review Title", "Review Content",
+                   "Review Username", "Review Created (UTC)")
+
 
 def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path)
+    df = read_table(path, PRODUCT_COLUMNS)
     reviews = []
     for _, row in df.iterrows():
         reviews.append({
@@ -32,7 +38,7 @@ def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
 
 
 def load_trustpilot_service(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path)
+    df = read_table(path, SERVICE_COLUMNS)
     reviews = []
     for _, row in df.iterrows():
         title = _clean_str(row.get("Review Title"))

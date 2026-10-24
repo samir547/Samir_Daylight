@@ -21,9 +21,15 @@ from daylight_sentiment.infra.review_sources.coercion import (
 
 logger = logging.getLogger("multi_source_sentiment")
 
+# Every column the loader reads; a file missing any of them is rejected.
+# "error" is optional: only scrapes that hit failures carry it.
+COLUMNS = ("review_id", "rating", "product_name", "asin", "model_number",
+           "review_country", "review_header", "review_text", "author_name",
+           "review_posted_date", "is_verified")
+
 
 def load_amazon_product(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path)
+    df = read_table(path, COLUMNS)
 
     # Scrape-failure rows carry an error code and no review payload.
     if "error" in df.columns:

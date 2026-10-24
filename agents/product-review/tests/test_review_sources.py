@@ -14,7 +14,11 @@ from daylight_sentiment.infra.review_sources import (
     build_default_sources,
     load_reviews,
 )
-from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
+from daylight_sentiment.infra.review_sources.base import (
+    MissingColumnsError,
+    read_table,
+    resolve_source_file,
+)
 from daylight_sentiment.infra.sharepoint_sync import select_items_by_patterns
 
 TP_PRODUCT = FilePattern(("trustpilot", "product"), ".xlsx")
@@ -250,6 +254,60 @@ class TestReadTable:
         path.write_bytes(b"")
         with pytest.raises(ValueError, match=r"t\.xls.*expected \.xlsx or \.csv"):
             read_table(path)
+
+
+TP_PRODUCT_ROW = {"review_id": "r1", "stars": 5, "product_name": "Lamp",
+                  "product_sku": "U25090", "content": "Great light",
+                  "consumer_name": "Pat", "created_at": "2026-01-01"}
+TP_SERVICE_ROW = {"Review Id": "s1", "Review Stars": 4, "Review Title": "Great",
+                  "Review Content": "Fast reply.", "Review Username": "Sam",
+                  "Review Created (UTC)": "2026-02-02"}
+AMAZON_ROW = {"review_id": "a1", "rating": 4, "product_name": "Lamp", "asin": "B01",
+              "model_number": "u25090", "review_country": "us", "review_header": "Wow",
+              "review_text": "Bright", "author_name": "A",
+              "review_posted_date": "2026-03-03", "is_verified": True}
+
+
+class TestMissingColumns:
+    @pytest.mark.parametrize("ext", ["xlsx", "csv"])
+    @pytest.mark.parametrize("source_cls, filename, row, dropped", [
+        (TrustpilotProductSource, "trustpilot-product-reviews", TP_PRODUCT_ROW,
+         ["product_sku", "created_at"]),
+        (TrustpilotServiceSource, "TrustPilot Service Reviews", TP_SERVICE_ROW,
+         ["Review Created (UTC)"]),
+        (AmazonBrightDataSource, "amazon_product_reviews_all", AMAZON_ROW,
+         ["is_verified", "review_country"]),
+    ])
+    def test_missing_columns_fail_naming_file_and_columns(
+            self, tmp_path, ext, source_cls, filename, row, dropped):
+        df = pd.DataFrame([{k: v for k, v in row.items() if k not in dropped}])
+        path = tmp_path / f"{filename}.{ext}"
+        if ext == "xlsx":
+            df.to_excel(path, index=False)
+        else:
+            df.to_csv(path, index=False)
+        with pytest.raises(MissingColumnsError) as exc:
+            source_cls(_sources_config(tmp_path)).fetch()
+        message = str(exc.value)
+        assert path.name in message
+        named = message.split("missing required column(s): ")[1].split(", ")
+        assert sorted(named) == sorted(dropped)
+
+    def test_header_only_file_with_every_column_loads_nothing(self, tmp_path):
+        pd.DataFrame(columns=list(TP_SERVICE_ROW)).to_csv(
+            tmp_path / "TrustPilot Service Reviews.csv", index=False)
+        assert TrustpilotServiceSource(_sources_config(tmp_path)).fetch() == []
+
+    def test_empty_csv_names_every_column(self, tmp_path):
+        (tmp_path / "amazon_product_reviews_all.csv").write_text(
+            "unrelated\n", encoding="utf-8")
+        with pytest.raises(MissingColumnsError, match="review_id, rating, .*is_verified"):
+            AmazonBrightDataSource(_sources_config(tmp_path)).fetch()
+
+    def test_amazon_error_column_is_optional(self, tmp_path):
+        pd.DataFrame([AMAZON_ROW]).to_csv(
+            tmp_path / "amazon_product_reviews_all.csv", index=False)
+        assert len(AmazonBrightDataSource(_sources_config(tmp_path)).fetch()) == 1
 
 
 class TestLoadReviews:

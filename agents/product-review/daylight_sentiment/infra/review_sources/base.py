@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Protocol, runtime_checkable
+from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
 
 import pandas as pd
 
@@ -38,17 +38,32 @@ def resolve_source_file(pattern: FilePattern, directory: Path) -> Path:
         f"No file in {directory} matches {pattern.describe()}")
 
 
-def read_table(path: Path) -> pd.DataFrame:
+class MissingColumnsError(ValueError):
+    """A review export lacks columns its loader reads. Raised instead of
+    loading the rows with those fields silently empty."""
+
+
+def read_table(path: Path, required: Sequence[str] = ()) -> pd.DataFrame:
     """Read a review export by its real extension: .xlsx through read_excel,
     .csv through read_csv. Every loader goes through here, so a source can be
-    supplied in either format and the column handling after it is shared."""
+    supplied in either format and the column handling after it is shared.
+
+    ``required`` lists the columns the loader reads; if any is absent the
+    whole file is rejected with MissingColumnsError naming the file and the
+    missing columns."""
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
-        return pd.read_excel(path)
-    if suffix == ".csv":
-        return pd.read_csv(path)
-    raise ValueError(f"{path}: unsupported review file type {path.suffix!r} "
-                     f"(expected .xlsx or .csv)")
+        df = pd.read_excel(path)
+    elif suffix == ".csv":
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"{path}: unsupported review file type {path.suffix!r} "
+                         f"(expected .xlsx or .csv)")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise MissingColumnsError(
+            f"{path} is missing required column(s): {', '.join(missing)}")
+    return df
 
 
 def load_reviews(sources: List[ReviewSource]) -> List[Dict[str, Any]]:
