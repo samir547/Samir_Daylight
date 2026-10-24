@@ -97,6 +97,11 @@ Rules:
     about that group itself (customers who did not say what they use the
     product for), never as a catch-all. Everywhere else, write names in
     plain words (for example "shipping quality", not "shipping_quality").
+13. "evidence_strength" is exactly one of "strong", "moderate" or
+    "early signal". Use "early signal" for an item that rests mainly on a
+    group marked "small_sample": true; it is required when "related_area"
+    is such a group. Use "strong" only for a large group with a clear
+    pattern.
 
 Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
 {{"items": [
@@ -105,7 +110,8 @@ Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
    "description": "<what to do, in 1 to 3 sentences>",
    "rationale": "<why, citing the numbers from the summary>",
    "related_area": "<one value from rule 8>",
-   "evidence": "<one plain sentence quoting the supporting counts>"}},
+   "evidence": "<one plain sentence quoting the supporting counts>",
+   "evidence_strength": "<strong, moderate or early signal>"}},
   {{"rank": 2, ...}},
   {{"rank": 3, ...}}
 ]}}"""

@@ -402,7 +402,8 @@ class TestActionItemsEndToEndOffline:
     REPLY = {"items": [
         {"rank": r, "title": f"Reduce glare {r}", "description": "Do it.",
          "rationale": "38 of 150 reviews are negative.", "related_area": "Beauty",
-         "evidence": "38 negative reviews mention glare."} for r in (1, 2, 3)]}
+         "evidence": "38 negative reviews mention glare.", "evidence_strength": "strong"}
+        for r in (1, 2, 3)]}
 
     def _setup(self, monkeypatch, reply):
         from datetime import date

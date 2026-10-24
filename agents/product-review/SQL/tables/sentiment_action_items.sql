@@ -18,10 +18,16 @@
 --                     the newest review date in the data, not the day they
 --                     were generated.
 --   reviews_analysed  how many analysed reviews fall in that window.
+--   evidence_strength 'strong', 'moderate' or 'early signal' ('early signal'
+--                     whenever related_area is a group with too few reviews
+--                     to be sure). NULL only on rows saved before the column
+--                     existed.
 --
 -- The pipeline creates this table itself (the "create_action_items_table"
--- entry in daylight_sentiment/infra/db/connection.py's MIGRATIONS); this file
--- is the canonical definition and is safe to re-run.
+-- and "add_action_items_evidence_strength" entries in
+-- daylight_sentiment/infra/db/connection.py's MIGRATIONS); this file is the
+-- canonical definition and is safe to re-run, including on a table created
+-- before evidence_strength existed.
 -- ============================================================================
 
 IF OBJECT_ID('dbo.sentiment_action_items', 'U') IS NULL
@@ -37,6 +43,7 @@ BEGIN
         rationale          NVARCHAR(MAX)    NOT NULL,   -- why, citing the numbers
         related_area       NVARCHAR(100)    NOT NULL,   -- sector group, service aspect, region or 'overall'
         evidence           NVARCHAR(MAX)    NOT NULL,   -- one sentence quoting the supporting counts
+        evidence_strength  NVARCHAR(20)     NULL,       -- strong / moderate / early signal
         window_start       DATE             NOT NULL,
         window_end         DATE             NOT NULL,
         reviews_analysed   INT              NOT NULL,
@@ -45,4 +52,10 @@ BEGIN
         CONSTRAINT UQ_sentiment_action_items_generation_rank UNIQUE (generation_id, [rank])
     );
 END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'evidence_strength')
+    ALTER TABLE dbo.sentiment_action_items ADD evidence_strength NVARCHAR(20) NULL;
 GO

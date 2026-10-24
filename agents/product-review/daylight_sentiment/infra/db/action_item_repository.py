@@ -29,8 +29,9 @@ class ActionItemRepository:
     NEGATIVE_TEXT_COLUMNS = ("review_text_en", "review_text")
 
     INSERT_COLUMNS = ("generation_id", "run_timestamp", "[rank]", "title", "description",
-                      "rationale", "related_area", "evidence", "window_start", "window_end",
-                      "reviews_analysed", "llm_provider", "llm_model")
+                      "rationale", "related_area", "evidence", "evidence_strength",
+                      "window_start", "window_end", "reviews_analysed", "llm_provider",
+                      "llm_model")
 
     def __init__(self, settings: DatabaseSettings):
         self.settings = settings
@@ -73,7 +74,8 @@ WHERE sentiment IS NOT NULL
         """One parameter tuple per item, in INSERT_COLUMNS order."""
         return [(generation_id, run_timestamp, item["rank"], item["title"],
                  item["description"], item["rationale"], item["related_area"],
-                 item["evidence"], window_start, window_end, reviews_analysed,
+                 item["evidence"], item["evidence_strength"], window_start, window_end,
+                 reviews_analysed,
                  llm_provider, llm_model)
                 for item in items]
 

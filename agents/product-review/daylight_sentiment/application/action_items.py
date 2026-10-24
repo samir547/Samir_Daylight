@@ -71,7 +71,7 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
     areas = summary_areas(summary)
     reply = analyzer.complete_json(build_action_items_prompt(summary, areas),
                                    max_tokens=ACTION_ITEMS_MAX_TOKENS)
-    items = validate_action_items(reply, areas)
+    items = validate_action_items(reply, summary)
 
     outcome = ActionItemsOutcome(window, items)
     if dry_run:

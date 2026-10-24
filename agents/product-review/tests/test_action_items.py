@@ -28,6 +28,7 @@ from daylight_sentiment.domain.action_items import (
     products_most_negative,
     select_excerpts,
     select_window,
+    small_sample_areas,
     summary_areas,
     validate_action_items,
 )
@@ -439,17 +440,30 @@ def good_reply():
     return {"items": [
         {"rank": 2, "title": "Review the stand design", "description": "Do it.",
          "rationale": "12 of 40 negative reviews.", "related_area": "Sewing & Needlecraft",
-         "evidence": "12 negative reviews mention the stand."},
-        {"rank": 1, "title": "Fix delivery packaging", "description": "Do it.",
+         "evidence": "12 negative reviews mention the stand.",
+         "evidence_strength": "Moderate"},
+        {"rank": 1, "title": "Monitor delivery packaging", "description": "Do it.",
          "rationale": "9 of 10.", "related_area": "SHIPPING QUALITY",
-         "evidence": "9 service reviews."},
+         "evidence": "9 service reviews.", "evidence_strength": "early  signal"},
         {"rank": 3, "title": "Check flicker reports", "description": "Do it.",
          "rationale": "Only 4 reviews, so this is tentative.", "related_area": "overall",
-         "evidence": "4 negative reviews mention flicker."},
+         "evidence": "4 negative reviews mention flicker.", "evidence_strength": "strong"},
     ]}
 
 
-AREAS = ["overall", "Sewing & Needlecraft", "Shipping quality"]
+def summary_for(sector_groups=(("Sewing & Needlecraft", False),),
+                aspects=(("Shipping quality", True),), regions=()):
+    """The parts of a summary the validator reads: (name, small_sample)."""
+    def section(entries):
+        return [{"name": n, "reviews": 10 if small else 100, "small_sample": small}
+                for n, small in entries]
+    return {"small_sample_threshold_reviews": 30,
+            "product_by_sector_group": section(sector_groups),
+            "service_by_aspect": section(aspects),
+            "product_by_region": section(regions)}
+
+
+AREAS = summary_for()
 
 
 class TestValidate:
@@ -457,6 +471,7 @@ class TestValidate:
         items = validate_action_items(good_reply(), AREAS)
         assert [i["rank"] for i in items] == [1, 2, 3]
         assert items[0]["related_area"] == "Shipping quality"
+        assert [i["evidence_strength"] for i in items] == ["early signal", "moderate", "strong"]
 
     def test_strips_whitespace(self):
         reply = good_reply()
@@ -485,7 +500,7 @@ class TestValidate:
             validate_action_items(reply, AREAS)
 
     @pytest.mark.parametrize("name", ["title", "description", "rationale",
-                                      "related_area", "evidence"])
+                                      "related_area", "evidence", "evidence_strength"])
     def test_rejects_missing_or_empty_field(self, name):
         reply = good_reply()
         del reply["items"][0][name]
@@ -513,11 +528,57 @@ class TestValidate:
         reply = good_reply()
         reply["items"][0][name] = "x" * (FIELD_MAX_CHARS[name] + 1)
         with pytest.raises(ActionItemsValidationError, match="limit"):
-            validate_action_items(reply, AREAS + ["x" * (FIELD_MAX_CHARS[name] + 1)])
+            validate_action_items(reply, AREAS)
 
     def test_db_column_sizes_bound_the_caps(self):
         assert FIELD_MAX_CHARS["title"] <= 200
         assert FIELD_MAX_CHARS["related_area"] <= 100
+        assert FIELD_MAX_CHARS["evidence_strength"] <= 20
+
+    def test_accepts_overall_and_readable_aspect_names_in_any_case(self):
+        summary = summary_for(aspects=[(n, False) for n in ASPECT_NAMES.values()])
+        for area in ["Overall", "OVERALL", "Returns & refunds", "returns & REFUNDS",
+                     "Delivery speed"]:
+            reply = good_reply()
+            reply["items"][0]["related_area"] = area
+            items = validate_action_items(reply, summary)
+            assert items[1]["related_area"] in ["overall"] + list(ASPECT_NAMES.values())
+
+    def test_rejects_raw_aspect_label(self):
+        reply = good_reply()
+        reply["items"][0]["related_area"] = "returns_refunds"
+        summary = summary_for(aspects=[("Returns & refunds", False)])
+        with pytest.raises(ActionItemsValidationError, match="returns_refunds"):
+            validate_action_items(reply, summary)
+
+    @pytest.mark.parametrize("strength", ["weak", "high", "early", "very strong"])
+    def test_rejects_evidence_strength_outside_the_allowed_set(self, strength):
+        reply = good_reply()
+        reply["items"][2]["evidence_strength"] = strength
+        with pytest.raises(ActionItemsValidationError, match="evidence_strength"):
+            validate_action_items(reply, AREAS)
+
+    @pytest.mark.parametrize("strength", ["strong", "moderate"])
+    def test_small_sample_area_must_be_an_early_signal(self, strength):
+        reply = good_reply()
+        reply["items"][1]["evidence_strength"] = strength
+        with pytest.raises(ActionItemsValidationError,
+                           match="Shipping quality.*fewer than 30 reviews.*early signal"):
+            validate_action_items(reply, AREAS)
+
+    def test_small_sample_rule_uses_the_summary_flags(self):
+        summary = build_summary(window_of(TestBuildSummary().rows()), 15, 10, 300)
+        assert set(small_sample_areas(summary)) == set(summary_areas(summary)) - {"overall"}
+        assert small_sample_areas(summary_for()) == ["Shipping quality"]
+
+    def test_lists_every_problem_found(self):
+        reply = good_reply()
+        reply["items"][0]["related_area"] = "Atlantis"
+        reply["items"][2]["evidence_strength"] = "huge"
+        with pytest.raises(ActionItemsValidationError) as exc:
+            validate_action_items(reply, AREAS)
+        assert "item 1 related_area 'Atlantis'" in str(exc.value)
+        assert "item 3 evidence_strength 'huge'" in str(exc.value)
 
     @pytest.mark.parametrize("reply", [None, [], {}, {"items": "x"}, {"items": [1, 2, 3]}])
     def test_rejects_malformed_reply(self, reply):
@@ -537,7 +598,8 @@ class TestPrompt:
         for rule in ("Financial Director", "British English", "EXACTLY 3",
                      "starts with a verb", "ONLY the numbers", "cite the numbers",
                      "too thin", "generic advice", '"rank"', '"title"', '"description"',
-                     '"rationale"', '"related_area"', '"evidence"'):
+                     '"rationale"', '"related_area"', '"evidence"',
+                     '"evidence_strength"', '"early signal"'):
             assert rule in " ".join(prompt.split()), rule
 
     def test_real_numbers_prompt_has_the_like_for_like_and_small_sample_rules(self):
@@ -576,7 +638,8 @@ def test_format_action_items():
     rows = [review(i, date(2026, 6, 1)) for i in range(3)]
     text = format_action_items(validate_action_items(good_reply(), AREAS), window_of(rows))
     assert text.startswith("Top 3 to-do items -- Based on 3 reviews from 2026-06-01 to 2026-06-01")
-    assert "1. Fix delivery packaging  [Shipping quality]" in text
+    assert "1. Monitor delivery packaging  [Shipping quality]" in text
+    assert "   Evidence strength: early signal" in text
 
 
 # -- orchestration ------------------------------------------------------------

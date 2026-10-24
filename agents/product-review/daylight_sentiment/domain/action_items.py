@@ -41,17 +41,21 @@ ASPECT_NAMES = {
     "warranty": "Warranty",
     "general_experience": "General experience",
 }
-ITEM_FIELDS = ("title", "description", "rationale", "related_area", "evidence")
+ITEM_FIELDS = ("title", "description", "rationale", "related_area", "evidence",
+               "evidence_strength")
+EARLY_SIGNAL = "early signal"
+EVIDENCE_STRENGTHS = ("strong", "moderate", EARLY_SIGNAL)
 
 # Caps follow dbo.sentiment_action_items: title NVARCHAR(200), related_area
-# NVARCHAR(100). The NVARCHAR(MAX) text fields get a cap that keeps an item
-# readable in a Power BI card.
+# NVARCHAR(100), evidence_strength NVARCHAR(20). The NVARCHAR(MAX) text
+# fields get a cap that keeps an item readable in a Power BI card.
 FIELD_MAX_CHARS = {
     "title": 200,
     "description": 1000,
     "rationale": 1500,
     "related_area": 100,
     "evidence": 1000,
+    "evidence_strength": 20,
 }
 
 # Free review text can carry contact details; these are blanked in excerpts.
@@ -424,53 +428,98 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
     return summary
 
 
+# The summary sections whose group names a to-do item's related_area may take.
+AREA_SECTIONS = ("product_by_sector_group", "service_by_aspect", "product_by_region")
+
+
 def summary_areas(summary: Dict[str, Any]) -> List[str]:
     """Values a to-do item's related_area may take: "overall" plus every
-    sector group, service aspect and region named in the summary."""
+    sector group, service aspect (readable name) and region named in the
+    summary."""
     areas = [OVERALL_AREA]
-    for key in ("product_by_sector_group", "service_by_aspect", "product_by_region"):
+    for key in AREA_SECTIONS:
         for entry in summary.get(key, []):
             if entry["name"] not in areas:
                 areas.append(entry["name"])
     return areas
 
 
-def validate_action_items(reply: Any, allowed_areas: Sequence[str]) -> List[Dict[str, Any]]:
-    """Check the model's reply and return the items ordered by rank, with
-    text stripped and related_area in its canonical spelling. Anything short
-    of exactly ITEM_COUNT complete items raises ActionItemsValidationError:
-    a partial set is never returned."""
+def small_sample_areas(summary: Dict[str, Any]) -> List[str]:
+    """The related_area values whose group is flagged small_sample."""
+    return [entry["name"] for key in AREA_SECTIONS for entry in summary.get(key, [])
+            if entry.get("small_sample")]
+
+
+def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
+                threshold: Any) -> tuple:
+    """(clean item or None, problems) for one item of the reply."""
+    if not isinstance(item, dict):
+        return None, [f"item {i} is not an object"]
+    problems: List[str] = []
+    rank = item.get("rank")
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        problems.append(f"item {i} has no whole-number rank")
+    clean: Dict[str, Any] = {"rank": rank}
+    for name in ITEM_FIELDS:
+        value = item.get(name)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"item {i} has a missing or empty {name}")
+            continue
+        value = value.strip()
+        if len(value) > FIELD_MAX_CHARS[name]:
+            problems.append(f"item {i} {name} is {len(value)} characters "
+                            f"(limit {FIELD_MAX_CHARS[name]})")
+            continue
+        clean[name] = value
+
+    if "related_area" in clean:
+        area = canonical.get(clean["related_area"].casefold())
+        if area is None:
+            problems.append(f"item {i} related_area {clean['related_area']!r} "
+                            f"is not in the summary")
+        else:
+            clean["related_area"] = area
+    if "evidence_strength" in clean:
+        strength = " ".join(clean["evidence_strength"].casefold().split())
+        if strength not in EVIDENCE_STRENGTHS:
+            problems.append(f"item {i} evidence_strength {clean['evidence_strength']!r} "
+                            f"is not one of {', '.join(EVIDENCE_STRENGTHS)}")
+        else:
+            clean["evidence_strength"] = strength
+            area = clean.get("related_area", "")
+            if area.casefold() in small and strength != EARLY_SIGNAL:
+                problems.append(
+                    f"item {i} related_area {area!r} has fewer than {threshold} reviews "
+                    f"(small_sample), so evidence_strength must be {EARLY_SIGNAL!r}, "
+                    f"not {strength!r}")
+    return (None if problems else clean), problems
+
+
+def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Check the model's reply against the summary it was given and return
+    the items ordered by rank, with text stripped, related_area in its
+    canonical spelling and evidence_strength lower-case. Anything short of
+    exactly ITEM_COUNT complete items raises ActionItemsValidationError,
+    whose message lists every problem found: a partial set is never
+    returned."""
     if not isinstance(reply, dict) or not isinstance(reply.get("items"), list):
         raise ActionItemsValidationError('reply has no "items" list')
     items = reply["items"]
     if len(items) != ITEM_COUNT:
         raise ActionItemsValidationError(f"expected {ITEM_COUNT} items, got {len(items)}")
 
-    canonical = {a.casefold(): a for a in allowed_areas}
+    canonical = {a.casefold(): a for a in summary_areas(summary)}
+    small = {a.casefold() for a in small_sample_areas(summary)}
+    threshold = summary.get("small_sample_threshold_reviews", SMALL_SAMPLE_REVIEWS)
     out: List[Dict[str, Any]] = []
+    problems: List[str] = []
     for i, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            raise ActionItemsValidationError(f"item {i} is not an object")
-        rank = item.get("rank")
-        if isinstance(rank, bool) or not isinstance(rank, int):
-            raise ActionItemsValidationError(f"item {i} has no whole-number rank")
-        clean: Dict[str, Any] = {"rank": rank}
-        for name in ITEM_FIELDS:
-            value = item.get(name)
-            if not isinstance(value, str) or not value.strip():
-                raise ActionItemsValidationError(f"item {i} has a missing or empty {name}")
-            value = value.strip()
-            if len(value) > FIELD_MAX_CHARS[name]:
-                raise ActionItemsValidationError(
-                    f"item {i} {name} is {len(value)} characters "
-                    f"(limit {FIELD_MAX_CHARS[name]})")
-            clean[name] = value
-        area = canonical.get(clean["related_area"].casefold())
-        if area is None:
-            raise ActionItemsValidationError(
-                f"item {i} related_area {clean['related_area']!r} is not in the summary")
-        clean["related_area"] = area
-        out.append(clean)
+        clean, found = _check_item(i, item, canonical, small, threshold)
+        problems += found
+        if clean is not None:
+            out.append(clean)
+    if problems:
+        raise ActionItemsValidationError("; ".join(problems))
 
     ranks = sorted(item["rank"] for item in out)
     if ranks != list(range(1, ITEM_COUNT + 1)):
@@ -488,6 +537,7 @@ def format_action_items(items: Sequence[Dict[str, Any]], window: ReviewWindow) -
             f"   What to do: {item['description']}",
             f"   Why: {item['rationale']}",
             f"   Evidence: {item['evidence']}",
+            f"   Evidence strength: {item['evidence_strength']}",
             "",
         ]
     return "\n".join(lines).rstrip() + "\n"

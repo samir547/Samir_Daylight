@@ -128,6 +128,12 @@ BEGIN
         CONSTRAINT UQ_{ACTION_ITEMS_TABLE}_generation_rank UNIQUE (generation_id, [rank])
     );
 END"""),
+    ("add_action_items_evidence_strength", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'evidence_strength')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD evidence_strength NVARCHAR(20) NULL;
+"""),
 ]
 
 
