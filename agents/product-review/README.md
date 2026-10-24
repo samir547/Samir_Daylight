@@ -6,7 +6,7 @@ review's sentiment with an LLM (Claude), translates non-English
 reviews, and loads the results into the Azure SQL Server database that the
 Power BI dashboards read from — unattended, end to end, on a single
 invocation. After loading new reviews it also writes the top 3 to-do items
-for the business, for Power BI (§7.6). Structured as the `daylight_sentiment` package; see `DESIGN.md`
+for the business for the last 3, 6 and 12 months, for Power BI (§7.6). Structured as the `daylight_sentiment` package; see `DESIGN.md`
 for the full architecture and current known issues.
 
 ---
@@ -86,9 +86,10 @@ without touching the pipeline (see §5).
         │
         ▼
  ┌─────────────────┐   run_action_items() (only when this run loaded new reviews)
- │ 10. ACTION ITEMS  │  one LLM call over a summary of the stored results
- │                    │  (one retry if the reply fails the checks); saves the
- │                    │  top 3 to-do items for Power BI (§7.6)
+ │ 10. ACTION ITEMS  │  per review window (last 3, 6, 12 months): one LLM
+ │                    │  call over a summary of that window (one retry if the
+ │                    │  reply fails the checks); saves its top 3 to-do items
+ │                    │  for Power BI (§7.6)
  └─────────────────┘
 ```
 
@@ -381,13 +382,13 @@ Flags: `--provider {claude}` (default `claude`), `--model <override>`
 `--skip-db-load`, `--skip-translation`, `--load-db-only`,
 `--sync-sharepoint-only` (download the new files into `Reviews/` and stop),
 `--keep-output-files` (don't delete the JSON outputs after a successful DB
-load), `--skip-action-items`, `--action-items-months N`,
+load), `--skip-action-items`, `--action-items-months 3,6,12`,
 `--action-items-only`, `--action-items-dry-run` (see §7.6).
 
 Exit codes: `0` finished (including "nothing new in SharePoint"), `1` the
 Claude API rejected the run (key, billing or model — see §4.5), or
-`--action-items-only` couldn't produce the items, `2` SharePoint sign-in is
-needed (see §7.5).
+`--action-items-only` couldn't produce the items for a window, `2`
+SharePoint sign-in is needed (see §7.5).
 
 Operator tools live in `scripts/` and are run as modules from the repo root
 (the same form as the pipeline itself), e.g.:
@@ -554,78 +555,133 @@ straight away instead of waiting, run the pipeline once by hand
 
 After a run that analysed and loaded new reviews, the pipeline writes the
 **top 3 to-do items** for the business, for the Financial Director to read
-in Power BI. Each item has a rank (1 = biggest business impact), a short
-title that starts with a verb, what to do, why (citing the review numbers),
-the area it concerns (a sector group, a service aspect such as "Returns &
+in Power BI, once for each of three review windows: the **last 3, 6 and 12
+months**. Each item has a rank (1 = biggest business impact), a short title
+that starts with a verb, what to do, why (citing the review numbers), the
+area it concerns (a sector group, a service aspect such as "Returns &
 refunds", a region, or "overall" for an issue that spans several), one
 sentence of evidence and an **evidence strength**: "strong", "moderate" or
 "early signal". They are read-only advice: there is no status tracking or
 write-back.
 
-**What they're based on.** The analysed reviews in `dbo.vw_review_analysis`
-whose review date falls in the last 12 months. The 12 months end on the
-**newest review date in the database**, so the period doesn't shrink while no
-new files arrive, but never later than today: if a wrongly parsed review date
-lies in the future, the period ends today instead (those reviews are still
-counted) and a WARNING says so. If fewer than 100 reviews fall in the period,
-all dated reviews are used instead; if that's still fewer than 50, no items
-are generated and the log says why.
+**The three windows.** Advice from one long period can be driven by
+problems that have already been dealt with, so each run generates a
+separate set of items for each window, and the report lets the reader pick
+one. Every window ends on the **newest review date in the database** and
+covers the N months before it ("Last 3 months", "Last 6 months", "Last 12
+months"), so the windows slide forward whenever newer reviews are loaded.
+They never end later than today: if a wrongly parsed review date lies in the
+future, the windows end today instead (those reviews are still counted) and a
+WARNING says so. Reviews with no parsed review date are left out, and the log
+says how many. A window with **fewer than 100 analysed reviews is skipped**
+(a WARNING names it); it is never stretched to cover more months, so its
+label is always true. If every window is skipped, nothing is saved and the
+run carries on as normal.
 
-**The summary.** The code summarises the reviews and makes one LLM call on
-that summary alone. It contains:
+A run that analyses nothing new generates nothing, so the stored items stay
+as they are. `--action-items-only` regenerates them on demand from what's
+already in the database.
+
+The windows are set with `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`
+(comma-separated, default `3,6,12`) or `--action-items-months 3,6,12` for one
+run; a single number gives one window. Rule of thumb: the 3-month window
+needs 100 reviews, so it works while reviews arrive at about 35 or more a
+month; if monthly review volume grows well beyond about 150, try shorter
+windows (for example `1,3,6`).
+
+**Why fixed windows, not the report's date slicer.** The items are written
+by an LLM at run time and stored; Power BI only reads them. A date slicer
+can't make new advice for a range someone picks in the report, so the
+choice is between a few fixed, named windows that are generated in advance.
+There is no real-time or on-demand generation from the report.
+
+**The summary.** For each window, the code summarises that window's reviews
+and makes one LLM call on that summary alone. It contains:
 
 - counts and negative shares by review type and source, by sector group, by
   service aspect (under readable names such as "Shipping quality") and by
   region, all sources together;
-- product reviews by **region and source together** -- the table for
-  comparing regions;
+- the same by **group and source together**: product reviews by sector group
+  and source, service reviews by aspect and source, and product reviews by
+  region and source -- the tables for comparing groups like with like;
 - the products with the most negative reviews: up to 10, each with at least
-  3 negative reviews, by resolved SKU with their most common product name and
-  their region;
+  3 negative reviews, by resolved SKU with their most common product name,
+  their region and how many of their reviews come from each source;
 - the total number of negative reviews, the most frequent complaint themes
   (plural and word-order variants such as "product defect" / "defective
   product" counted as one), the monthly negative share, and up to 10 short
-  negative quotes with no reviewer names.
+  negative quotes with no reviewer names, shortened after a whole word;
+- a **trend** section: the window split into its most recent third and the
+  earlier two thirds, with the negative count and share in each part for
+  the sector groups, service aspects, review types and sources, regions
+  within each source and the 10 most frequent negative themes (for a theme,
+  the negative reviews mentioning it as a share of all the reviews in that
+  part).
 
 Every group carries its number of reviews, negatives, negative share and a
 `small_sample` flag for fewer than 30 reviews (`SMALL_SAMPLE_REVIEWS` in
 `domain/action_items.py`).
 
-**Rules the model is given.** Compare like with like: regions or other
-groups are compared only within the same review website. Amazon and
-Trustpilot reviewers are different customers (most Trustpilot reviews are
-invited by the company and skew positive), so a difference between the two
-sites is background, never a problem by itself. An item based mainly on a
-small-sample group asks the business to monitor or investigate, never to
-overhaul or fix, and is an "early signal". No claim that a difference is
-statistically significant or "not random". Theme counts overlap, so they are
-never added up or turned into a share of the negative reviews. Name the
-products concerned where the evidence supports it. Use "overall" for an issue
-that spans several areas, and "General / No Use Stated" only for an issue
-about that group itself.
+**Rules the model is given.**
+
+- *Like with like.* Regions, sector groups, service aspects and products are
+  compared only within the same review website, or the item says plainly
+  that their mix of websites differs and treats the gap as background only;
+  such a gap is never the main reason for an item. Amazon and Trustpilot
+  reviewers are different customers (most Trustpilot reviews are invited by
+  the company and skew positive), so a difference between the two sites is
+  background, never a problem by itself.
+- *Catch-all groups are not findings.* "General / No Use Stated", "Unknown",
+  "No Region Data" and similar groups are never an item on their own, and no
+  item's only action is to investigate or monitor one. An item may use them
+  only when the summary shows the cause inside the group (particular
+  products, themes or aspects), and names it.
+- *Trend.* If an issue's recent negative share is clearly lower than its
+  earlier share (and the recent part isn't a small sample), the item says it
+  may already be improving and ranks it lower or says so. If the recent
+  share is higher, it says the issue is getting worse. It never says an
+  issue is "fixed" or "solved": reviews can't prove that.
+- *Evidence strength follows the evidence.* "early signal" when the key
+  figures behind an item (its products, groups or aspects) are mostly small
+  samples, even when the related area is "overall"; "strong" only for large
+  samples with the same pattern in more than one group or in both parts of
+  the trend; otherwise "moderate".
+- *Small samples.* An item based mainly on a small-sample group asks the
+  business to monitor or investigate, never to overhaul or fix.
+- No claim that a difference is statistically significant or "not random".
+  Theme counts overlap, so they are never added up or turned into a share of
+  the negative reviews. Name the products concerned where the evidence
+  supports it.
 
 **Checks.** Before anything is saved, the reply must have exactly 3 items,
 ranks 1-3, every field filled in and within its length limit, a related area
 from the summary (any letter case; service aspects by their readable name),
-an evidence strength from the three allowed, "early signal" when the area is
-flagged `small_sample`, and **every number** in the description, rationale
-and evidence present in the summary. A percentage may also be the summary's
+an evidence strength from the three allowed, "early signal" when the related
+area is flagged `small_sample`, and **every number** in the description,
+rationale and evidence present in that window's summary (the trend and the
+group-by-source tables included). A percentage may also be the summary's
 figure rounded to a whole number; dates, years and periods such as
-"12 months" are not checked. A reply that fails is sent back to the model
-**once**, with the reasons; each failure is logged as a WARNING. If the second
-reply fails too, nothing is saved. The 3 items of a generation are saved
-together in `dbo.sentiment_action_items`; every generation is kept.
+"12 months" are not checked. Line breaks and runs of spaces in the reply
+become single spaces. A reply that fails is sent back to the model **once**,
+with the reasons; each failure is logged as a WARNING. If the second reply
+fails too, nothing is saved for that window. Each window's 3 items are saved
+together in `dbo.sentiment_action_items` with their own `generation_id`,
+`window_label` and `window_months`; every generation is kept.
+
+The code can only check evidence strength against the related area itself:
+for an item whose related area is "overall", the rule that small-sample
+figures make it an "early signal" rests on the prompt.
 
 **Flags.**
 
 - `--skip-action-items` — don't generate them in this run.
-- `--action-items-months N` — base them on the last N months instead of 12
-  (or set `ACTION_ITEMS_WINDOW_MONTHS` in `.env`).
+- `--action-items-months 3,6,12` — the windows for this run, in months
+  (or set `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`; default `3,6,12`).
 - `--action-items-only` — skip SharePoint, loading and analysis; generate
-  from what's already in the database, then exit. Exit code `1` if it
-  fails.
-- `--action-items-dry-run` — generate and print the items but don't save
-  them.
+  every window from what's already in the database, then exit. Exit code `1`
+  if any window failed (a skipped window isn't a failure).
+- `--action-items-dry-run` — generate and print every window's items but
+  don't save them.
 
 ```bash
 # Preview from the data already in the database, saving nothing
@@ -634,25 +690,36 @@ python -m daylight_sentiment.cli --action-items-only --action-items-dry-run
 # Regenerate on demand and save (e.g. after a manual load)
 python -m daylight_sentiment.cli --action-items-only
 
-# Same, over the last 6 months
+# Only the last 6 months
 python -m daylight_sentiment.cli --action-items-only --action-items-months 6
 ```
 
-In a normal run, a failure here (both replies failed the checks, the view is
-missing, a network error) logs one `ERROR` line starting
-`Action items were not generated` and doesn't change the exit code: the
-reviews are already saved. An invalid API key or exhausted credit still
-stops the run with exit code `1`, as everywhere else.
+Each run makes up to 3 LLM calls here (one per window), plus one retry for
+any window whose reply fails the checks. In a normal run, a failure (both
+replies failed the checks, the view is missing, a network error) logs one
+`ERROR` line per failed window, starting
+`Action items were not generated for Last N months`, and doesn't change the
+exit code: the reviews are already saved, and the other windows are still
+saved. An invalid API key or exhausted credit still stops the run with exit
+code `1`, as everywhere else.
 
 **Power BI.** Use the view `dbo.vw_latest_action_items`
 (`SQL/views/vw_latest_action_items.sql`). It returns the 3 rows of the newest
-generation; sort by `item_rank`. Its `basis` column reads like "Based on 710
-reviews from 2025-08-21 to 2026-08-20", so readers can see how recent the
-reviews behind the advice are, and `evidence_strength` reads "Strong",
-"Moderate" or "Early signal". The pipeline creates the table and adds the
-`evidence_strength` column to an existing one itself, but its database login
-can't create views: an administrator applies the view file in SSMS once (and
-again whenever it changes).
+generation **for each `window_label`** (rows saved without a label form one
+"Custom window" group). Set the page up with:
+
+- a **single-select slicer on `window_label`**, defaulting to "Last 6 months";
+- the items visual **sorted by `item_rank`**;
+- `basis`, which reads like "Based on 710 reviews from 2025-08-21 to
+  2026-08-20" and, when the window ends more than 45 days before today,
+  goes on ". Newest review is from 2026-08-20, so this may be out of date.";
+- `evidence_strength`, which reads "Strong", "Moderate" or "Early signal".
+
+The report's date slicer does not drive these items: they are generated at
+run time, one fixed set per window. The pipeline creates the table and adds
+new columns to an existing one itself, but its database login can't create
+views: an administrator applies the view file in SSMS once (and again
+whenever it changes).
 
 ## 8. Known things to watch
 

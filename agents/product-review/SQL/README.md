@@ -39,12 +39,24 @@ rather than it being split across SQL and Python.
 | File | Object | Notes |
 |---|---|---|
 | `tables/sector_group_map.sql` | `dbo.sector_group_map` | Raw sector label -> reporting group; seeded by `seed/sector_group_map.sql` |
-| `tables/sentiment_action_items.sql` | `dbo.sentiment_action_items` | The business to-do items, 3 rows per generation, history kept. Also created by the pipeline itself, `evidence_strength` included (the last two entries in `MIGRATIONS`, `daylight_sentiment/infra/db/connection.py`) |
+| `tables/sentiment_action_items.sql` | `dbo.sentiment_action_items` | The business to-do items: 3 rows per generation, one generation per review window ("Last 3 months", "Last 6 months", "Last 12 months") per run, history kept. Also created by the pipeline itself, with `evidence_strength`, `window_label` and `window_months` added by their own guarded `ALTER`s (the action-items entries at the end of `MIGRATIONS`, `daylight_sentiment/infra/db/connection.py`) |
 | `views/vw_review_analysis.sql` | `dbo.vw_review_analysis` | Reviews with resolved SKU, region, parsed review date, sector group and English display text |
-| `views/vw_latest_action_items.sql` | `dbo.vw_latest_action_items` | The newest generation of to-do items for Power BI, with `evidence_strength` and a plain-text `basis` line |
+| `views/vw_latest_action_items.sql` | `dbo.vw_latest_action_items` | The newest generation of to-do items for each `window_label`, for Power BI, with `evidence_strength` and a plain-text `basis` line that notes when the newest review is more than 45 days old |
 
 Views are applied by an administrator in SSMS: the pipeline's login
 (`daylight_agents`) can create and alter tables but not views.
+
+### Action items in Power BI
+
+The to-do items are generated at run time for a few fixed review windows
+(by default the last 3, 6 and 12 months, each ending on the newest review
+date and no later than the run date) and stored; the report only reads them.
+So the report's date slicer does not drive them. Set the page up with a
+single-select slicer on `window_label` (default "Last 6 months") and sort the
+items visual by `item_rank`. Rows saved before `window_label` existed appear
+under "Custom window". When `window_end` is more than 45 days before the date
+the view is queried (`stale_after_days` in the view), `basis` adds that the
+items may be out of date.
 
 ## Run order for a fresh database
 
