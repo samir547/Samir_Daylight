@@ -437,9 +437,11 @@ real-time generation.
    (`months_before()`, plus one day). When the cap at today applies (a review
    dated in the future, usually a misparsed date) one WARNING names the date;
    reviews dated after today stay in the windows. A window with fewer than
-   `MIN_WINDOW_REVIEWS` (100) analysed reviews is returned skipped and logged
-   as a WARNING, never widened, so its label always describes it; a skipped
-   window is not a failure. If every window is skipped nothing is saved.
+   `ActionItemSettings.min_reviews` analysed reviews (default 50, from
+   `MIN_WINDOW_REVIEWS`; `ACTION_ITEMS_MIN_REVIEWS` or
+   `--action-items-min-reviews`, a whole number of 10 or more) is returned
+   skipped and logged as a WARNING naming that minimum, never widened, so
+   its label always describes it; a skipped window is not a failure. If every window is skipped nothing is saved.
 3. For each window that isn't skipped, `generate_window_items()`:
    `build_summary()` of that window's rows, one
    `analyzer.complete_json(prompt, max_tokens=1500)`, validation against that
@@ -634,8 +636,9 @@ unreachable) logs one ERROR line, `Action items were not generated: ...`.
 read, and 0 when every window was generated or skipped. A
 `FatalProviderError` is reported as everywhere else and exits 1.
 
-**Sizing.** When fewer than about 35 reviews a month arrive, the 3-month
-window falls under the 100-review minimum and is skipped. If monthly review
+**Sizing.** When fewer than about 17 reviews a month arrive, the 3-month
+window falls under the default 50-review minimum and is skipped (an N-month
+window needs about minimum / N a month). If monthly review
 volume grows well beyond about 150, shorter windows (for example
 `ACTION_ITEMS_WINDOWS_MONTHS=1,3,6`) give fresher advice.
 

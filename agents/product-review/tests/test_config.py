@@ -7,6 +7,7 @@ from daylight_sentiment.config import (
     DatabaseSettings,
     LLMProvider,
     SharePointSettings,
+    parse_min_reviews,
     parse_window_months,
 )
 
@@ -132,6 +133,36 @@ def test_action_items_windows_months_from_env(monkeypatch):
     monkeypatch.setenv("ACTION_ITEMS_WINDOWS_MONTHS", "6")
     assert Config.from_env(dotenv=False).action_items.windows_months == (6,)
     assert Config().action_items.windows_months == (3, 6, 12)  # plain Config ignores env
+
+
+def test_action_items_min_reviews_defaults_to_50(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS", raising=False)
+    assert Config.from_env(dotenv=False).action_items.min_reviews == 50
+    assert Config().action_items.min_reviews == 50
+
+
+def test_action_items_min_reviews_from_env(monkeypatch):
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", "120")
+    assert Config.from_env(dotenv=False).action_items.min_reviews == 120
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", " 10 ")
+    assert Config.from_env(dotenv=False).action_items.min_reviews == 10
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", "")
+    assert Config.from_env(dotenv=False).action_items.min_reviews == 50
+    assert Config().action_items.min_reviews == 50  # plain Config ignores env
+
+
+@pytest.mark.parametrize("raw", ["9", "0", "-10", "fifty", "50.5", "5,0"])
+def test_action_items_min_reviews_rejects_bad_values(monkeypatch, raw):
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", raw)
+    with pytest.raises(ValueError, match="ACTION_ITEMS_MIN_REVIEWS must be a whole number "
+                                         "of reviews, 10 or more"):
+        Config.from_env(dotenv=False)
+
+
+def test_parse_min_reviews_names_the_setting():
+    assert parse_min_reviews("50") == 50
+    with pytest.raises(ValueError, match="^--x must be"):
+        parse_min_reviews("9", name="--x")
 
 
 def test_old_singular_setting_is_not_read(monkeypatch):

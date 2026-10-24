@@ -123,21 +123,29 @@ class TestSelectWindows:
         assert w.start == date(2025, 8, 21) and w.review_count == 101
 
     def test_thin_window_is_skipped_not_widened(self):
-        rows = ([review(i, date(2026, 8, 1)) for i in range(60)]
+        rows = ([review(i, date(2026, 8, 1)) for i in range(40)]
                 + [review(1000 + i, date(2026, 3, 1)) for i in range(60)])
         w = windows_by_months(rows)
         assert w[3].skipped and not w[6].skipped and not w[12].skipped
-        assert w[3].review_count == 60  # its own months only, not every review
+        assert w[3].review_count == 40  # its own months only, not every review
         assert w[3].start == date(2026, 5, 2)
         assert w[3].skip_reason == (
-            "only 60 analysed reviews from 2026-05-02 to 2026-08-01 (minimum 100)")
+            "only 40 analysed reviews from 2026-05-02 to 2026-08-01 (minimum 50)")
 
-    @pytest.mark.parametrize("count, skipped", [(99, True), (100, False)])
-    def test_minimum_is_100_reviews(self, count, skipped):
-        assert MIN_WINDOW_REVIEWS == 100
+    @pytest.mark.parametrize("count, skipped", [(49, True), (50, False)])
+    def test_minimum_defaults_to_50_reviews(self, count, skipped):
+        assert MIN_WINDOW_REVIEWS == 50
         rows = [review(i, date(2026, 8, 1)) for i in range(count)]
         [w] = select_windows(rows, [3], today=TODAY)
         assert w.skipped is skipped
+
+    @pytest.mark.parametrize("count, skipped", [(19, True), (20, False)])
+    def test_minimum_passed_in_is_applied_and_named(self, count, skipped):
+        rows = [review(i, date(2026, 8, 1)) for i in range(count)]
+        [w] = select_windows(rows, [3], today=TODAY, min_reviews=20)
+        assert w.skipped is skipped
+        if skipped:
+            assert w.skip_reason.endswith("(minimum 20)")
 
     def test_every_window_skipped_when_data_is_thin(self):
         rows = [review(i, date(2026, 8, 1)) for i in range(40)]
@@ -1274,7 +1282,7 @@ class TestGenerate:
             "shape.")
 
     def test_thin_window_is_skipped_without_calling_the_model(self, caplog):
-        rows = ([review(i, date(2026, 8, 20)) for i in range(60)]
+        rows = ([review(i, date(2026, 8, 20)) for i in range(40)]
                 + [review(1000 + i, date(2026, 4, 1)) for i in range(60)]
                 + [review(9000, date(2026, 8, 20), "negative", review_type="service")])
         reply = dataset_reply()
@@ -1286,8 +1294,20 @@ class TestGenerate:
         assert outcome.windows[0].items == [] and outcome.failed == []
         assert len(analyzer.calls) == 2
         assert [s["window_label"] for s in repo.saved] == ["Last 6 months", "Last 12 months"]
-        assert ("Action items for Last 3 months: skipped -- only 61 analysed reviews"
+        assert ("Action items for Last 3 months: skipped -- only 41 analysed reviews"
                 in caplog.text)
+        assert "(minimum 50)" in caplog.text
+
+    def test_minimum_comes_from_the_settings_and_is_logged(self, caplog):
+        rows = ([review(i, date(2026, 8, 20)) for i in range(60)]
+                + [review(9000, date(2026, 8, 20), "negative", review_type="service")])
+        settings = ActionItemSettings(windows_months=(3,), min_reviews=100)
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            outcome, analyzer, repo = self.run(rows=rows, settings=settings)
+        assert [w.skipped for w in outcome.windows] == [True]
+        assert analyzer.calls == [] and repo.saved == []
+        assert ("Action items for Last 3 months: skipped -- only 61 analysed reviews "
+                "from 2026-05-21 to 2026-08-20 (minimum 100)") in caplog.text
 
     def test_all_windows_skipped_saves_nothing_and_is_not_a_failure(self, caplog):
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):

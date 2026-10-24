@@ -20,8 +20,10 @@ ITEM_COUNT = 3
 OVERALL_AREA = "overall"
 
 # A review window with fewer analysed reviews than this is skipped: too few
-# to base three items on. It is never widened, so its label stays true.
-MIN_WINDOW_REVIEWS = 100
+# to base three items on. It is never widened, so its label stays true. The
+# default for callers that pass nothing; a run's value comes from
+# ActionItemSettings.min_reviews (ACTION_ITEMS_MIN_REVIEWS).
+MIN_WINDOW_REVIEWS = 50
 
 # A group (sector group, aspect, region, source, product...) with fewer
 # reviews than this is flagged small_sample in the summary: too few to

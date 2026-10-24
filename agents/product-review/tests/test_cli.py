@@ -509,6 +509,32 @@ class TestActionItemsWiring:
         config = build_config(parse_args(["--action-items-months", "6,3"]))
         assert config.action_items.windows_months == (3, 6)
 
+    def test_min_reviews_defaults_to_50(self, monkeypatch):
+        monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS", raising=False)
+        assert parse_args([]).action_items_min_reviews is None
+        assert build_config(parse_args([])).action_items.min_reviews == 50
+
+    def test_min_reviews_flag_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", "80")
+        assert build_config(parse_args([])).action_items.min_reviews == 80
+        config = build_config(parse_args(["--action-items-min-reviews", "25"]))
+        assert config.action_items.min_reviews == 25
+        config = build_config(parse_args(["--action-items-min-reviews", "10"]))
+        assert config.action_items.min_reviews == 10
+
+    @pytest.mark.parametrize("value", ["9", "0", "-50", "fifty", "50.5", ""])
+    def test_min_reviews_below_10_is_rejected(self, value, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--action-items-min-reviews", value])
+        assert ("--action-items-min-reviews must be a whole number of reviews, 10 or more"
+                in capsys.readouterr().err)
+
+    def test_help_shows_the_min_reviews_flag(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        out = " ".join(capsys.readouterr().out.split())
+        assert "--action-items-min-reviews N" in out and "default 50" in out
+
     def test_help_shows_the_windows_flag(self, capsys):
         with pytest.raises(SystemExit):
             parse_args(["--help"])
@@ -736,7 +762,7 @@ class TestActionItemsEndToEndOffline:
         config.action_items.windows_months = (3,)
         from daylight_sentiment.application import action_items as app
         monkeypatch.setattr(app, "select_windows",
-                            lambda rows, months, today=None: [
+                            lambda rows, months, today=None, min_reviews=None: [
                                 app.ReviewWindow(3, rows[:10], None, None,
                                                  skip_reason="only 10 analysed reviews")])
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):

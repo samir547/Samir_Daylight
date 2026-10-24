@@ -6,6 +6,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
+from daylight_sentiment.domain.action_items import MIN_WINDOW_REVIEWS
+
 # Repo root -- daylight_sentiment/ sits directly under it.
 BASE = Path(__file__).resolve().parent.parent
 
@@ -217,24 +219,51 @@ def parse_window_months(raw: str, name: str = "ACTION_ITEMS_WINDOWS_MONTHS") -> 
     return tuple(sorted(months))
 
 
+# Below this, a window's to-do items would rest on a handful of reviews.
+MIN_REVIEWS_FLOOR = 10
+
+
+def parse_min_reviews(raw: str, name: str = "ACTION_ITEMS_MIN_REVIEWS") -> int:
+    """The minimum number of analysed reviews a window needs, as a whole
+    number. Raises ValueError, naming ``name``, for anything that is not a
+    whole number of at least MIN_REVIEWS_FLOOR."""
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = 0
+    if value < MIN_REVIEWS_FLOOR:
+        raise ValueError(
+            f"{name} must be a whole number of reviews, {MIN_REVIEWS_FLOOR} or more "
+            f"(e.g. 50); got {raw!r}")
+    return value
+
+
 @dataclass
 class ActionItemSettings:
     """The business to-do items generated after a run (see
     application/action_items.py): one set per review window. Each window is
     the last N months ending on the newest review date in the data (or
     today, if that is earlier); windows_months is overridable with
-    ACTION_ITEMS_WINDOWS_MONTHS and, per run, --action-items-months."""
+    ACTION_ITEMS_WINDOWS_MONTHS and, per run, --action-items-months. A
+    window with fewer than min_reviews analysed reviews is skipped;
+    overridable with ACTION_ITEMS_MIN_REVIEWS and, per run,
+    --action-items-min-reviews."""
     windows_months: Tuple[int, ...] = (3, 6, 12)
+    min_reviews: int = MIN_WINDOW_REVIEWS
     top_themes: int = 15
     max_excerpts: int = 10
     excerpt_chars: int = 300
 
     @classmethod
     def from_env(cls) -> "ActionItemSettings":
+        settings = cls()
         raw = os.getenv("ACTION_ITEMS_WINDOWS_MONTHS")
-        if not raw:
-            return cls()
-        return cls(windows_months=parse_window_months(raw))
+        if raw:
+            settings.windows_months = parse_window_months(raw)
+        raw = os.getenv("ACTION_ITEMS_MIN_REVIEWS")
+        if raw:
+            settings.min_reviews = parse_min_reviews(raw)
+        return settings
 
 
 # Legacy flat attribute -> (sub-config field, attribute). The compat layer for

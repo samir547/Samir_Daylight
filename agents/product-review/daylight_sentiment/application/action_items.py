@@ -110,7 +110,8 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
     once; if it fails the error propagates.
     """
     rows = repository.fetch_analysed_rows()
-    windows = select_windows(rows, settings.windows_months, today=today)
+    windows = select_windows(rows, settings.windows_months, today=today,
+                             min_reviews=settings.min_reviews)
     first = windows[0] if windows else None
     if first is not None and first.capped_from:
         logger.warning("Action items: the newest review date (%s) is after today, so the "

@@ -19,7 +19,12 @@ from daylight_sentiment.application.aggregator import AnalysisAggregator
 from daylight_sentiment.application.checkpoint import load_checkpoint
 from daylight_sentiment.application.output_generator import OutputGenerator
 from daylight_sentiment.application.pipeline import MultiSourcePipeline
-from daylight_sentiment.config import Config, LLMProvider, parse_window_months
+from daylight_sentiment.config import (
+    Config,
+    LLMProvider,
+    parse_min_reviews,
+    parse_window_months,
+)
 from daylight_sentiment.domain.action_items import format_action_items
 from daylight_sentiment.logging_setup import configure_logging as _configure_logging
 from daylight_sentiment.infra.analyzers import (
@@ -57,6 +62,13 @@ logger = logging.getLogger("multi_source_sentiment")
 def _window_months(value: str) -> tuple:
     try:
         return parse_window_months(value, name="--action-items-months")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _min_reviews(value: str) -> int:
+    try:
+        return parse_min_reviews(value, name="--action-items-min-reviews")
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
@@ -129,6 +141,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "comma-separated: one set of items for each 'last N months', "
                         "counted back from the newest review date in the database "
                         "(default 3,6,12, or ACTION_ITEMS_WINDOWS_MONTHS)")
+    p.add_argument("--action-items-min-reviews", type=_min_reviews, metavar="N",
+                   help="Skip a review window with fewer than N analysed reviews; "
+                        "at least 10 (default 50, or ACTION_ITEMS_MIN_REVIEWS)")
     p.add_argument("--action-items-only", action="store_true",
                    help="Skip SharePoint sync, loading and analysis entirely -- just generate "
                         "the to-do items for every review window from the reviews already in "
@@ -151,6 +166,8 @@ def build_config(args: argparse.Namespace) -> Config:
         getattr(config, config.llm_provider.value).model = args.model
     if args.action_items_months is not None:
         config.action_items.windows_months = args.action_items_months
+    if args.action_items_min_reviews is not None:
+        config.action_items.min_reviews = args.action_items_min_reviews
     config.output_dir.mkdir(parents=True, exist_ok=True)
     return config
 
