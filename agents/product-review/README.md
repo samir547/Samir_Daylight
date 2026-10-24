@@ -110,32 +110,50 @@ provider error (§4.5).
 Three files, three different schemas, normalized into one shape before
 anything reaches the LLM. Each arrives via the SharePoint sync (stage 1 in
 §2) into `Reviews/`. There is no expected or preferred filename for any of
-them — each source is matched purely by `FilePattern` (name tokens +
-extension), and `resolve_source_file()` (`infra/review_sources/base.py`)
-always picks the newest file in `Reviews/` matching that pattern. A renamed
+them — each source is matched purely by `FilePattern` (name tokens + an
+extension of `.xlsx` or `.csv`), and `resolve_source_file()`
+(`infra/review_sources/base.py`) always picks the newest file in `Reviews/`
+matching that pattern, whichever of the two formats it is. A renamed
 export — "(2)" suffix, fresh row count, date stamp — is resolved exactly
 like any other name; only a pattern with zero matches fails the run.
 
-### 3.1 Trustpilot product reviews — matched by `*trustpilot*product*.xlsx`
-Excel, e.g. `Reviews/trustpilot-product-reviews 873.xlsx` (872 rows in the
-current export). `load_trustpilot_product()` (`infra/review_sources/trustpilot.py`)
+Every source can be supplied as Excel or CSV. `read_table()` (same module)
+reads the file by its real extension (`.xlsx` → `read_excel`, `.csv` →
+`read_csv`), then the loader's column handling is the same for both, so the
+same data gives the same reviews either way:
+- ids, SKUs, ASINs, model numbers, names and review text are read as text
+  (a leading zero survives; a column with blanks never yields `123.0`);
+  ratings become whole numbers and empty cells become `""`; fully blank rows
+  are ignored.
+- `review_date` is stored as text. Text cells are kept exactly as exported.
+  A real Excel date cell is written the way the CSV export writes it — ISO
+  8601 UTC for Trustpilot (`2026-10-07T17:24:58.498Z`) and the bare day for
+  Amazon (`2026-10-07`) — so `vw_review_analysis` parses both formats alike.
+- A file missing any column its loader reads (listed below) stops the run
+  with an error naming the file and the missing columns, instead of loading
+  those fields as empty. Amazon's `error` column is the only optional one.
+
+### 3.1 Trustpilot product reviews — matched by `*trustpilot*product*.{xlsx,csv}`
+Excel or CSV, e.g. `Reviews/trustpilot-product-reviews 873.xlsx` (872 rows in
+the current export). `load_trustpilot_product()` (`infra/review_sources/trustpilot.py`)
 reads columns: `review_id`, `stars`, `product_name`, `product_sku`, `content`,
 `consumer_name`, `created_at`.
 
-### 3.2 Trustpilot service reviews — matched by `*trustpilot*service*.xlsx`
-Excel, e.g. `Reviews/TrustPilot Service Reviews.xlsx` (1,395 rows in the
-current export). `load_trustpilot_service()` (`infra/review_sources/trustpilot.py`)
+### 3.2 Trustpilot service reviews — matched by `*trustpilot*service*.{xlsx,csv}`
+Excel or CSV, e.g. `Reviews/TrustPilot Service Reviews.xlsx` (1,395 rows in
+the current export). `load_trustpilot_service()` (`infra/review_sources/trustpilot.py`)
 reads: `Review Id`, `Review Stars`, `Review Title`, `Review Content`,
 `Review Username`, `Review Created (UTC)`.
 Title and body are concatenated (`"{title}\n\n{body}"`) before being sent to
 the LLM, since service review titles often carry the real signal
 (e.g. "Great After-Sales Service!").
 
-### 3.3 Amazon product reviews — matched by `*amazon*product*.csv`
-CSV, e.g. `Reviews/amazon_product_reviews_all.csv` (672 rows in the current
-export). `load_amazon_product()` (`infra/review_sources/amazon_brightdata.py`)
-reads: `review_id`, `rating`, `product_name`, `asin`, `review_header`,
-`review_text`, `author_name`, `review_posted_date`, `is_verified`.
+### 3.3 Amazon product reviews — matched by `*amazon*product*.{xlsx,csv}`
+CSV or Excel, e.g. `Reviews/amazon_product_reviews_all.csv` (672 rows in the
+current export). `load_amazon_product()` (`infra/review_sources/amazon_brightdata.py`)
+reads: `review_id`, `rating`, `product_name`, `asin`, `model_number`,
+`review_country`, `review_header`, `review_text`, `author_name`,
+`review_posted_date`, `is_verified` (and `error` when present).
 Two cleanup steps happen here that don't happen for the Trustpilot sources:
 - Rows with a non-null `error` column (scrape failures) are dropped and logged.
 - Duplicate `review_id`s are dropped, keeping the first occurrence.
@@ -473,7 +491,10 @@ configured via env vars, skipped cleanly if they're absent:
 
 - **SharePoint** (`SP_SHARE_URL`, `SP_USERNAME`, `SP_PASSWORD` in `.env`) —
   `SharePointSync` downloads the 3 review exports into `Reviews/` before
-  loading. Auth is MSAL against Microsoft Graph's `/shares` endpoint;
+  loading. Each source's "In Progress" folder may hold `.xlsx` or `.csv`
+  files; the newest file matching the source's pattern wins, whichever
+  format it is, and it is downloaded under its original name and moved to
+  "Processed" after a confirmed database load, exactly as before. Auth is MSAL against Microsoft Graph's `/shares` endpoint;
   plain username/password (ROPC) is tried first but this account has MFA
   enforced, so it always falls back to an interactive device-code sign-in
   (prints a `microsoft.com/device` URL + code — a human has to complete it

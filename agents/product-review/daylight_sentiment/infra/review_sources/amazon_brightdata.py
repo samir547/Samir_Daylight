@@ -1,4 +1,4 @@
-"""Amazon product reviews from the Bright Data CSV export shape.
+"""Amazon product reviews from the Bright Data export shape (.xlsx or .csv).
 
 Bright Data is no longer the extraction vendor (ISSUE-03); this loader
 stays for the existing export on disk until a replacement source exists --
@@ -11,11 +11,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-import pandas as pd
-
 from daylight_sentiment.config import SourceFiles
-from daylight_sentiment.infra.review_sources.base import resolve_source_file
+from daylight_sentiment.infra.review_sources.base import read_table, resolve_source_file
 from daylight_sentiment.infra.review_sources.coercion import (
+    _clean_date,
     _clean_str,
     _safe_bool,
     _safe_int,
@@ -23,9 +22,18 @@ from daylight_sentiment.infra.review_sources.coercion import (
 
 logger = logging.getLogger("multi_source_sentiment")
 
+# Every column the loader reads; a file missing any of them is rejected.
+# "error" is optional: only scrapes that hit failures carry it.
+COLUMNS = ("review_id", "rating", "product_name", "asin", "model_number",
+           "review_country", "review_header", "review_text", "author_name",
+           "review_posted_date", "is_verified")
+# Read as text in both formats (ids and codes must not become numbers).
+TEXT_COLUMNS = ("review_id", "product_name", "asin", "model_number", "review_country",
+                "review_header", "review_text", "author_name")
+
 
 def load_amazon_product(path: Path) -> List[Dict[str, Any]]:
-    df = pd.read_csv(path)
+    df = read_table(path, COLUMNS, TEXT_COLUMNS)
 
     # Scrape-failure rows carry an error code and no review payload.
     if "error" in df.columns:
@@ -62,7 +70,9 @@ def load_amazon_product(path: Path) -> List[Dict[str, Any]]:
             "title": header,
             "text": text,
             "reviewer_name": _clean_str(row.get("author_name")),
-            "review_date": _clean_str(row.get("review_posted_date")),
+            # Day only: the view parses Amazon dates with TRY_PARSE, where a
+            # trailing Z could shift the day by the server's time zone.
+            "review_date": _clean_date(row.get("review_posted_date"), with_time=False),
             "verified_purchase": _safe_bool(row.get("is_verified")),
         })
     logger.info("Loaded %d Amazon product reviews", len(reviews))

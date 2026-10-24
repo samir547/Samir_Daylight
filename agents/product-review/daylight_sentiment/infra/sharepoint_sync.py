@@ -3,7 +3,7 @@ review sources read them, so nothing downstream needs to know the files came
 from SharePoint.
 
 ISSUE-01: sync() now matches files by *pattern* (FilePattern: name tokens +
-extension), not exact filename. A renamed export ("(2)" suffix, fresh row
+an .xlsx or .csv extension), not exact filename. A renamed export ("(2)" suffix, fresh row
 count, date stamp) is a warning + best-guess match -- newest wins -- instead
 of aborting the entire run before a single review is analyzed. A pattern with
 no match at all in the folder still raises, since the source genuinely can't
