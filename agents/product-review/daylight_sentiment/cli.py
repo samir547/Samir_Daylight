@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from daylight_sentiment.application.action_items import generate_action_items
 from daylight_sentiment.application.aggregator import AnalysisAggregator
@@ -31,6 +31,7 @@ from daylight_sentiment.infra.db import (
     REVIEWS_TABLE,
     RUNS_TABLE,
     ActionItemRepository,
+    ExistingReviewsReadError,
     ReviewRepository,
     RunRepository,
     connect,
@@ -72,23 +73,32 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None,
                    help="Reviews per unit of work handed to a worker thread (default 10)")
     p.add_argument("--fresh-start", action="store_true",
-                   help="Ignore the checkpoint and reprocess every review from scratch. "
-                        "By default the pipeline always resumes from the checkpoint -- "
-                        "this is the only way to force a full reprocess.")
+                   help="Ignore the checkpoint and reprocess every review from scratch, "
+                        "including reviews that already have a stored analysis in the "
+                        "database. By default the pipeline resumes from the checkpoint and "
+                        "skips reviews the database already holds a sentiment for.")
     p.add_argument("--rerun-product-reviews", action="store_true",
                    help="Reopen only product reviews (Trustpilot + Amazon) for reprocessing, "
                         "leaving service reviews untouched in the checkpoint. Use this after "
                         "changing the sector taxonomy (SECTORS), or after adding a new field "
                         "the loaders capture for product reviews (e.g. model_number) that "
-                        "existing checkpoint entries predate. Ignored if --fresh-start is also "
+                        "existing checkpoint entries predate. Product reviews already in the "
+                        "database are re-analysed too. Ignored if --fresh-start is also "
                         "passed, since that already reprocesses everything.")
     p.add_argument("--rerun-service-reviews", action="store_true",
                    help="Reopen only service reviews (Trustpilot) for reprocessing, leaving "
                         "product reviews untouched in the checkpoint. Mirrors "
                         "--rerun-product-reviews for the service side -- use after a prompt "
                         "change (e.g. to SENTIMENT_GUIDANCE) that should apply to service "
-                        "reviews too. Combine both flags to reopen everything without a full "
+                        "reviews too. Service reviews already in the database are re-analysed "
+                        "too. Combine both flags to reopen everything without a full "
                         "--fresh-start. Ignored if --fresh-start is also passed.")
+    p.add_argument("--reanalyse-existing", action="store_true",
+                   help="Analyse every loaded review, from every source, even if the "
+                        "database already holds a sentiment for it (its stored result is "
+                        "overwritten on load). Without it, reviews already analysed in the "
+                        "database are skipped. Unlike --fresh-start the checkpoint is still "
+                        "resumed from.")
     p.add_argument("--skip-sharepoint-sync", action="store_true",
                    help="Don't pull fresh files from SharePoint even if SP_* env vars are set; "
                         "use whatever's already in Reviews/")
@@ -276,6 +286,89 @@ def resume_state(config: Config, args: argparse.Namespace,
         wanted = {r["uid"] for r in all_reviews}
         done = {k: v for k, v in done.items() if k in wanted}
     return apply_rerun_flags(done, args.rerun_product_reviews, args.rerun_service_reviews)
+
+
+def drop_already_analysed(config: Config, args: argparse.Namespace,
+                          reviews: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Leave out the reviews the database already holds a sentiment for:
+    history is frozen once scored, so they are neither re-analysed (paid LLM
+    calls) nor re-loaded over their stored result. Returns (the reviews to
+    analyse, how many were left out).
+
+    The check is off with --fresh-start / --reanalyse-existing, and when no
+    database is configured; --rerun-product-reviews / --rerun-service-reviews
+    turn it off for that review type only. A stored row whose analysis
+    failed has no sentiment and is analysed again. A review with a blank
+    review_id is never matched: its uid ends in "row<N>", its position in
+    this run's combined load, which says nothing about what's stored.
+    Raises ExistingReviewsReadError if the database can't be read -- never
+    treats everything as new."""
+    total = len(reviews)
+    if args.fresh_start or args.reanalyse_existing:
+        flag = "--fresh-start" if args.fresh_start else "--reanalyse-existing"
+        logger.info("%s: not skipping reviews already analysed in the database; all %d "
+                    "loaded review(s) go to analysis", flag, total)
+        return reviews, 0
+    if not config.db.configured:
+        logger.info("DB_SERVER/DB_USER/DB_PASSWORD not set; can't skip reviews already "
+                    "analysed in the database, so all %d loaded review(s) go to analysis",
+                    total)
+        return reviews, 0
+
+    reopened = set()
+    if args.rerun_product_reviews:
+        reopened.add("product")
+    if args.rerun_service_reviews:
+        reopened.add("service")
+    if reopened:
+        logger.info("Re-analysing %s reviews even if they're already in the database",
+                    " and ".join(sorted(reopened)))
+
+    blank_ids = sum(1 for r in reviews if not r.get("review_id"))
+    if blank_ids:
+        logger.warning("%d loaded review(s) have no review_id, so their uid is only their "
+                       "row position in this run and can't be matched against the "
+                       "database: they are analysed (and loaded) again on every run",
+                       blank_ids)
+
+    checkable = [r for r in reviews
+                 if r.get("review_id") and r.get("review_type") not in reopened]
+    existing = ReviewRepository(config.db).fetch_analysed_uids(r["uid"] for r in checkable)
+    skip = {id(r) for r in checkable if r["uid"] in existing}
+    pending = [r for r in reviews if id(r) not in skip]
+    logger.info("Reviews loaded: %d; already analysed in the database (skipped): %d; "
+                "to analyse: %d", total, len(skip), len(pending))
+    return pending, len(skip)
+
+
+def report_existing_reviews_unreadable(exc: ExistingReviewsReadError) -> int:
+    logger.error("Stopping before any analysis: %s", exc)
+    logger.error("Without that list every review would look new and be re-analysed, "
+                 "overwriting stored results. Fix the database connection and rerun, or "
+                 "pass --reanalyse-existing to analyse every loaded review regardless.")
+    return 1
+
+
+def finish_without_new_reviews(config: Config, args: argparse.Namespace,
+                               sync_results: Optional[Dict[str, SourceSyncResult]]) -> int:
+    """Every loaded review is already analysed in the database: nothing to
+    analyse, write, load, translate or generate action items for. Synced
+    files still move to Processed -- the lookup that emptied the list is the
+    confirmation that their reviews are in the database -- unless
+    --skip-db-load says this run must not commit anything."""
+    logger.info("Every loaded review is already analysed in the database; nothing new to "
+                "analyse, load, translate or generate action items for")
+    if sync_results is None:
+        return 0
+    if args.skip_db_load:
+        logger.info("--skip-db-load set; not moving any SharePoint files to Processed. They "
+                    "stay in In Progress for the next run.")
+        return 0
+    try:
+        move_synced_files_to_processed(config, sync_results)
+    except SharePointSignInRequiredError as exc:
+        return report_sign_in_required(exc)
+    return 0
 
 
 def write_outputs(config: Config, results: List[Dict[str, Any]],
@@ -468,6 +561,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.limit:
         all_reviews = all_reviews[: args.limit]
         logger.info("Limited to first %d reviews", len(all_reviews))
+
+    try:
+        all_reviews, already_analysed = drop_already_analysed(config, args, all_reviews)
+    except ExistingReviewsReadError as exc:
+        return report_existing_reviews_unreadable(exc)
+    if already_analysed and not all_reviews:
+        return finish_without_new_reviews(config, args, sync_results)
 
     analyzer = build_analyzer(config)
     done = resume_state(config, args, all_reviews)
