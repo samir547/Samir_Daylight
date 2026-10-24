@@ -109,7 +109,7 @@ Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
    "title": "<short action starting with a verb>",
    "description": "<what to do, in 1 to 3 sentences>",
    "rationale": "<why, citing the numbers from the summary>",
-   "related_area": "<one value from rule 8>",
+   "related_area": "<one value from rule 12>",
    "evidence": "<one plain sentence quoting the supporting counts>",
    "evidence_strength": "<strong, moderate or early signal>"}},
   {{"rank": 2, ...}},

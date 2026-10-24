@@ -2,6 +2,7 @@
 the prompt, validation of the reply, and the orchestration with a fake
 analyzer and a fake repository (no API or database access)."""
 import json
+import re
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -700,6 +701,12 @@ class TestPrompt:
                      '"rationale"', '"related_area"', '"evidence"',
                      '"evidence_strength"', '"early signal"'):
             assert rule in " ".join(prompt.split()), rule
+
+    def test_related_area_placeholder_points_at_its_rule(self):
+        summary = build_summary(window_of(TestBuildSummary().rows()), 15, 10, 300)
+        prompt = build_action_items_prompt(summary, summary_areas(summary))
+        [n] = re.findall(r'"related_area": "<one value from rule (\d+)>"', prompt)
+        assert re.search(rf'^{n}\. "related_area" must be exactly one of', prompt, re.M)
 
     def test_real_numbers_prompt_has_the_like_for_like_and_small_sample_rules(self):
         summary = build_summary(window_of(real_region_source_rows()), 15, 10, 300)
