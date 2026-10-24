@@ -229,17 +229,75 @@ class TestMigration:
                      "add_action_items_window_months"):
             assert " ".join(_migration(name).split()) in " ".join(canonical.split())
 
-    def test_view_reads_latest_generation_only(self):
-        view = (SQL_DIR / "views" / "vw_latest_action_items.sql").read_text(encoding="utf-8")
-        assert "CREATE OR ALTER VIEW dbo.vw_latest_action_items" in view
-        assert "SELECT TOP (1) generation_id" in view
-        assert "ORDER BY generated_at DESC, item_id DESC" in view
-        assert "AS basis" in view
 
-    def test_view_returns_evidence_strength(self):
-        view = (SQL_DIR / "views" / "vw_latest_action_items.sql").read_text(encoding="utf-8")
-        columns = view.split("CREATE OR ALTER VIEW", 1)[1].split(
-            "FROM dbo.sentiment_action_items AS a", 1)[0]
-        assert re.search(r"UPPER\(LEFT\(a\.evidence_strength, 1\)\) \+ "
-                         r"SUBSTRING\(a\.evidence_strength, 2, 20\)\s+AS evidence_strength,",
-                         columns)
+VIEW_FILE = SQL_DIR / "views" / "vw_latest_action_items.sql"
+
+
+def _view():
+    return VIEW_FILE.read_text(encoding="utf-8")
+
+
+def _view_body():
+    body = _view().split("CREATE OR ALTER VIEW dbo.vw_latest_action_items AS", 1)[1]
+    return body.split("GO", 1)[0]
+
+
+def _flat(text):
+    return " ".join(text.split())
+
+
+class TestView:
+    def test_create_or_alter_and_no_order_by_in_the_view(self):
+        assert "CREATE OR ALTER VIEW dbo.vw_latest_action_items AS" in _view()
+        body = _view_body()
+        # ORDER BY only inside ROW_NUMBER(), never on the view itself.
+        assert body.count("ORDER BY") == 1
+        assert "OVER (PARTITION BY" in _flat(body)
+
+    def test_newest_generation_per_window_label(self):
+        flat = _flat(_view_body())
+        assert "COALESCE(a.window_label, N'Custom window') AS window_group" in flat
+        assert ("ROW_NUMBER() OVER (PARTITION BY window_group "
+                "ORDER BY generated_at DESC, item_id DESC) AS newest") in flat
+        assert "ON r.generation_id = l.generation_id AND r.newest = 1" in flat
+        assert "TOP (1)" not in flat  # not one generation across every window
+
+    def test_returns_the_columns_power_bi_needs(self):
+        select = _flat(_view_body().split("FROM labelled AS l", 1)[0])
+        for column in ("l.window_group AS window_label", "l.window_months",
+                       "l.[rank] AS item_rank", "l.title", "l.description", "l.rationale",
+                       "AS related_area", "l.evidence,", "AS evidence_strength", "AS basis",
+                       "l.window_start", "l.window_end", "l.reviews_analysed",
+                       "l.generated_at", "l.generation_id"):
+            assert column in select, column
+
+    def test_readable_related_area_and_evidence_strength(self):
+        flat = _flat(_view_body())
+        assert ("CASE WHEN l.related_area = 'overall' THEN 'Overall' ELSE l.related_area END "
+                "AS related_area") in flat
+        assert ("UPPER(LEFT(l.evidence_strength, 1)) + SUBSTRING(l.evidence_strength, 2, 20) "
+                "AS evidence_strength") in flat
+
+    def test_basis_and_the_out_of_date_note(self):
+        flat = _flat(_view_body())
+        assert ("CONCAT(N'Based on ', l.reviews_analysed, N' reviews from ', "
+                "CONVERT(CHAR(10), l.window_start, 23), N' to ', "
+                "CONVERT(CHAR(10), l.window_end, 23),") in flat
+        assert ("CASE WHEN l.window_end < DATEADD(DAY, -s.stale_after_days, "
+                "CAST(SYSDATETIME() AS DATE))") in flat
+        assert ("THEN CONCAT(N'. Newest review is from ', CONVERT(CHAR(10), l.window_end, 23), "
+                "N', so this may be out of date.') ELSE N'' END) AS basis") in flat
+
+    def test_45_day_constant_is_named_and_documented(self):
+        flat = _flat(_view_body())
+        assert "SELECT 45 AS stale_after_days" in flat
+        assert "CROSS JOIN settings AS s" in flat
+        assert "STALE_AFTER_DAYS" in _view_body()
+        assert "stale_after_days (45" in _view()
+
+    def test_header_describes_deployment_and_power_bi(self):
+        header = _flat(" ".join(line.lstrip("- ") for line in
+                                _view().split("CREATE OR ALTER VIEW", 1)[0].splitlines()))
+        assert "applied by an administrator in SSMS" in header
+        assert "single-select slicer on window_label" in header
+        assert "date slicer does not drive these items" in header
