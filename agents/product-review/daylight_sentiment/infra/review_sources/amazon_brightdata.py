@@ -26,10 +26,13 @@ logger = logging.getLogger("multi_source_sentiment")
 COLUMNS = ("review_id", "rating", "product_name", "asin", "model_number",
            "review_country", "review_header", "review_text", "author_name",
            "review_posted_date", "is_verified")
+# Read as text in both formats (ids and codes must not become numbers).
+TEXT_COLUMNS = ("review_id", "product_name", "asin", "model_number", "review_country",
+                "review_header", "review_text", "author_name")
 
 
 def load_amazon_product(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path, COLUMNS)
+    df = read_table(path, COLUMNS, TEXT_COLUMNS)
 
     # Scrape-failure rows carry an error code and no review payload.
     if "error" in df.columns:

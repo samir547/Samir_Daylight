@@ -310,6 +310,93 @@ class TestMissingColumns:
         assert len(AmazonBrightDataSource(_sources_config(tmp_path)).fetch()) == 1
 
 
+def _load_both_ways(tmp_path, source_cls, stem, rows):
+    """Write the same table as .xlsx and as .csv (each in its own folder),
+    load each through the source, and return (from_xlsx, from_csv).
+    dtype=object keeps an int column with blanks as ints in the written
+    files, as a real export has them (pandas would otherwise write 35000.0)."""
+    df = pd.DataFrame(rows, dtype=object)
+    out = []
+    for ext in ("xlsx", "csv"):
+        folder = tmp_path / ext
+        folder.mkdir()
+        if ext == "xlsx":
+            df.to_excel(folder / f"{stem}.xlsx", index=False)
+        else:
+            df.to_csv(folder / f"{stem}.csv", index=False)
+        out.append(source_cls(_sources_config(folder)).fetch())
+    return tuple(out)
+
+
+BLANK = None
+
+
+class TestXlsxCsvParity:
+    """The same data supplied as .xlsx and as .csv gives identical reviews:
+    ids/SKUs as text (leading zeros kept, no "123.0"), ratings as int, empty
+    cells as "", fully blank rows ignored."""
+
+    def test_trustpilot_product(self, tmp_path):
+        rows = [
+            {"review_id": "00123", "stars": 5, "product_name": "Lamp", "product_sku": 35000,
+             "content": "Great light", "consumer_name": "Pat",
+             "created_at": "2026-10-07T17:24:58.498Z"},
+            dict.fromkeys(TP_PRODUCT_ROW, BLANK),
+            {"review_id": "60f0321651", "stars": 2, "product_name": BLANK,
+             "product_sku": BLANK, "content": "Flickers", "consumer_name": BLANK,
+             "created_at": BLANK},
+        ]
+        from_xlsx, from_csv = _load_both_ways(
+            tmp_path, TrustpilotProductSource, "trustpilot-product-reviews", rows)
+        assert from_xlsx == from_csv
+        assert [r["review_id"] for r in from_csv] == ["00123", "60f0321651"]
+        assert [r["product_sku"] for r in from_csv] == ["35000", ""]
+        assert [r["rating"] for r in from_csv] == [5, 2]
+        assert all(type(r["rating"]) is int for r in from_csv)
+        assert from_csv[1]["product_name"] == "" and from_csv[1]["review_date"] == ""
+
+    def test_trustpilot_service(self, tmp_path):
+        rows = [
+            {"Review Id": 98765, "Review Stars": 4, "Review Title": "Great",
+             "Review Content": "Fast reply.", "Review Username": "Sam",
+             "Review Created (UTC)": "2026-10-07T17:24:58.498Z"},
+            dict.fromkeys(TP_SERVICE_ROW, BLANK),
+            {"Review Id": "0042", "Review Stars": 1, "Review Title": BLANK,
+             "Review Content": "Slow.", "Review Username": BLANK,
+             "Review Created (UTC)": BLANK},
+        ]
+        from_xlsx, from_csv = _load_both_ways(
+            tmp_path, TrustpilotServiceSource, "TrustPilot Service Reviews", rows)
+        assert from_xlsx == from_csv
+        assert [r["review_id"] for r in from_csv] == ["98765", "0042"]
+        assert [r["rating"] for r in from_csv] == [4, 1]
+        assert from_csv[1]["title"] == "" and from_csv[1]["text"] == "Slow."
+
+    def test_amazon(self, tmp_path):
+        rows = [
+            {**AMAZON_ROW, "review_id": "R1ABC", "model_number": "u25090",
+             "asin": "B0123", "is_verified": True},
+            dict.fromkeys(AMAZON_ROW, BLANK),
+            {**AMAZON_ROW, "review_id": "R2DEF", "rating": 3, "model_number": 1410,
+             "review_header": BLANK, "review_country": BLANK, "is_verified": BLANK},
+            {**AMAZON_ROW, "review_id": "R3GHI", "rating": 1, "is_verified": False},
+        ]
+        from_xlsx, from_csv = _load_both_ways(
+            tmp_path, AmazonBrightDataSource, "amazon_product_reviews_all", rows)
+        assert from_xlsx == from_csv
+        assert [r["review_id"] for r in from_csv] == ["R1ABC", "R2DEF", "R3GHI"]
+        assert [r["model_number"] for r in from_csv] == ["U25090", "1410", "U25090"]
+        assert [r["rating"] for r in from_csv] == [4, 3, 1]
+        assert [r["verified_purchase"] for r in from_csv] == [True, None, False]
+        assert from_csv[1]["review_country"] == "" and from_csv[1]["title"] == ""
+
+    def test_csv_with_byte_order_mark(self, tmp_path):
+        path = tmp_path / "TrustPilot Service Reviews.csv"
+        pd.DataFrame([TP_SERVICE_ROW]).to_csv(path, index=False, encoding="utf-8-sig")
+        [review] = TrustpilotServiceSource(_sources_config(tmp_path)).fetch()
+        assert review["review_id"] == "s1"
+
+
 class TestLoadReviews:
     def test_uid_assignment_and_row_fallback(self):
         class Fake:

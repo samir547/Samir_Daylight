@@ -43,19 +43,28 @@ class MissingColumnsError(ValueError):
     loading the rows with those fields silently empty."""
 
 
-def read_table(path: Path, required: Sequence[str] = ()) -> pd.DataFrame:
+def read_table(path: Path, required: Sequence[str] = (),
+               text_columns: Sequence[str] = ()) -> pd.DataFrame:
     """Read a review export by its real extension: .xlsx through read_excel,
     .csv through read_csv. Every loader goes through here, so a source can be
     supplied in either format and the column handling after it is shared.
 
     ``required`` lists the columns the loader reads; if any is absent the
     whole file is rejected with MissingColumnsError naming the file and the
-    missing columns."""
+    missing columns.
+
+    ``text_columns`` are read as text in both formats, so an id or SKU such
+    as 00123 keeps its leading zeros and never turns into 123.0 because the
+    column has a blank cell. Fully blank rows are dropped: Excel leaves
+    trailing empty rows out, a CSV keeps them as ",,,," lines."""
     suffix = path.suffix.lower()
+    dtype = {c: str for c in text_columns}
     if suffix == ".xlsx":
-        df = pd.read_excel(path)
+        df = pd.read_excel(path, dtype=dtype)
     elif suffix == ".csv":
-        df = pd.read_csv(path)
+        # utf-8-sig: a byte-order mark (Excel's "CSV UTF-8") would otherwise
+        # become part of the first column name.
+        df = pd.read_csv(path, dtype=dtype, encoding="utf-8-sig")
     else:
         raise ValueError(f"{path}: unsupported review file type {path.suffix!r} "
                          f"(expected .xlsx or .csv)")
@@ -63,7 +72,7 @@ def read_table(path: Path, required: Sequence[str] = ()) -> pd.DataFrame:
     if missing:
         raise MissingColumnsError(
             f"{path} is missing required column(s): {', '.join(missing)}")
-    return df
+    return df.dropna(how="all")
 
 
 def load_reviews(sources: List[ReviewSource]) -> List[Dict[str, Any]]:

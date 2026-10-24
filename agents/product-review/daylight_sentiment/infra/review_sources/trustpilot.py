@@ -16,10 +16,14 @@ PRODUCT_COLUMNS = ("review_id", "stars", "product_name", "product_sku", "content
                    "consumer_name", "created_at")
 SERVICE_COLUMNS = ("Review Id", "Review Stars", "Review Title", "Review Content",
                    "Review Username", "Review Created (UTC)")
+# Read as text in both formats (ids and SKUs must not become numbers).
+PRODUCT_TEXT_COLUMNS = ("review_id", "product_name", "product_sku", "content",
+                        "consumer_name")
+SERVICE_TEXT_COLUMNS = ("Review Id", "Review Title", "Review Content", "Review Username")
 
 
 def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path, PRODUCT_COLUMNS)
+    df = read_table(path, PRODUCT_COLUMNS, PRODUCT_TEXT_COLUMNS)
     reviews = []
     for _, row in df.iterrows():
         reviews.append({
@@ -38,7 +42,7 @@ def load_trustpilot_product(path: Path) -> List[Dict[str, Any]]:
 
 
 def load_trustpilot_service(path: Path) -> List[Dict[str, Any]]:
-    df = read_table(path, SERVICE_COLUMNS)
+    df = read_table(path, SERVICE_COLUMNS, SERVICE_TEXT_COLUMNS)
     reviews = []
     for _, row in df.iterrows():
         title = _clean_str(row.get("Review Title"))
