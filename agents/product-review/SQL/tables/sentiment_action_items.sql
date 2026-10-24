@@ -15,8 +15,8 @@
 --                     run that generated it; NULL for an on-demand generation.
 --                     Not an enforced foreign key.
 --   window_start/end  the review dates the items are based on. window_end is
---                     the newest review date in the data, not the day they
---                     were generated.
+--                     the newest review date in the data (or the day they
+--                     were generated, if that is earlier).
 --   reviews_analysed  how many analysed reviews fall in that window.
 --   evidence_strength 'strong', 'moderate' or 'early signal' ('early signal'
 --                     whenever related_area is a group with too few reviews

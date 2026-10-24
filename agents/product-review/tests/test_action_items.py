@@ -2,7 +2,7 @@
 the prompt, validation of the reply, and the orchestration with a fake
 analyzer and a fake repository (no API or database access)."""
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -120,6 +120,33 @@ class TestSelectWindow:
                 + [review(100 + i, "2026-07-01") for i in range(60)])
         w = select_window(rows, 12, 100, 50)
         assert w.review_count == 120 and w.end == date(2026, 8, 1)
+
+    def test_future_date_does_not_move_the_window_past_today(self):
+        rows = ([review(i, date(2026, 8, 20)) for i in range(120)]
+                + [review(500, date(2027, 5, 1))])
+        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
+        assert w.end == date(2026, 10, 24) and w.start == date(2025, 10, 25)
+        assert w.capped_from == date(2027, 5, 1) and w.future_dated == 1
+        assert w.review_count == 121  # the future-dated review is kept
+
+    def test_no_cap_when_the_newest_date_is_not_in_the_future(self):
+        rows = [review(i, date(2026, 10, 24)) for i in range(120)]
+        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
+        assert w.end == date(2026, 10, 24)
+        assert w.capped_from is None and w.future_dated == 0
+
+    def test_cap_applies_to_a_widened_window(self):
+        rows = ([review(i, date(2020, 1, 1)) for i in range(60)]
+                + [review(500, date(2030, 1, 1))])
+        w = select_window(rows, 12, 100, 50, today=date(2026, 10, 24))
+        assert w.widened and w.end == date(2026, 10, 24) and w.start == date(2020, 1, 1)
+        assert w.capped_from == date(2030, 1, 1)
+
+    def test_defaults_to_the_current_date(self):
+        future = date.today() + timedelta(days=400)
+        rows = [review(i, future) for i in range(120)]
+        w = select_window(rows, 12, 100, 50)
+        assert w.end == date.today() and w.start <= w.end
 
     def test_months_before_clamps_short_months(self):
         assert months_before(date(2026, 3, 31), 1) == date(2026, 2, 28)
@@ -876,6 +903,15 @@ class TestGenerate:
         assert outcome.skipped and outcome.items == []
         assert analyzer.calls == [] and repo.saved == []
         assert "not generated" in caplog.text
+
+    def test_window_cap_is_logged(self, caplog):
+        rows = dataset() + [review(9999, date.today() + timedelta(days=30), review_type="service")]
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            outcome, _, repo = self.run(rows=rows)
+        assert repo.saved[0]["window_end"] == date.today()
+        assert outcome.window.capped_from == date.today() + timedelta(days=30)
+        assert "is after today, so the window ends today" in caplog.text
+        assert "1 review(s) dated after today" in caplog.text
 
     def test_provider_error_propagates(self):
         with pytest.raises(FatalProviderError):

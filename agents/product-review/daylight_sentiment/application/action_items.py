@@ -60,6 +60,11 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
     rows = repository.fetch_analysed_rows()
     window = select_window(rows, settings.window_months, settings.min_window_reviews,
                            settings.min_total_reviews)
+    if window.capped_from:
+        logger.warning("Action items: the newest review date (%s) is after today, so the "
+                       "window ends today (%s) instead; %d review(s) dated after today "
+                       "are kept in it", window.capped_from.isoformat(),
+                       window.end.isoformat(), window.future_dated)
     if window.undated_excluded:
         logger.info("Action items: %d analysed review(s) have no parsed review date "
                     "and are left out", window.undated_excluded)

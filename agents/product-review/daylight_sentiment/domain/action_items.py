@@ -94,6 +94,10 @@ class ReviewWindow:
     widened: bool = False
     undated_excluded: int = 0
     skip_reason: Optional[str] = None
+    # Set when the newest review date is after today, so the window was
+    # ended today instead; future_dated counts the reviews dated after today.
+    capped_from: Optional[date] = None
+    future_dated: int = 0
 
     @property
     def skipped(self) -> bool:
@@ -153,15 +157,20 @@ def months_before(end: date, months: int) -> date:
 
 
 def select_window(rows: Iterable[Dict[str, Any]], months: int,
-                  min_window_reviews: int, min_total_reviews: int) -> ReviewWindow:
+                  min_window_reviews: int, min_total_reviews: int,
+                  today: Optional[date] = None) -> ReviewWindow:
     """Pick the analysed reviews to base the items on.
 
     The window is the ``months`` months ending on the NEWEST review date in
-    the data (not today), so it doesn't shrink while no new files arrive.
-    Fewer than ``min_window_reviews`` in it widens to every dated review;
-    fewer than ``min_total_reviews`` even then skips generation. Rows with
-    no sentiment or no parsed review date are left out.
+    the data, so it doesn't shrink while no new files arrive -- or on
+    ``today`` (default: the current date) if that is earlier, so a wrongly
+    parsed future date can't push the window forward. Reviews dated after
+    today stay in it. Fewer than ``min_window_reviews`` in it widens to
+    every dated review; fewer than ``min_total_reviews`` even then skips
+    generation. Rows with no sentiment or no parsed review date are left
+    out.
     """
+    today = today or date.today()
     analysed = [r for r in rows if r.get("sentiment")]
     dated = []
     for r in analysed:
@@ -174,19 +183,22 @@ def select_window(rows: Iterable[Dict[str, Any]], months: int,
         return ReviewWindow([], None, None, undated_excluded=undated,
                             skip_reason="no analysed reviews with a review date")
 
-    end = max(r["review_date_parsed"] for r in dated)
+    newest = max(r["review_date_parsed"] for r in dated)
+    end = min(newest, today)
+    capped = {"capped_from": newest if newest > today else None,
+              "future_dated": sum(1 for r in dated if r["review_date_parsed"] > today)}
     start = months_before(end, months) + timedelta(days=1)
     in_window = [r for r in dated if r["review_date_parsed"] >= start]
     if len(in_window) >= min_window_reviews:
-        return ReviewWindow(in_window, start, end, undated_excluded=undated)
+        return ReviewWindow(in_window, start, end, undated_excluded=undated, **capped)
 
-    earliest = min(r["review_date_parsed"] for r in dated)
+    earliest = min(min(r["review_date_parsed"] for r in dated), end)
     if len(dated) < min_total_reviews:
         return ReviewWindow(
             dated, earliest, end, widened=True, undated_excluded=undated,
             skip_reason=(f"only {len(dated)} dated, analysed reviews in total "
-                         f"(minimum {min_total_reviews})"))
-    return ReviewWindow(dated, earliest, end, widened=True, undated_excluded=undated)
+                         f"(minimum {min_total_reviews})"), **capped)
+    return ReviewWindow(dated, earliest, end, widened=True, undated_excluded=undated, **capped)
 
 
 def parse_themes(raw: Any) -> List[str]:

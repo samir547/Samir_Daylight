@@ -11,7 +11,7 @@
 --   "Based on 710 reviews from 2025-08-21 to 2026-08-20"
 -- built from the stored window and count, so a reader can see how recent the
 -- reviews behind the advice are. The window ends on the newest review date in
--- the data, not on the day the items were generated.
+-- the data, or on the day the items were generated if that is earlier.
 --
 -- evidence_strength reads "Strong", "Moderate" or "Early signal" ("Early
 -- signal" when the item rests on too few reviews to be sure).
