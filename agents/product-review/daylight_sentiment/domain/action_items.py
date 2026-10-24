@@ -291,13 +291,30 @@ def _area(row: Dict[str, Any]) -> str:
     return OVERALL_AREA
 
 
+def single_spaced(text: str) -> str:
+    """Every run of whitespace, line breaks included, as one space. A line
+    break dropped by whatever displays the text would otherwise join the
+    words either side of it."""
+    return " ".join(text.split())
+
+
+def shorten(text: str, max_chars: int) -> str:
+    """``text`` cut to at most ``max_chars`` characters at a word boundary,
+    with "..." after the last whole word. A single word longer than the
+    limit is the only thing cut mid-word."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars - 3]
+    if not text[max_chars - 3].isspace() and " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:-") + "..."
+
+
 def _clean_excerpt(text: str, max_chars: int) -> str:
-    text = " ".join(text.split())
+    text = single_spaced(text)
     text = _EMAIL.sub("[email removed]", text)
     text = _PHONE.sub("[number removed]", text)
-    if len(text) > max_chars:
-        text = text[:max_chars - 3].rstrip() + "..."
-    return text
+    return shorten(text, max_chars)
 
 
 def select_excerpts(rows: Sequence[Dict[str, Any]], max_excerpts: int,
@@ -351,9 +368,7 @@ def _product_name(names: Counter, sku: str) -> str:
     if not names:
         return sku
     name = min(names.items(), key=lambda kv: (-kv[1], kv[0]))[0]
-    if len(name) > PRODUCT_NAME_CHARS:
-        name = name[:PRODUCT_NAME_CHARS - 3].rstrip() + "..."
-    return name
+    return shorten(name, PRODUCT_NAME_CHARS)
 
 
 def products_most_negative(product_rows: Iterable[Dict[str, Any]],
@@ -553,7 +568,7 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
         if not isinstance(value, str) or not value.strip():
             problems.append(f"item {i} has a missing or empty {name}")
             continue
-        value = value.strip()
+        value = single_spaced(value)
         if len(value) > FIELD_MAX_CHARS[name]:
             problems.append(f"item {i} {name} is {len(value)} characters "
                             f"(limit {FIELD_MAX_CHARS[name]})")
@@ -590,7 +605,8 @@ def _check_item(i: int, item: Any, canonical: Dict[str, str], small: set,
 
 def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Check the model's reply against the summary it was given and return
-    the items ordered by rank, with text stripped, related_area in its
+    the items ordered by rank, with text single-spaced (line breaks
+    included), related_area in its
     canonical spelling and evidence_strength lower-case. Every number in
     the description, rationale and evidence must be in the summary (dates,
     years and periods aside; a percentage may be rounded to a whole

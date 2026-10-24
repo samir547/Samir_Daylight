@@ -29,6 +29,8 @@ from daylight_sentiment.domain.action_items import (
     products_most_negative,
     select_excerpts,
     select_window,
+    shorten,
+    single_spaced,
     small_sample_areas,
     summary_areas,
     summary_numbers,
@@ -432,7 +434,25 @@ class TestSelectExcerpts:
                        review_text_en="English text " * 50)]
         [ex] = select_excerpts(rows, 10, 300)
         assert ex["text"].startswith("English text")
-        assert len(ex["text"]) == 300 and ex["text"].endswith("...")
+        assert len(ex["text"]) <= 300 and ex["text"].endswith(" English...")
+
+    def test_quote_is_cut_at_a_word_boundary(self):
+        text = "Please send me the return authorization number so I can post it back today"
+        rows = [review(1, date(2026, 6, 1), "negative", review_text=text)]
+        [ex] = select_excerpts(rows, 10, 45)
+        assert ex["text"] == "Please send me the return authorization..."
+        assert len(ex["text"]) <= 45
+
+    @pytest.mark.parametrize("text, limit, expected", [
+        ("short enough", 20, "short enough"),
+        ("one two three four", 12, "one two..."),
+        ("one two, three", 12, "one two..."),
+        ("one two three", 11, "one two..."),
+        ("abcdefghijklmnop", 10, "abcdefg..."),
+    ])
+    def test_shorten(self, text, limit, expected):
+        assert shorten(text, limit) == expected
+        assert len(shorten(text, limit)) <= limit
 
     def test_falls_back_to_original_text(self):
         rows = [review(1, date(2026, 6, 1), "negative", review_text="Lampe cassée")]
@@ -515,6 +535,19 @@ class TestValidate:
         reply = good_reply()
         reply["items"][0]["title"] = "  Review the stand design \n"
         assert validate_action_items(reply, AREAS)[1]["title"] == "Review the stand design"
+
+    def test_line_breaks_and_whitespace_runs_become_one_space(self):
+        # A line break inside a JSON string survives parsing; whatever shows
+        # the text later may drop it and join the words ("thatreturn").
+        reply = good_reply()
+        reply["items"][0]["description"] = ("Check the products that\nreturn most often,"
+                                            "\r\n\tand  which\n\nspecific parts fail.")
+        reply["items"][0]["title"] = "Review the\nstand design"
+        item = validate_action_items(reply, AREAS)[1]
+        assert item["description"] == ("Check the products that return most often, and "
+                                       "which specific parts fail.")
+        assert item["title"] == "Review the stand design"
+        assert single_spaced("a  b\n") == "a b"
 
     @pytest.mark.parametrize("count", [2, 4])
     def test_rejects_wrong_item_count(self, count):
