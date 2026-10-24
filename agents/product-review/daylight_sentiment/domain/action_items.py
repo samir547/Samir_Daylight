@@ -18,6 +18,29 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 ITEM_COUNT = 3
 OVERALL_AREA = "overall"
+
+# A group (sector group, aspect, region, source, product...) with fewer
+# reviews than this is flagged small_sample in the summary: too few to
+# support more than an early signal.
+SMALL_SAMPLE_REVIEWS = 30
+# The per-product section: at most TOP_PRODUCTS products, each with at least
+# MIN_PRODUCT_NEGATIVES negative reviews; names cut to PRODUCT_NAME_CHARS.
+TOP_PRODUCTS = 10
+MIN_PRODUCT_NEGATIVES = 3
+PRODUCT_NAME_CHARS = 80
+
+# Service-review aspect labels (domain/taxonomy.ASPECTS) as the reader sees
+# them: in the summary, in related_area and so in Power BI.
+ASPECT_NAMES = {
+    "shipping_quality": "Shipping quality",
+    "customer_service": "Customer service",
+    "product_quality": "Product quality",
+    "fulfillment_speed": "Delivery speed",
+    "communication": "Communication",
+    "returns_refunds": "Returns & refunds",
+    "warranty": "Warranty",
+    "general_experience": "General experience",
+}
 ITEM_FIELDS = ("title", "description", "rationale", "related_area", "evidence")
 
 # Caps follow dbo.sentiment_action_items: title NVARCHAR(200), related_area
@@ -66,18 +89,19 @@ class ReviewWindow:
 @dataclass
 class _Tally:
     reviews: int = 0
-    negative: int = 0
+    negatives: int = 0
     by_sentiment: Counter = field(default_factory=Counter)
 
     def add(self, sentiment: str) -> None:
         self.reviews += 1
         self.by_sentiment[sentiment] += 1
         if sentiment == "negative":
-            self.negative += 1
+            self.negatives += 1
 
-    def as_dict(self) -> Dict[str, Any]:
-        return {"reviews": self.reviews, "negative": self.negative,
-                "negative_share_pct": _pct(self.negative, self.reviews)}
+    def as_dict(self, small_sample_reviews: int) -> Dict[str, Any]:
+        return {"reviews": self.reviews, "negatives": self.negatives,
+                "negative_share_pct": _pct(self.negatives, self.reviews),
+                "small_sample": self.reviews < small_sample_reviews}
 
 
 def _pct(part: int, whole: int) -> float:
@@ -172,11 +196,64 @@ def parse_themes(raw: Any) -> List[str]:
     return out
 
 
+def aspect_name(label: Optional[str]) -> str:
+    """Readable name of a service aspect label ("returns_refunds" ->
+    "Returns & refunds"); a label outside ASPECT_NAMES is humanised."""
+    if not label:
+        return "Unknown"
+    if label in ASPECT_NAMES:
+        return ASPECT_NAMES[label]
+    text = " ".join(label.replace("_", " ").split())
+    return text[:1].upper() + text[1:].lower()
+
+
+# Theme words reduced to a shared stem so that "defective product" and
+# "product defect" count as one theme. Kept short and explicit on purpose.
+_THEME_STEMS = {"defective": "defect", "broken": "break", "broke": "break"}
+
+
+def _theme_word(word: str) -> str:
+    word = _THEME_STEMS.get(word, word)
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def theme_key(theme: str) -> str:
+    """Key under which near-identical themes are counted together: the
+    words singularised, stemmed (_THEME_STEMS) and put in alphabetical
+    order, so plural and word-order variants share one count."""
+    return " ".join(sorted(_theme_word(w) for w in theme.split()))
+
+
+def count_negative_themes(rows: Iterable[Dict[str, Any]]) -> List[tuple]:
+    """(theme, negative reviews mentioning it), most frequent first.
+    Near-identical themes are merged (theme_key) and each review counts
+    once per merged theme, which is shown under its most frequent
+    spelling."""
+    counts: Counter = Counter()
+    spellings: Dict[str, Counter] = defaultdict(Counter)
+    for r in rows:
+        if r.get("sentiment") != "negative":
+            continue
+        keys = set()
+        for theme in parse_themes(r.get("key_themes")):
+            key = theme_key(theme)
+            spellings[key][theme] += 1
+            keys.add(key)
+        counts.update(keys)
+    label = {k: min(v.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+             for k, v in spellings.items()}
+    return sorted(((label[k], c) for k, c in counts.items()), key=lambda tc: (-tc[1], tc[0]))
+
+
 def _area(row: Dict[str, Any]) -> str:
     if row.get("review_type") == "product":
         return row.get("sector_group") or "Unknown"
     if row.get("review_type") == "service":
-        return row.get("primary_aspect") or "Unknown"
+        return aspect_name(row.get("primary_aspect"))
     return OVERALL_AREA
 
 
@@ -227,18 +304,61 @@ def select_excerpts(rows: Sequence[Dict[str, Any]], max_excerpts: int,
     } for r in picked]
 
 
-def _grouped(rows: Iterable[Dict[str, Any]], key) -> List[Dict[str, Any]]:
+def _grouped(rows: Iterable[Dict[str, Any]], key,
+             small_sample_reviews: int) -> List[Dict[str, Any]]:
     tallies: Dict[str, _Tally] = defaultdict(_Tally)
     for r in rows:
         tallies[key(r)].add(r.get("sentiment"))
-    ordered = sorted(tallies.items(), key=lambda kv: (-kv[1].negative, -kv[1].reviews, kv[0]))
-    return [{"name": name, **t.as_dict()} for name, t in ordered]
+    ordered = sorted(tallies.items(), key=lambda kv: (-kv[1].negatives, -kv[1].reviews, kv[0]))
+    return [{"name": name, **t.as_dict(small_sample_reviews)} for name, t in ordered]
+
+
+def _product_name(names: Counter, sku: str) -> str:
+    if not names:
+        return sku
+    name = min(names.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+    if len(name) > PRODUCT_NAME_CHARS:
+        name = name[:PRODUCT_NAME_CHARS - 3].rstrip() + "..."
+    return name
+
+
+def products_most_negative(product_rows: Iterable[Dict[str, Any]],
+                           small_sample_reviews: int) -> List[Dict[str, Any]]:
+    """The products with the most negative reviews, by resolved_sku (the
+    one product key the view resolves for both sources), named by their
+    most frequent product_name. Products with fewer than
+    MIN_PRODUCT_NEGATIVES negatives are left out; at most TOP_PRODUCTS."""
+    tallies: Dict[str, _Tally] = defaultdict(_Tally)
+    names: Dict[str, Counter] = defaultdict(Counter)
+    regions: Dict[str, Counter] = defaultdict(Counter)
+    for r in product_rows:
+        sku = (r.get("resolved_sku") or "").strip()
+        if not sku:
+            continue
+        tallies[sku].add(r.get("sentiment"))
+        name = " ".join((r.get("product_name") or "").split())
+        if name:
+            names[sku][name] += 1
+        if r.get("product_region"):
+            regions[sku][r["product_region"]] += 1
+    kept = [(sku, t) for sku, t in tallies.items() if t.negatives >= MIN_PRODUCT_NEGATIVES]
+    kept.sort(key=lambda kv: (-kv[1].negatives, -kv[1].reviews, kv[0]))
+    out = []
+    for sku, t in kept[:TOP_PRODUCTS]:
+        entry = {"product": _product_name(names[sku], sku), "sku": sku}
+        if regions[sku]:
+            entry["region"] = regions[sku].most_common(1)[0][0]
+        out.append({**entry, **t.as_dict(small_sample_reviews)})
+    return out
 
 
 def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
-                  excerpt_chars: int) -> Dict[str, Any]:
+                  excerpt_chars: int,
+                  small_sample_reviews: int = SMALL_SAMPLE_REVIEWS) -> Dict[str, Any]:
     """Compact, JSON-serialisable summary of the window's reviews -- the only
-    thing the model is shown."""
+    thing the model is shown. Every grouped section gives reviews,
+    negatives, the negative share and small_sample (fewer than
+    ``small_sample_reviews`` reviews)."""
     rows = window.rows
     overall = _Tally()
     for r in rows:
@@ -252,15 +372,11 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
     product = [r for r in rows if r.get("review_type") == "product"]
     service = [r for r in rows if r.get("review_type") == "service"]
 
-    themes: Counter = Counter()
-    for r in rows:
-        if r.get("sentiment") == "negative":
-            themes.update(parse_themes(r.get("key_themes")))
-
     monthly: Dict[str, _Tally] = defaultdict(_Tally)
     for r in rows:
         monthly[r["review_date_parsed"].strftime("%Y-%m")].add(r.get("sentiment"))
 
+    n = small_sample_reviews
     summary: Dict[str, Any] = {
         "window": {
             "start": window.start.isoformat(),
@@ -268,29 +384,41 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
             "reviews": window.review_count,
             "widened_to_all_dates": window.widened,
         },
+        "small_sample_threshold_reviews": n,
         "sentiment": {
             "reviews": overall.reviews,
             "positive": overall.by_sentiment["positive"],
             "negative": overall.by_sentiment["negative"],
             "neutral": overall.by_sentiment["neutral"],
-            "negative_share_pct": _pct(overall.negative, overall.reviews),
+            "negative_share_pct": _pct(overall.negatives, overall.reviews),
         },
+        "negative_reviews_total": overall.negatives,
         "by_review_type_and_source": [
-            {"review_type": t, "review_source": s, **tally.as_dict()}
-            for (t, s), tally in sorted(by_type_source.items())
+            {"review_type": t, "review_source": src, **tally.as_dict(n)}
+            for (t, src), tally in sorted(by_type_source.items())
         ],
-        "product_by_sector_group": _grouped(product, lambda r: r.get("sector_group") or "Unknown"),
-        "service_by_aspect": _grouped(service, lambda r: r.get("primary_aspect") or "Unknown"),
+        "product_by_sector_group": _grouped(
+            product, lambda r: r.get("sector_group") or "Unknown", n),
+        "service_by_aspect": _grouped(
+            service, lambda r: aspect_name(r.get("primary_aspect")), n),
     }
     regional = [r for r in product if r.get("product_region")]
     if regional:
-        summary["product_by_region"] = _grouped(regional, lambda r: r["product_region"])
+        summary["product_by_region"] = _grouped(regional, lambda r: r["product_region"], n)
+        by_region_source: Dict[tuple, _Tally] = defaultdict(_Tally)
+        for r in regional:
+            by_region_source[(r["product_region"],
+                              r.get("review_source") or "unknown")].add(r.get("sentiment"))
+        summary["product_by_region_and_source"] = [
+            {"region": region, "review_source": src, **tally.as_dict(n)}
+            for (region, src), tally in sorted(by_region_source.items())
+        ]
+    summary["products_most_negative"] = products_most_negative(product, n)
     summary["top_negative_themes"] = [
-        {"theme": t, "count": c}
-        for t, c in sorted(themes.items(), key=lambda kv: (-kv[1], kv[0]))[:top_themes]
+        {"theme": t, "count": c} for t, c in count_negative_themes(rows)[:top_themes]
     ]
     summary["monthly_negative"] = [
-        {"month": m, **monthly[m].as_dict()} for m in sorted(monthly)
+        {"month": m, **monthly[m].as_dict(n)} for m in sorted(monthly)
     ]
     summary["negative_excerpts"] = select_excerpts(rows, max_excerpts, excerpt_chars)
     return summary

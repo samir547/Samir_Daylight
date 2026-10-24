@@ -22,8 +22,8 @@ SQL_DIR = Path(__file__).resolve().parent.parent / "SQL"
 def test_fetch_columns_pinned():
     assert ActionItemRepository.FETCH_COLUMNS == (
         "uid", "review_type", "review_source", "sentiment", "confidence", "rating",
-        "sector_group", "primary_aspect", "product_region", "key_themes",
-        "review_date_parsed")
+        "sector_group", "primary_aspect", "product_region", "resolved_sku", "product_name",
+        "key_themes", "review_date_parsed")
     assert ActionItemRepository.NEGATIVE_TEXT_COLUMNS == ("review_text_en", "review_text")
 
 

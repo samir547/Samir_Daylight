@@ -11,14 +11,21 @@ from daylight_sentiment.application.action_items import (
     generate_action_items,
 )
 from daylight_sentiment.config import ActionItemSettings
+from daylight_sentiment.domain import taxonomy
 from daylight_sentiment.domain.action_items import (
+    ASPECT_NAMES,
     ActionItemsValidationError,
     FIELD_MAX_CHARS,
+    SMALL_SAMPLE_REVIEWS,
     ReviewWindow,
+    aspect_name,
     build_summary,
+    count_negative_themes,
     format_action_items,
     months_before,
+    theme_key,
     parse_themes,
+    products_most_negative,
     select_excerpts,
     select_window,
     summary_areas,
@@ -152,18 +159,21 @@ class TestBuildSummary:
                                   "neutral": 1, "negative_share_pct": 50.0}
         sectors = {e["name"]: e for e in s["product_by_sector_group"]}
         assert sectors["Sewing & Needlecraft"] == {
-            "name": "Sewing & Needlecraft", "reviews": 3, "negative": 2,
-            "negative_share_pct": 66.7}
-        assert sectors["Art & Painting"]["negative"] == 0
+            "name": "Sewing & Needlecraft", "reviews": 3, "negatives": 2,
+            "negative_share_pct": 66.7, "small_sample": True}
+        assert sectors["Art & Painting"]["negatives"] == 0
         aspects = {e["name"]: e for e in s["service_by_aspect"]}
-        assert aspects["shipping_quality"]["negative_share_pct"] == 100.0
+        assert aspects["Shipping quality"]["negative_share_pct"] == 100.0
+        assert set(aspects) == {"Shipping quality", "Customer service"}
         assert {e["name"] for e in s["product_by_region"]} == {"UK", "EU"}
         assert s["by_review_type_and_source"] == [
             {"review_type": "product", "review_source": "trustpilot",
-             "reviews": 4, "negative": 2, "negative_share_pct": 50.0},
+             "reviews": 4, "negatives": 2, "negative_share_pct": 50.0, "small_sample": True},
             {"review_type": "service", "review_source": "trustpilot",
-             "reviews": 2, "negative": 1, "negative_share_pct": 50.0},
+             "reviews": 2, "negatives": 1, "negative_share_pct": 50.0, "small_sample": True},
         ]
+        assert s["negative_reviews_total"] == 3
+        assert s["small_sample_threshold_reviews"] == SMALL_SAMPLE_REVIEWS == 30
 
     def test_negative_themes_counted_and_normalised(self):
         s = build_summary(window_of(self.rows()), 15, 10, 300)
@@ -182,13 +192,17 @@ class TestBuildSummary:
     def test_monthly_trend(self):
         s = build_summary(window_of(self.rows()), 15, 10, 300)
         assert s["monthly_negative"] == [
-            {"month": "2026-05", "reviews": 2, "negative": 0, "negative_share_pct": 0.0},
-            {"month": "2026-06", "reviews": 4, "negative": 3, "negative_share_pct": 75.0},
+            {"month": "2026-05", "reviews": 2, "negatives": 0, "negative_share_pct": 0.0,
+             "small_sample": True},
+            {"month": "2026-06", "reviews": 4, "negatives": 3, "negative_share_pct": 75.0,
+             "small_sample": True},
         ]
 
     def test_no_region_section_without_regions(self):
         rows = [review(i, date(2026, 6, 1), product_region=None) for i in range(3)]
-        assert "product_by_region" not in build_summary(window_of(rows), 15, 10, 300)
+        s = build_summary(window_of(rows), 15, 10, 300)
+        assert "product_by_region" not in s
+        assert "product_by_region_and_source" not in s
 
     def test_no_reviewer_names_or_contact_details_in_output(self):
         rows = self.rows()
@@ -206,6 +220,176 @@ class TestBuildSummary:
 
     def test_summary_is_json_serialisable(self):
         json.dumps(build_summary(window_of(self.rows()), 15, 10, 300))
+
+
+# Product reviews by region and source in the real data (since 2025-08-12):
+# (region, source, reviews, negatives). Within Amazon the UK is the worst
+# region; the UK only looks best overall because most of its reviews are
+# from Trustpilot.
+REAL_REGION_SOURCE = [
+    ("EU", "amazon", 186, 29), ("EU", "trustpilot", 17, 1),
+    ("UK", "amazon", 45, 10), ("UK", "trustpilot", 77, 2),
+    ("US", "amazon", 87, 17), ("US", "trustpilot", 37, 4),
+    ("No Region Data", "trustpilot", 14, 2),
+]
+
+
+def real_region_source_rows():
+    rows, i = [], 0
+    for region, source, reviews, negatives in REAL_REGION_SOURCE:
+        for k in range(reviews):
+            rows.append(review(i, date(2026, 6, 1), "negative" if k < negatives else "positive",
+                               review_source=source, product_region=region))
+            i += 1
+    return rows
+
+
+class TestRegionAndSource:
+    def test_region_by_source_table_from_the_real_numbers(self):
+        s = build_summary(window_of(real_region_source_rows()), 15, 10, 300)
+        table = {(e["region"], e["review_source"]): e for e in s["product_by_region_and_source"]}
+        assert table == {
+            ("EU", "amazon"): {"region": "EU", "review_source": "amazon", "reviews": 186,
+                               "negatives": 29, "negative_share_pct": 15.6,
+                               "small_sample": False},
+            ("EU", "trustpilot"): {"region": "EU", "review_source": "trustpilot",
+                                   "reviews": 17, "negatives": 1,
+                                   "negative_share_pct": 5.9, "small_sample": True},
+            ("UK", "amazon"): {"region": "UK", "review_source": "amazon", "reviews": 45,
+                               "negatives": 10, "negative_share_pct": 22.2,
+                               "small_sample": False},
+            ("UK", "trustpilot"): {"region": "UK", "review_source": "trustpilot",
+                                   "reviews": 77, "negatives": 2,
+                                   "negative_share_pct": 2.6, "small_sample": False},
+            ("US", "amazon"): {"region": "US", "review_source": "amazon", "reviews": 87,
+                               "negatives": 17, "negative_share_pct": 19.5,
+                               "small_sample": False},
+            ("US", "trustpilot"): {"region": "US", "review_source": "trustpilot",
+                                   "reviews": 37, "negatives": 4,
+                                   "negative_share_pct": 10.8, "small_sample": False},
+            ("No Region Data", "trustpilot"): {
+                "region": "No Region Data", "review_source": "trustpilot", "reviews": 14,
+                "negatives": 2, "negative_share_pct": 14.3, "small_sample": True},
+        }
+        # The mixed-source region totals stay a separate section.
+        regions = {e["name"]: e for e in s["product_by_region"]}
+        assert regions["UK"]["reviews"] == 122 and regions["UK"]["negatives"] == 12
+        assert s["negative_reviews_total"] == 65
+
+    def test_sections_are_listed_in_a_stable_order(self):
+        s = build_summary(window_of(real_region_source_rows()), 15, 10, 300)
+        assert [(e["region"], e["review_source"]) for e in s["product_by_region_and_source"]] == [
+            ("EU", "amazon"), ("EU", "trustpilot"), ("No Region Data", "trustpilot"),
+            ("UK", "amazon"), ("UK", "trustpilot"), ("US", "amazon"), ("US", "trustpilot")]
+
+
+class TestSmallSample:
+    @pytest.mark.parametrize("reviews, small", [(29, True), (30, False), (31, False)])
+    def test_flag_at_the_threshold(self, reviews, small):
+        rows = [review(i, date(2026, 6, 1), "negative" if i < 5 else "positive",
+                       resolved_sku="D1", review_source="amazon")
+                for i in range(reviews)]
+        s = build_summary(window_of(rows), 15, 10, 300)
+        for section in ("product_by_sector_group", "product_by_region",
+                        "product_by_region_and_source", "by_review_type_and_source",
+                        "products_most_negative"):
+            [entry] = s[section]
+            assert entry["small_sample"] is small, section
+            assert entry["reviews"] == reviews and entry["negatives"] == 5
+
+    def test_threshold_can_be_passed_in(self):
+        rows = [review(i, date(2026, 6, 1)) for i in range(10)]
+        s = build_summary(window_of(rows), 15, 10, 300, small_sample_reviews=10)
+        assert s["product_by_sector_group"][0]["small_sample"] is False
+        assert s["small_sample_threshold_reviews"] == 10
+
+
+class TestProducts:
+    def rows(self):
+        rows, i = [], 0
+        # (sku, name, reviews, negatives)
+        for sku, name, reviews, negatives in [
+                ("D35500", "Lumi Task Lamp", 40, 6), ("U31000", "Halo Floor Lamp", 12, 3),
+                ("E20000", "Slimline Magnifier", 50, 2), (None, "No SKU lamp", 20, 10)]:
+            for k in range(reviews):
+                rows.append(review(i, date(2026, 6, 1),
+                                   "negative" if k < negatives else "positive",
+                                   resolved_sku=sku, product_name=name,
+                                   product_region={"D": "UK", "U": "US", "E": "EU"}.get(
+                                       (sku or "x")[0])))
+                i += 1
+        return rows
+
+    def test_most_negative_products_with_flags(self):
+        products = build_summary(window_of(self.rows()), 15, 10, 300)["products_most_negative"]
+        assert products == [
+            {"product": "Lumi Task Lamp", "sku": "D35500", "region": "UK", "reviews": 40,
+             "negatives": 6, "negative_share_pct": 15.0, "small_sample": False},
+            {"product": "Halo Floor Lamp", "sku": "U31000", "region": "US", "reviews": 12,
+             "negatives": 3, "negative_share_pct": 25.0, "small_sample": True},
+        ]
+
+    def test_products_with_fewer_than_3_negatives_or_no_sku_left_out(self):
+        skus = {p["sku"] for p in products_most_negative(self.rows(), 30)}
+        assert "E20000" not in skus  # only 2 negatives
+        assert None not in skus and "" not in skus
+
+    def test_top_10_only(self):
+        rows = [review(i, date(2026, 6, 1), "negative", resolved_sku=f"D{i // 3:03d}")
+                for i in range(3 * 12)]
+        assert len(products_most_negative(rows, 30)) == 10
+
+    def test_name_is_most_frequent_spelling_and_cut_short(self):
+        long_name = "Daylight " + "very long marketing title " * 10
+        rows = ([review(i, date(2026, 6, 1), "negative", resolved_sku="D1",
+                        product_name=long_name) for i in range(3)]
+                + [review(9, date(2026, 6, 1), "negative", resolved_sku="D1",
+                          product_name="Other")])
+        [p] = products_most_negative(rows, 30)
+        assert p["product"].startswith("Daylight very long") and p["product"].endswith("...")
+        assert len(p["product"]) <= 80
+
+    def test_falls_back_to_the_sku_without_a_name(self):
+        rows = [review(i, date(2026, 6, 1), "negative", resolved_sku="D7", product_name=None)
+                for i in range(3)]
+        assert products_most_negative(rows, 30)[0]["product"] == "D7"
+
+
+class TestThemeNormalisation:
+    @pytest.mark.parametrize("a, b", [
+        ("product defect", "defective product"),
+        ("product defect", "product defects"),
+        ("broken arm", "arm broken"),
+        ("battery", "batteries"),
+        ("delivery delay", "delivery delays"),
+    ])
+    def test_variants_share_a_key(self, a, b):
+        assert theme_key(a) == theme_key(b)
+
+    @pytest.mark.parametrize("a, b", [
+        ("product failure", "product defect"),
+        ("short lifespan", "product failure"),
+        ("brightness", "bright"),
+        ("glass", "glas"),
+    ])
+    def test_different_themes_stay_apart(self, a, b):
+        assert theme_key(a) != theme_key(b)
+
+    def test_merged_and_counted_once_per_review(self):
+        d = date(2026, 6, 1)
+        rows = [review(1, d, "negative", key_themes='["product defect", "defective product"]'),
+                review(2, d, "negative", key_themes='["Defective product"]'),
+                review(3, d, "negative", key_themes='["defective product", "short lifespan"]'),
+                review(4, d, "positive", key_themes='["product defect"]')]
+        assert count_negative_themes(rows) == [("defective product", 3), ("short lifespan", 1)]
+
+
+def test_aspect_names_cover_the_taxonomy():
+    assert set(ASPECT_NAMES) == set(taxonomy.ASPECTS)
+    assert aspect_name("returns_refunds") == "Returns & refunds"
+    assert aspect_name("shipping_quality") == "Shipping quality"
+    assert aspect_name("new_label_x") == "New label x"
+    assert aspect_name(None) == "Unknown"
 
 
 class TestSelectExcerpts:
@@ -235,7 +419,7 @@ class TestSelectExcerpts:
                            confidence=0.6))
         picked = select_excerpts(rows, 3, 300)
         assert [p["area"] for p in picked] == [
-            "Sewing & Needlecraft", "shipping_quality", "Beauty"]
+            "Sewing & Needlecraft", "Shipping quality", "Beauty"]
         assert picked[0]["text"] == "review text 0"  # most confident in its area
         assert select_excerpts(list(reversed(rows)), 3, 300) == picked
 
@@ -257,7 +441,7 @@ def good_reply():
          "rationale": "12 of 40 negative reviews.", "related_area": "Sewing & Needlecraft",
          "evidence": "12 negative reviews mention the stand."},
         {"rank": 1, "title": "Fix delivery packaging", "description": "Do it.",
-         "rationale": "9 of 10.", "related_area": "SHIPPING_QUALITY",
+         "rationale": "9 of 10.", "related_area": "SHIPPING QUALITY",
          "evidence": "9 service reviews."},
         {"rank": 3, "title": "Check flicker reports", "description": "Do it.",
          "rationale": "Only 4 reviews, so this is tentative.", "related_area": "overall",
@@ -265,14 +449,14 @@ def good_reply():
     ]}
 
 
-AREAS = ["overall", "Sewing & Needlecraft", "shipping_quality"]
+AREAS = ["overall", "Sewing & Needlecraft", "Shipping quality"]
 
 
 class TestValidate:
     def test_accepts_good_reply_sorted_and_canonicalised(self):
         items = validate_action_items(good_reply(), AREAS)
         assert [i["rank"] for i in items] == [1, 2, 3]
-        assert items[0]["related_area"] == "shipping_quality"
+        assert items[0]["related_area"] == "Shipping quality"
 
     def test_strips_whitespace(self):
         reply = good_reply()
@@ -360,14 +544,14 @@ class TestPrompt:
         summary = build_summary(window_of(TestBuildSummary().rows()), 15, 10, 300)
         assert summary_areas(summary) == [
             "overall", "Sewing & Needlecraft", "Art & Painting",
-            "shipping_quality", "customer_service", "UK", "EU"]
+            "Shipping quality", "Customer service", "UK", "EU"]
 
 
 def test_format_action_items():
     rows = [review(i, date(2026, 6, 1)) for i in range(3)]
     text = format_action_items(validate_action_items(good_reply(), AREAS), window_of(rows))
     assert text.startswith("Top 3 to-do items -- Based on 3 reviews from 2026-06-01 to 2026-06-01")
-    assert "1. Fix delivery packaging  [shipping_quality]" in text
+    assert "1. Fix delivery packaging  [Shipping quality]" in text
 
 
 # -- orchestration ------------------------------------------------------------

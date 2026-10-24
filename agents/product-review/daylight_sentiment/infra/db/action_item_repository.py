@@ -25,7 +25,7 @@ class ActionItemRepository:
     # review text columns are read for negative reviews only (the excerpts).
     FETCH_COLUMNS = ("uid", "review_type", "review_source", "sentiment", "confidence",
                      "rating", "sector_group", "primary_aspect", "product_region",
-                     "key_themes", "review_date_parsed")
+                     "resolved_sku", "product_name", "key_themes", "review_date_parsed")
     NEGATIVE_TEXT_COLUMNS = ("review_text_en", "review_text")
 
     INSERT_COLUMNS = ("generation_id", "run_timestamp", "[rank]", "title", "description",
