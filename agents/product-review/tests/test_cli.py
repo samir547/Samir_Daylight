@@ -1,6 +1,7 @@
 """ISSUE-04: the decomposed CLI phases -- arg parsing, config overrides, the
 rerun-flag logic, and checkpoint writing (all offline)."""
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,8 @@ class TestParseArgs:
     def test_provider_choices_come_from_llm_provider(self, capsys):
         with pytest.raises(SystemExit):
             parse_args(["--provider", "not-a-provider"])
-        assert "choose from 'claude'" in capsys.readouterr().err
+        # Python 3.12.8+ prints the choices without quotes.
+        assert re.search(r"choose from '?claude'?\)", capsys.readouterr().err)
 
     def test_all_flags_still_exist(self):
         # The production flag surface must not shrink.
