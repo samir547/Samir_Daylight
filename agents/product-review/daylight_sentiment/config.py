@@ -123,9 +123,9 @@ class SourceFiles:
     There is no fixed expected filename for any source -- every export
     (locally and on SharePoint) is resolved purely by FilePattern: the
     newest file in the directory whose name contains all of the pattern's
-    tokens and ends in .xlsx or .csv (either format, for every source). A rename, a "(2)" suffix, a fresh row count, a date stamp --
-    none of it matters, because nothing ever compares against a specific
-    name. See resolve_source_file() (infra/review_sources/base.py) and
+    tokens and ends in .xlsx or .csv (either format, for every source). A
+    rename, a "(2)" suffix, a fresh row count, a date stamp -- none of it
+    matters, because nothing ever compares against a specific name. See resolve_source_file() (infra/review_sources/base.py) and
     select_items_by_patterns() (infra/sharepoint_sync.py)."""
     reviews_dir: Path = BASE / "Reviews"
     trustpilot_product_pattern: FilePattern = FilePattern(("trustpilot", "product"))
