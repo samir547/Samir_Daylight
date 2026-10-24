@@ -130,6 +130,9 @@ WORK_PHASES = {"load_reviews", "build_analyzer", "process_all_reviews", "write_o
                "load_database", "delete_analysis_outputs",
                "move_synced_files_to_processed", "run_translation", "run_action_items"}
 NEW_RESULT = {"uid": "trustpilot:product:1", "analysis": {"sentiment": "positive"}}
+# The real functions, for tests that undo the fixture's fakes.
+REAL_BUILD_ANALYZER = cli.build_analyzer
+REAL_RUN_ACTION_ITEMS = cli.run_action_items
 
 
 def _sync_results(*synced_keys):
@@ -405,7 +408,7 @@ class TestActionItemsEndToEndOffline:
          "evidence": "38 negative reviews mention glare.", "evidence_strength": "strong"}
         for r in (1, 2, 3)]}
 
-    def _setup(self, monkeypatch, reply):
+    def _setup(self, monkeypatch, *replies):
         from datetime import date
         from enum import Enum
         from types import SimpleNamespace
@@ -420,7 +423,8 @@ class TestActionItemsEndToEndOffline:
                 pass
 
             def complete_json(self, prompt, max_tokens=None):
-                return reply
+                prompts.append(prompt)
+                return replies[min(len(prompts), len(replies)) - 1]
 
             def analyze_product_review(self, text, product_name=None, rating=None):
                 return {}
@@ -435,7 +439,7 @@ class TestActionItemsEndToEndOffline:
                  "review_date_parsed": date(2026, 7, 1), "review_text_en": None,
                  "review_text": "too much glare" if i % 4 == 0 else None}
                 for i in range(150)]
-        saved = []
+        saved, prompts = [], []
 
         class FakeRepository:
             def __init__(self, settings):
@@ -453,6 +457,7 @@ class TestActionItemsEndToEndOffline:
         config = Config(llm_provider=OtherProvider.FAKE,
                         db=DatabaseSettings(server="s", name="n", user="u", password="p"))
         object.__setattr__(config, "fake", SimpleNamespace(model="fake-model"))
+        self.prompts = prompts
         return config, saved
 
     def test_second_provider_generates_and_saves(self, monkeypatch):
@@ -474,3 +479,26 @@ class TestActionItemsEndToEndOffline:
         config, saved = self._setup(monkeypatch, {"items": self.REPLY["items"][:2]})
         assert cli.action_items_only(config, dry_run=False) == 1
         assert saved == []
+        assert len(self.prompts) == 2  # the first try and one retry
+
+    def test_invalid_then_valid_reply_is_saved_and_exits_0(self, monkeypatch):
+        config, saved = self._setup(monkeypatch, {"items": []}, self.REPLY)
+        assert cli.action_items_only(config, dry_run=False) == 0
+        assert len(saved) == 1 and len(self.prompts) == 2
+        assert "Your previous reply failed because: expected 3 items, got 0" in self.prompts[1]
+
+    run = TestMainPhases.run
+
+    def test_both_invalid_in_a_normal_run_keeps_exit_0(self, run, monkeypatch, caplog):
+        config, saved = self._setup(monkeypatch, {"items": []})
+        config.output_dir = run.config.output_dir
+        monkeypatch.setattr(cli, "build_config", lambda args: config)
+        monkeypatch.setattr(cli, "build_analyzer", REAL_BUILD_ANALYZER)
+        monkeypatch.setattr(cli, "run_action_items", REAL_RUN_ACTION_ITEMS)
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            code, _ = run(sync=_sync_results("trustpilot_product"))
+        assert code == 0
+        assert saved == [] and len(self.prompts) == 2
+        levels = [r.levelname for r in caplog.records]
+        assert levels.count("WARNING") == 2 and levels.count("ERROR") == 1
+        assert "Action items were not generated: ActionItemsValidationError" in caplog.text

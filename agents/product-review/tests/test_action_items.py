@@ -34,7 +34,10 @@ from daylight_sentiment.domain.action_items import (
     unsupported_numbers,
     validate_action_items,
 )
-from daylight_sentiment.domain.action_items_prompt import build_action_items_prompt
+from daylight_sentiment.domain.action_items_prompt import (
+    build_action_items_prompt,
+    build_retry_prompt,
+)
 from daylight_sentiment.infra.analyzers import FatalProviderError, SentimentAnalyzer
 
 
@@ -714,7 +717,9 @@ def test_format_action_items():
 # -- orchestration ------------------------------------------------------------
 
 class FakeAnalyzer(SentimentAnalyzer):
-    def __init__(self, reply=None, error=None):
+    """Returns ``reply`` to every call, or ``replies`` in turn."""
+    def __init__(self, reply=None, error=None, replies=None):
+        self.replies = list(replies) if replies is not None else None
         self.reply = reply
         self.error = error
         self.calls = []
@@ -723,6 +728,8 @@ class FakeAnalyzer(SentimentAnalyzer):
         self.calls.append((prompt, max_tokens))
         if self.error:
             raise self.error
+        if self.replies is not None:
+            return self.replies.pop(0)
         return self.reply
 
     def analyze_product_review(self, text, product_name=None, rating=None):
@@ -777,7 +784,7 @@ class TestGenerate:
 
     def test_one_call_and_saved_with_window(self):
         outcome, analyzer, repo = self.run()
-        assert len(analyzer.calls) == 1
+        assert len(analyzer.calls) == 1  # valid first time: no retry
         assert analyzer.calls[0][1] == ACTION_ITEMS_MAX_TOKENS
         assert outcome.generation_id == "generation-1"
         [saved] = repo.saved
@@ -798,6 +805,63 @@ class TestGenerate:
         reply["items"].pop()
         with pytest.raises(ActionItemsValidationError):
             self.run(reply=reply)
+
+    def generate(self, analyzer, repo, dry_run=False):
+        return generate_action_items(analyzer, repo, ActionItemSettings(), "claude", "m",
+                                     dry_run=dry_run)
+
+    def test_invalid_then_valid_reply_is_saved_once(self, caplog):
+        bad = dataset_reply()
+        bad["items"][0]["rationale"] = "47.3% of buyers complain."
+        analyzer = FakeAnalyzer(replies=[bad, dataset_reply()])
+        repo = FakeRepository(dataset())
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            outcome = self.generate(analyzer, repo)
+        assert len(analyzer.calls) == 2 and len(repo.saved) == 1
+        assert [i["rank"] for i in outcome.items] == [1, 2, 3]
+        first, retry = analyzer.calls[0][0], analyzer.calls[1][0]
+        assert retry.startswith(first)
+        assert ("Your previous reply failed because: item 1 rationale has numbers that are "
+                "not in the summary: 47.3%") in retry
+        assert analyzer.calls[1][1] == ACTION_ITEMS_MAX_TOKENS
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "retrying once" in warnings[0].getMessage()
+        assert "47.3%" in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+
+    def test_both_replies_invalid_saves_nothing(self, caplog):
+        analyzer = FakeAnalyzer(replies=[{"items": []}, {"items": [1, 2, 3]}])
+        repo = FakeRepository(dataset())
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            with pytest.raises(ActionItemsValidationError, match="item 1 is not an object"):
+                self.generate(analyzer, repo)
+        assert len(analyzer.calls) == 2 and repo.saved == []
+        assert "expected 3 items, got 0" in analyzer.calls[1][0]
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2
+        assert "retrying once: expected 3 items, got 0" in warnings[0]
+        assert "the retry failed validation too: item 1 is not an object" in warnings[1]
+        assert all(r.exc_info is None for r in caplog.records)
+
+    def test_both_invalid_in_a_dry_run_saves_nothing(self):
+        analyzer = FakeAnalyzer(replies=[{"items": []}, {"items": []}])
+        repo = FakeRepository(dataset())
+        with pytest.raises(ActionItemsValidationError):
+            self.generate(analyzer, repo, dry_run=True)
+        assert repo.saved == []
+
+    def test_provider_error_is_not_retried(self):
+        analyzer = FakeAnalyzer(error=FatalProviderError("bad key"))
+        with pytest.raises(FatalProviderError):
+            self.generate(analyzer, FakeRepository(dataset()))
+        assert len(analyzer.calls) == 1
+
+    def test_retry_prompt(self):
+        assert build_retry_prompt("PROMPT", "x; y") == (
+            "PROMPT\n\nYour previous reply failed because: x; y\n\nWrite the 3 items "
+            "again, following every rule above, and respond ONLY with\nJSON in the same "
+            "shape.")
 
     def test_invalid_reply_repository_untouched(self):
         repo = FakeRepository(dataset())

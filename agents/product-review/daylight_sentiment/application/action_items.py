@@ -1,6 +1,7 @@
 """The top 3 to-do items for the business, generated from the stored
 sentiment results: fetch the analysed reviews, pick the review window, build
-the summary, make ONE model call, validate the reply, save the 3 items.
+the summary, make one model call, validate the reply (retrying once, with
+the reasons, if it fails), save the 3 items.
 
 The model call goes through the provider-neutral
 SentimentAnalyzer.complete_json(); nothing here depends on which provider
@@ -14,13 +15,17 @@ from typing import Any, Dict, List, Optional
 
 from daylight_sentiment.config import ActionItemSettings
 from daylight_sentiment.domain.action_items import (
+    ActionItemsValidationError,
     ReviewWindow,
     build_summary,
     select_window,
     summary_areas,
     validate_action_items,
 )
-from daylight_sentiment.domain.action_items_prompt import build_action_items_prompt
+from daylight_sentiment.domain.action_items_prompt import (
+    build_action_items_prompt,
+    build_retry_prompt,
+)
 from daylight_sentiment.infra.analyzers.base import SentimentAnalyzer
 
 logger = logging.getLogger("multi_source_sentiment")
@@ -48,7 +53,8 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
     """Generate (and, unless ``dry_run``, save) one set of to-do items.
 
     Returns an outcome with no items when there are too few reviews to base
-    them on. A provider error, or a reply that fails validation
+    them on. A reply that fails validation is retried ONCE, with the
+    reasons; a provider error, or a retry that fails validation too
     (ActionItemsValidationError), propagates and nothing is saved.
     """
     rows = repository.fetch_analysed_rows()
@@ -68,10 +74,19 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
 
     summary = build_summary(window, settings.top_themes, settings.max_excerpts,
                             settings.excerpt_chars)
-    areas = summary_areas(summary)
-    reply = analyzer.complete_json(build_action_items_prompt(summary, areas),
-                                   max_tokens=ACTION_ITEMS_MAX_TOKENS)
-    items = validate_action_items(reply, summary)
+    prompt = build_action_items_prompt(summary, summary_areas(summary))
+    reply = analyzer.complete_json(prompt, max_tokens=ACTION_ITEMS_MAX_TOKENS)
+    try:
+        items = validate_action_items(reply, summary)
+    except ActionItemsValidationError as exc:
+        logger.warning("Action items: the reply failed validation, retrying once: %s", exc)
+        reply = analyzer.complete_json(build_retry_prompt(prompt, str(exc)),
+                                       max_tokens=ACTION_ITEMS_MAX_TOKENS)
+        try:
+            items = validate_action_items(reply, summary)
+        except ActionItemsValidationError as retry_exc:
+            logger.warning("Action items: the retry failed validation too: %s", retry_exc)
+            raise
 
     outcome = ActionItemsOutcome(window, items)
     if dry_run:

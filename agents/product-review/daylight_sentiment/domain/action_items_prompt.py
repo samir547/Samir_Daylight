@@ -117,6 +117,19 @@ Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
 ]}}"""
 
 
+RETRY_PROMPT = """{prompt}
+
+Your previous reply failed because: {errors}
+
+Write the 3 items again, following every rule above, and respond ONLY with
+JSON in the same shape."""
+
+
+def build_retry_prompt(prompt: str, errors: str) -> str:
+    """The original prompt plus why the previous reply was rejected."""
+    return RETRY_PROMPT.format(prompt=prompt, errors=errors)
+
+
 def build_action_items_prompt(summary: Dict[str, Any], areas: Sequence[str]) -> str:
     window = summary["window"]
     return ACTION_ITEMS_PROMPT.format(
