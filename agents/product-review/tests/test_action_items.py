@@ -538,7 +538,32 @@ class TestPrompt:
                      "starts with a verb", "ONLY the numbers", "cite the numbers",
                      "too thin", "generic advice", '"rank"', '"title"', '"description"',
                      '"rationale"', '"related_area"', '"evidence"'):
-            assert rule in prompt, rule
+            assert rule in " ".join(prompt.split()), rule
+
+    def test_real_numbers_prompt_has_the_like_for_like_and_small_sample_rules(self):
+        summary = build_summary(window_of(real_region_source_rows()), 15, 10, 300)
+        prompt = build_action_items_prompt(summary, summary_areas(summary))
+        assert '"product_by_region_and_source": [' in prompt
+        assert '"region": "UK",\n      "review_source": "amazon",\n      "reviews": 45,' in prompt
+        flat = " ".join(prompt.split())
+        for rule in (
+                "Compare like with like. Never compare regions, review websites or any "
+                "other groups whose reviews come from the review websites in different "
+                "proportions, except within the same website",
+                "most Trustpilot reviews are invited by the company and tend to be more "
+                "positive",
+                "A difference between Amazon and Trustpilot is background only, never "
+                "evidence of a problem by itself.",
+                'An item based mainly on a group marked "small_sample": true must ask the '
+                "business to monitor or investigate, never to overhaul or fix",
+                "Never claim that a difference is statistically significant, meaningful, "
+                '"not random"',
+                'Never add the counts in "top_negative_themes" together',
+                'use "negative_reviews_total"',
+                'name them (from "products_most_negative")',
+                'Use "overall" for an issue that spans several',
+                'Use "General / No Use Stated" only for an issue about that group itself'):
+            assert rule in flat, rule
 
     def test_summary_areas(self):
         summary = build_summary(window_of(TestBuildSummary().rows()), 15, 10, 300)

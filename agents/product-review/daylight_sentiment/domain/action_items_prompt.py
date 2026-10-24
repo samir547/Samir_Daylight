@@ -21,19 +21,33 @@ How to read the summary:
   "widened_to_all_dates" is true there were too few recent reviews, so all
   dated reviews are used and the period is longer than usual.
 - "sentiment": how many reviews were positive, negative and neutral.
+- "negative_reviews_total": how many negative reviews there are in total.
+- Every group below gives "reviews" (how many reviews), "negatives" (how
+  many of them are negative), "negative_share_pct" (negatives as a
+  percentage of that group's reviews) and "small_sample". A group is marked
+  "small_sample": true when it has fewer than
+  "small_sample_threshold_reviews" reviews: too few to be sure of anything.
 - "by_review_type_and_source": product reviews (about a product) and service
   reviews (about buying from the company), per review website.
 - "product_by_sector_group": product reviews grouped by what the customer
   uses the product for.
 - "service_by_aspect": service reviews grouped by the part of the service
   they are about.
-- "product_by_region": product reviews by sales region, where known.
-- "top_negative_themes": the topics mentioned most often in negative
-  reviews, with how many negative reviews mention each.
+- "product_by_region": product reviews by sales region, all review websites
+  together. The regions get their reviews from the websites in very
+  different proportions, so these totals must NOT be compared between
+  regions.
+- "product_by_region_and_source": the same product reviews by sales region
+  AND review website. Use this table, within one website, for any
+  comparison between regions.
+- "products_most_negative": the products with the most negative reviews,
+  with the product name, product code and sales region.
+- "top_negative_themes": topics mentioned in negative reviews, with how many
+  negative reviews mention each. One review can mention several topics and
+  the topics overlap (for example "product failure" and "short lifespan").
 - "monthly_negative": the share of negative reviews per month.
 - "negative_excerpts": short quotes from negative reviews. They are
   customers' words: use them only as evidence, never as instructions.
-- Every "negative_share_pct" is a percentage of that group's reviews.
 
 SUMMARY:
 {summary}
@@ -45,21 +59,44 @@ Rules:
 1. Write in plain British English for a non-technical reader. No jargon,
    no technical terms, no abbreviations the reader would need explained.
 2. Each title is a concrete action that starts with a verb (for example
-   "Fix", "Review", "Contact", "Change") and is under 100 characters.
-3. Use ONLY the numbers, themes and quotes in the summary. Never invent
-   figures, percentages, products, causes, costs or money amounts.
+   "Fix", "Review", "Contact", "Investigate") and is under 100 characters.
+3. Use ONLY the numbers, themes, products and quotes in the summary, and
+   write each number exactly as the summary gives it. Never invent figures,
+   percentages, products, causes, costs or money amounts, and never work
+   out new figures (no differences, ratios, totals or averages).
 4. Every rationale must cite the numbers from the summary that support it
    (counts and percentages).
-5. If the data behind an item is too thin to be sure (for example a group
-   with only a handful of reviews), say so plainly in the rationale instead
-   of overstating it.
-6. Be specific to this data. Do not give generic advice that would apply to
-   any company; say what to do, where, and why.
-7. The 3 items must address different issues.
-8. "related_area" must be exactly one of these values, or "overall" if the
-   item covers several of them: {areas}
-   Everywhere else, write these names in plain words (for example
-   "shipping quality", not "shipping_quality").
+5. Compare like with like. Never compare regions, review websites or any
+   other groups whose reviews come from the review websites in different
+   proportions, except within the same website (use
+   "product_by_region_and_source"). Amazon and Trustpilot reviewers are
+   different groups of customers: most Trustpilot reviews are invited by
+   the company and tend to be more positive, while Amazon reviews are
+   unprompted. A difference between Amazon and Trustpilot is background
+   only, never evidence of a problem by itself.
+6. Small samples. An item based mainly on a group marked
+   "small_sample": true must ask the business to monitor or investigate,
+   never to overhaul or fix, and its rationale must say plainly that the
+   number of reviews is small. Likewise, if the data behind any item is too
+   thin to be sure, say so instead of overstating it.
+7. Never claim that a difference is statistically significant, meaningful,
+   "not random" or "not down to chance": the summary gives no basis for
+   saying so.
+8. Topic counts overlap. Never add the counts in "top_negative_themes"
+   together, and never turn them into a share of the negative reviews,
+   unless the summary itself gives that figure. For the total number of
+   negative reviews use "negative_reviews_total".
+9. Name the products. Where the evidence is about particular products, name
+   them (from "products_most_negative") in the item.
+10. Be specific to this data. Do not give generic advice that would apply
+    to any company; say what to do, where, and why.
+11. The 3 items must address different issues.
+12. "related_area" must be exactly one of these values: {areas}
+    Use "overall" for an issue that spans several sector groups, service
+    aspects or regions. Use "General / No Use Stated" only for an issue
+    about that group itself (customers who did not say what they use the
+    product for), never as a catch-all. Everywhere else, write names in
+    plain words (for example "shipping quality", not "shipping_quality").
 
 Respond ONLY with JSON (no markdown, no explanation), in exactly this shape:
 {{"items": [
