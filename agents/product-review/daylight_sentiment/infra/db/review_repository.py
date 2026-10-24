@@ -14,13 +14,18 @@ fails outright (e.g. the Anthropic account running out of credits mid-run)
 would upsert NULL sentiment/sector over already-good existing rows,
 destroying real data for a reason that has nothing to do with that data's
 quality. The checkpoint file has the same property for the same reason.
+
+fetch_analysed_uids() is the read side of the same rule: the CLI asks it
+which of the reviews it just loaded already have a stored sentiment, and
+leaves those out of the analysis -- history is frozen once scored. A row
+whose sentiment is NULL is not "analysed" and is retried.
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Set
 
 from daylight_sentiment.config import DatabaseSettings
 from daylight_sentiment.infra.db.connection import REVIEWS_TABLE, connect
@@ -28,8 +33,15 @@ from daylight_sentiment.infra.db.connection import REVIEWS_TABLE, connect
 logger = logging.getLogger("multi_source_sentiment")
 
 
+class ExistingReviewsReadError(RuntimeError):
+    """The stored analyses could not be read. Raised instead of returning an
+    empty set, which would make every review look new and re-analyse (and
+    overwrite) all of them."""
+
+
 class ReviewRepository:
-    """Idempotent MERGE upserts into dbo.sentiment_analysis_reviews."""
+    """Idempotent MERGE upserts into dbo.sentiment_analysis_reviews, plus the
+    lookup of which uids already have a stored analysis."""
 
     COLUMNS = ("uid", "review_id", "review_type", "review_source", "rating", "product_name",
                "product_sku", "product_asin", "model_number", "review_country",
@@ -73,6 +85,44 @@ ON target.uid = src.uid
 WHEN MATCHED THEN UPDATE SET {set_clause}, target.loaded_at = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals});
 """
+
+    @staticmethod
+    def analysed_uids_sql(n_uids: int) -> str:
+        """uids among n_uids candidates that have a real stored result. A row
+        whose analysis failed has sentiment NULL and is not returned."""
+        marks = ", ".join(["?"] * n_uids)
+        return (f"SELECT uid FROM dbo.{REVIEWS_TABLE} "
+                f"WHERE sentiment IS NOT NULL AND uid IN ({marks})")
+
+    def fetch_analysed_uids(self, uids: Iterable[str], chunk_size: int = 1000) -> Set[str]:
+        """The subset of ``uids`` already stored with a sentiment.
+
+        Read-only: no schema migration runs here. A database that doesn't
+        have the reviews table yet holds no analyses, so that is an empty
+        set; any other failure raises ExistingReviewsReadError. chunk_size
+        keeps each IN list under SQL Server's 2100-parameter limit."""
+        wanted = sorted({u for u in uids if u})
+        found: Set[str] = set()
+        if not wanted:
+            return found
+        try:
+            conn = connect(self.settings)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT OBJECT_ID(?, 'U')", [f"dbo.{REVIEWS_TABLE}"])
+                if cur.fetchone()[0] is None:
+                    return found
+                for i in range(0, len(wanted), chunk_size):
+                    chunk = wanted[i:i + chunk_size]
+                    cur.execute(self.analysed_uids_sql(len(chunk)), chunk)
+                    found.update(row[0] for row in cur.fetchall())
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - pyodbc raises many shapes
+            raise ExistingReviewsReadError(
+                f"Could not read the stored analyses from dbo.{REVIEWS_TABLE}: "
+                f"{type(exc).__name__}: {exc}") from exc
+        return found
 
     def upsert(self, reviews: List[Dict[str, Any]], batch_size: int = 50,
                max_batch_retries: int = 6) -> int:
