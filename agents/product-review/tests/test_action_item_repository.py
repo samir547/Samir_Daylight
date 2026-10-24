@@ -43,8 +43,8 @@ def test_fetch_sql_reads_analysed_rows_from_the_view_only():
 def test_insert_columns_pinned_and_placeholders_match():
     assert ActionItemRepository.INSERT_COLUMNS == (
         "generation_id", "run_timestamp", "[rank]", "title", "description", "rationale",
-        "related_area", "evidence", "evidence_strength", "window_start", "window_end",
-        "reviews_analysed", "llm_provider", "llm_model")
+        "related_area", "evidence", "evidence_strength", "window_label", "window_months",
+        "window_start", "window_end", "reviews_analysed", "llm_provider", "llm_model")
     sql = ActionItemRepository.insert_sql()
     assert sql.startswith(f"INSERT INTO dbo.{ACTION_ITEMS_TABLE} (")
     assert sql.count("?") == len(ActionItemRepository.INSERT_COLUMNS)
@@ -58,15 +58,17 @@ ITEMS = [{"rank": r, "title": f"t{r}", "description": "d", "rationale": "r",
 
 
 def test_rows_match_insert_columns():
-    rows = ActionItemRepository.rows(ITEMS, "gid", date(2025, 9, 1), date(2026, 8, 20),
-                                     710, "claude", "m", "2026-10-24T10:00:00")
+    rows = ActionItemRepository.rows(ITEMS, "gid", "Last 12 months", 12, date(2025, 9, 1),
+                                     date(2026, 8, 20), 710, "claude", "m",
+                                     "2026-10-24T10:00:00")
     assert len(rows) == 3
     cols = [c.strip("[]") for c in ActionItemRepository.INSERT_COLUMNS]
     first = dict(zip(cols, rows[0]))
     assert first == {
         "generation_id": "gid", "run_timestamp": "2026-10-24T10:00:00", "rank": 1,
         "title": "t1", "description": "d", "rationale": "r", "related_area": "overall",
-        "evidence": "e", "evidence_strength": "moderate", "window_start": date(2025, 9, 1),
+        "evidence": "e", "evidence_strength": "moderate", "window_label": "Last 12 months",
+        "window_months": 12, "window_start": date(2025, 9, 1),
         "window_end": date(2026, 8, 20),
         "reviews_analysed": 710, "llm_provider": "claude", "llm_model": "m"}
     assert {row[0] for row in rows} == {"gid"}
@@ -102,14 +104,16 @@ class RecordingConn:
 
 def test_three_rows_inserted_in_one_transaction():
     conn = RecordingConn()
-    rows = ActionItemRepository.rows(ITEMS, "gid", None, None, 1, None, None, None)
+    rows = ActionItemRepository.rows(ITEMS, "gid", "Last 3 months", 3, None, None, 1,
+                                     None, None, None)
     ActionItemRepository.insert_on(conn, rows)
     assert [e[0] for e in conn.events] == ["execute", "execute", "execute", "commit"]
 
 
 def test_failed_insert_rolls_back_and_commits_nothing():
     conn = RecordingConn(fail_on=2)
-    rows = ActionItemRepository.rows(ITEMS, "gid", None, None, 1, None, None, None)
+    rows = ActionItemRepository.rows(ITEMS, "gid", "Last 3 months", 3, None, None, 1,
+                                     None, None, None)
     with pytest.raises(RuntimeError):
         ActionItemRepository.insert_on(conn, rows)
     assert ("commit",) not in conn.events
@@ -120,7 +124,7 @@ def test_save_applies_migrations_then_inserts_once(monkeypatch):
     conn = RecordingConn()
     monkeypatch.setattr(action_item_repository, "connect", lambda settings: conn)
     gid = ActionItemRepository(settings=None).save(
-        ITEMS, date(2025, 9, 1), date(2026, 8, 20), 710, "claude", "m")
+        ITEMS, "Last 6 months", 6, date(2025, 9, 1), date(2026, 8, 20), 710, "claude", "m")
     kinds = [e[0] for e in conn.events]
     # ensure_schema: one execute per migration + its own commit; then the
     # 3 inserts and a single commit; then close.
@@ -138,7 +142,8 @@ class TestMigration:
         assert [name for name, _ in MIGRATIONS] == [
             "create_reviews_table", "add_model_number", "add_review_country",
             "create_runs_table", "create_action_items_table",
-            "add_action_items_evidence_strength"]
+            "add_action_items_evidence_strength", "add_action_items_window_label",
+            "add_action_items_window_months"]
 
     def test_create_guarded_and_idempotent(self):
         sql = _migration("create_action_items_table")
@@ -152,22 +157,43 @@ class TestMigration:
         # own ALTER entries instead.
         assert "evidence_strength" not in _migration("create_action_items_table")
 
-    def test_evidence_strength_added_by_a_guarded_alter(self):
-        name, sql = MIGRATIONS[-1]
-        assert name == "add_action_items_evidence_strength"
-        assert " ".join(sql.split()) == (
+    @pytest.mark.parametrize("name, column, sql_type", [
+        ("add_action_items_evidence_strength", "evidence_strength", "NVARCHAR(20)"),
+        ("add_action_items_window_label", "window_label", "NVARCHAR(30)"),
+        ("add_action_items_window_months", "window_months", "TINYINT"),
+    ])
+    def test_later_columns_added_by_guarded_alters(self, name, column, sql_type):
+        assert " ".join(_migration(name).split()) == (
             "IF NOT EXISTS (SELECT 1 FROM sys.columns "
             f"WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}') "
-            "AND name = 'evidence_strength') "
-            f"ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD evidence_strength NVARCHAR(20) NULL;")
+            f"AND name = '{column}') "
+            f"ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD {column} {sql_type} NULL;")
 
-    def test_ensure_schema_applies_the_alter_after_the_create(self):
+    def test_window_columns_are_the_last_two_entries(self):
+        assert [name for name, _ in MIGRATIONS[-2:]] == [
+            "add_action_items_window_label", "add_action_items_window_months"]
+
+    def test_existing_entries_unchanged(self):
+        # Already applied on existing databases: never edited in place.
+        create = _migration("create_action_items_table")
+        assert "window_label" not in create and "window_months" not in create
+        assert "window_" not in _migration("add_action_items_evidence_strength")
+
+    def test_window_alters_touch_only_this_table(self):
+        for name in ("add_action_items_window_label", "add_action_items_window_months"):
+            sql = _migration(name)
+            assert sql.strip().startswith("IF NOT EXISTS (SELECT 1 FROM sys.columns")
+            assert "DROP" not in sql.upper() and "UPDATE" not in sql.upper()
+            assert REVIEWS_TABLE not in sql and RUNS_TABLE not in sql
+
+    def test_ensure_schema_applies_the_alters_after_the_create(self):
         conn = RecordingConn()
         from daylight_sentiment.infra.db.connection import ensure_schema
         ensure_schema(conn)
         sqls = [e[1] for e in conn.events if e[0] == "execute"]
-        assert sqls[-1] == _migration("add_action_items_evidence_strength")
-        assert sqls[-2] == _migration("create_action_items_table")
+        assert sqls[-4:] == [_migration(n) for n in (
+            "create_action_items_table", "add_action_items_evidence_strength",
+            "add_action_items_window_label", "add_action_items_window_months")]
 
     def test_schema(self):
         sql = _migration("create_action_items_table")
@@ -193,13 +219,15 @@ class TestMigration:
         canonical = (SQL_DIR / "tables" / "sentiment_action_items.sql").read_text(
             encoding="utf-8")
         expected = columns(_migration("create_action_items_table"))
-        expected.insert(expected.index(("evidence", "NVARCHAR(MAX)")) + 1,
-                        ("evidence_strength", "NVARCHAR(20)"))
+        after = expected.index(("evidence", "NVARCHAR(MAX)")) + 1
+        expected[after:after] = [("evidence_strength", "NVARCHAR(20)"),
+                                 ("window_label", "NVARCHAR(30)"), ("window_months", "TINYINT")]
         assert columns(canonical) == expected
-        assert len(columns(canonical)) == 16
-        # ...and it brings a table created before the column up to date.
-        assert " ".join(_migration("add_action_items_evidence_strength").split()) in \
-            " ".join(canonical.split())
+        assert len(columns(canonical)) == 18
+        # ...and it brings a table created before the columns up to date.
+        for name in ("add_action_items_evidence_strength", "add_action_items_window_label",
+                     "add_action_items_window_months"):
+            assert " ".join(_migration(name).split()) in " ".join(canonical.split())
 
     def test_view_reads_latest_generation_only(self):
         view = (SQL_DIR / "views" / "vw_latest_action_items.sql").read_text(encoding="utf-8")

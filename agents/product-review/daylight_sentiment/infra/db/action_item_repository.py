@@ -4,7 +4,7 @@ each generation's items to dbo.sentiment_action_items.
 
 Read-only on the review side, insert-only on the items side: older
 generations are kept as history and dbo.vw_latest_action_items shows the
-newest one.
+newest one for each review window.
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ class ActionItemRepository:
 
     INSERT_COLUMNS = ("generation_id", "run_timestamp", "[rank]", "title", "description",
                       "rationale", "related_area", "evidence", "evidence_strength",
-                      "window_start", "window_end", "reviews_analysed", "llm_provider",
-                      "llm_model")
+                      "window_label", "window_months", "window_start", "window_end",
+                      "reviews_analysed", "llm_provider", "llm_model")
 
     def __init__(self, settings: DatabaseSettings):
         self.settings = settings
@@ -68,15 +68,15 @@ WHERE sentiment IS NOT NULL
             conn.close()
 
     @classmethod
-    def rows(cls, items: Sequence[Dict[str, Any]], generation_id: str, window_start,
+    def rows(cls, items: Sequence[Dict[str, Any]], generation_id: str,
+             window_label: Optional[str], window_months: Optional[int], window_start,
              window_end, reviews_analysed: int, llm_provider: Optional[str],
              llm_model: Optional[str], run_timestamp: Optional[str]) -> List[tuple]:
         """One parameter tuple per item, in INSERT_COLUMNS order."""
         return [(generation_id, run_timestamp, item["rank"], item["title"],
                  item["description"], item["rationale"], item["related_area"],
-                 item["evidence"], item["evidence_strength"], window_start, window_end,
-                 reviews_analysed,
-                 llm_provider, llm_model)
+                 item["evidence"], item["evidence_strength"], window_label, window_months,
+                 window_start, window_end, reviews_analysed, llm_provider, llm_model)
                 for item in items]
 
     @classmethod
@@ -93,20 +93,20 @@ WHERE sentiment IS NOT NULL
             conn.rollback()
             raise
 
-    def save(self, items: Sequence[Dict[str, Any]], window_start, window_end,
-             reviews_analysed: int, llm_provider: Optional[str], llm_model: Optional[str],
-             run_timestamp: Optional[str] = None) -> str:
-        """Save one generation and return its generation_id. Applies the
-        schema migrations first, so the table exists on a fresh database."""
+    def save(self, items: Sequence[Dict[str, Any]], window_label: str, window_months: int,
+             window_start, window_end, reviews_analysed: int, llm_provider: Optional[str],
+             llm_model: Optional[str], run_timestamp: Optional[str] = None) -> str:
+        """Save one window's generation and return its generation_id. Applies
+        the schema migrations first, so the table exists on a fresh database."""
         generation_id = str(uuid.uuid4())
-        rows = self.rows(items, generation_id, window_start, window_end, reviews_analysed,
-                         llm_provider, llm_model, run_timestamp)
+        rows = self.rows(items, generation_id, window_label, window_months, window_start,
+                         window_end, reviews_analysed, llm_provider, llm_model, run_timestamp)
         conn = connect(self.settings)
         try:
             ensure_schema(conn)
             self.insert_on(conn, rows)
         finally:
             conn.close()
-        logger.info("Saved %d action items (generation %s) into dbo.%s",
-                    len(rows), generation_id, ACTION_ITEMS_TABLE)
+        logger.info("Saved %d action items for %s (generation %s) into dbo.%s",
+                    len(rows), window_label, generation_id, ACTION_ITEMS_TABLE)
         return generation_id

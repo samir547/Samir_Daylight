@@ -465,7 +465,8 @@ class TestActionItemsEndToEndOffline:
         assert cli.action_items_only(config, dry_run=False) == 0
         [(items, args)] = saved
         assert [i["rank"] for i in items] == [1, 2, 3]
-        assert args[2:5] == (150, "fake", "fake-model")
+        assert args[:2] == ("Last 12 months", 12)
+        assert args[4:7] == (150, "fake", "fake-model")
 
     def test_dry_run_prints_and_writes_nothing(self, monkeypatch, capsys):
         config, saved = self._setup(monkeypatch, self.REPLY)

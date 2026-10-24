@@ -6,28 +6,36 @@
 -- after each run that loads new reviews, or on demand with
 -- `python -m daylight_sentiment.cli --action-items-only`.
 --
--- One generation = 3 rows sharing a generation_id, inserted in a single
--- transaction (never a partial set). Older generations are kept as history;
+-- Each run generates one set per review window ("Last 3 months", "Last 6
+-- months", "Last 12 months" by default). One generation = the 3 rows of one
+-- window sharing a generation_id, inserted in a single transaction (never a
+-- partial set). Older generations are kept as history;
 -- dbo.vw_latest_action_items (../views/vw_latest_action_items.sql) shows the
--- newest one for Power BI.
+-- newest one for each window for Power BI.
 --
 --   run_timestamp     the dbo.sentiment_analysis_runs.run_timestamp of the
 --                     run that generated it; NULL for an on-demand generation.
 --                     Not an enforced foreign key.
+--   window_label      the window the items are for, e.g. 'Last 6 months'.
+--                     NULL only on rows saved before the column existed.
+--   window_months     the window's length in months (6 for 'Last 6 months').
+--                     NULL only on rows saved before the column existed.
 --   window_start/end  the review dates the items are based on. window_end is
 --                     the newest review date in the data (or the day they
 --                     were generated, if that is earlier).
 --   reviews_analysed  how many analysed reviews fall in that window.
 --   evidence_strength 'strong', 'moderate' or 'early signal' ('early signal'
---                     whenever related_area is a group with too few reviews
+--                     whenever the item rests on groups with too few reviews
 --                     to be sure). NULL only on rows saved before the column
 --                     existed.
 --
 -- The pipeline creates this table itself (the "create_action_items_table"
--- and "add_action_items_evidence_strength" entries in
--- daylight_sentiment/infra/db/connection.py's MIGRATIONS); this file is the
--- canonical definition and is safe to re-run, including on a table created
--- before evidence_strength existed.
+-- entry in daylight_sentiment/infra/db/connection.py's MIGRATIONS) and adds
+-- the later columns with the guarded ALTERs that follow it there
+-- ("add_action_items_evidence_strength", "add_action_items_window_label",
+-- "add_action_items_window_months"). This file is the canonical definition
+-- and is safe to re-run, including on a table created before those columns
+-- existed.
 -- ============================================================================
 
 IF OBJECT_ID('dbo.sentiment_action_items', 'U') IS NULL
@@ -44,6 +52,8 @@ BEGIN
         related_area       NVARCHAR(100)    NOT NULL,   -- sector group, service aspect, region or 'overall'
         evidence           NVARCHAR(MAX)    NOT NULL,   -- one sentence quoting the supporting counts
         evidence_strength  NVARCHAR(20)     NULL,       -- strong / moderate / early signal
+        window_label       NVARCHAR(30)     NULL,       -- e.g. 'Last 6 months'
+        window_months      TINYINT          NULL,       -- e.g. 6
         window_start       DATE             NOT NULL,
         window_end         DATE             NOT NULL,
         reviews_analysed   INT              NOT NULL,
@@ -58,4 +68,16 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns
                WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
                  AND name = 'evidence_strength')
     ALTER TABLE dbo.sentiment_action_items ADD evidence_strength NVARCHAR(20) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'window_label')
+    ALTER TABLE dbo.sentiment_action_items ADD window_label NVARCHAR(30) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'window_months')
+    ALTER TABLE dbo.sentiment_action_items ADD window_months TINYINT NULL;
 GO

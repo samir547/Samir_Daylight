@@ -134,6 +134,18 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns
                  AND name = 'evidence_strength')
     ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD evidence_strength NVARCHAR(20) NULL;
 """),
+    ("add_action_items_window_label", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'window_label')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD window_label NVARCHAR(30) NULL;
+"""),
+    ("add_action_items_window_months", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'window_months')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD window_months TINYINT NULL;
+"""),
 ]
 
 

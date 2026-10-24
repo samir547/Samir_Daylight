@@ -814,11 +814,13 @@ class FakeRepository:
     def fetch_analysed_rows(self):
         return self.rows
 
-    def save(self, items, window_start, window_end, reviews_analysed, llm_provider,
-             llm_model, run_timestamp=None):
-        self.saved.append(dict(items=items, window_start=window_start, window_end=window_end,
-                               reviews_analysed=reviews_analysed, llm_provider=llm_provider,
-                               llm_model=llm_model, run_timestamp=run_timestamp))
+    def save(self, items, window_label, window_months, window_start, window_end,
+             reviews_analysed, llm_provider, llm_model, run_timestamp=None):
+        self.saved.append(dict(items=items, window_label=window_label,
+                               window_months=window_months, window_start=window_start,
+                               window_end=window_end, reviews_analysed=reviews_analysed,
+                               llm_provider=llm_provider, llm_model=llm_model,
+                               run_timestamp=run_timestamp))
         return "generation-1"
 
 

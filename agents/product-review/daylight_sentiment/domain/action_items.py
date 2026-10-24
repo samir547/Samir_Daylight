@@ -147,6 +147,11 @@ def _as_date(value: Any) -> Optional[date]:
         return None
 
 
+def window_label(months: int) -> str:
+    """The name a review window is saved and shown under ("Last 6 months")."""
+    return f"Last {months} month{'' if months == 1 else 's'}"
+
+
 def months_before(end: date, months: int) -> date:
     """The same day ``months`` calendar months before ``end``, clamped to the
     last day of a shorter month (31 March minus one month is 28/29 Feb)."""

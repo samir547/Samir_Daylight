@@ -21,6 +21,7 @@ from daylight_sentiment.domain.action_items import (
     select_window,
     summary_areas,
     validate_action_items,
+    window_label,
 )
 from daylight_sentiment.domain.action_items_prompt import (
     build_action_items_prompt,
@@ -97,7 +98,8 @@ def generate_action_items(analyzer: SentimentAnalyzer, repository: Any,
     if dry_run:
         logger.info("Action items: dry run, nothing written to the database")
         return outcome
+    months = None if window.widened else settings.window_months
     outcome.generation_id = repository.save(
-        items, window.start, window.end, window.review_count,
-        llm_provider, llm_model, run_timestamp)
+        items, window_label(months) if months else None, months, window.start, window.end,
+        window.review_count, llm_provider, llm_model, run_timestamp)
     return outcome
