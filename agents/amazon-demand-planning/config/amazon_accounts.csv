@@ -1,0 +1,60 @@
+customer_no,marketplace,pool,status,note
+AMAZSL1,UK,UK,in,Amazon EU S.a.r.L. - main UK account
+AMAZBRS1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZBRS2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMAN1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMAN2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMAN3,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMAN4,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZLBA2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZLBA4,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZEMA1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZEMA2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZLCY3,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZLE33,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZXBH5,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZDSA6,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZNCL1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZXDS1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZLTN4,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMME1,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZMME2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZBHX2,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZBHX4,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZBHX7,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZTS22,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZB76,UK,UK,in,"Fulfilment-centre account, invoiced 2024-01 to 2024-09 only"
+AMAZHP2,UK,UK,in,"Tiny, 2019-2021; missing from CUSTOMERS so channel is NULL there"
+AMAZWS15,UK,UK,in,"Tiny, 2019-2021; missing from CUSTOMERS so channel is NULL there"
+AMAZCV5,UK,UK,in,"Tiny, 2019-2021; missing from CUSTOMERS so channel is NULL there"
+30003,US,US,in,AMAZON (US)
+AMAZFB13,US,US,pending,US FBA; sits under the EU buyer; ~12 net units (decision 1)
+30115,CA,US,pending,Amazon Canada; ~56 net units to 2024-11; FTD counts it in the US bucket (decision 2)
+AMAZ81000,DE,EU,in,"Amazon EU SARL DE; ships to DE, PL, CZ (decision 3)"
+AMAZ44145,DE,EU,in,Small DE-billed account
+AMAZ55040,DE,EU,in,Small DE-billed account; ships to Poland only (decision 3)
+AMAZ47495,DE,EU,in,Small DE-billed account
+AMAZ66340,DE,EU,in,Small DE-billed account; ships to Poland only (decision 3)
+AMAZ75177,DE,EU,in,Small DE-billed account
+AMAZ92110,FR,EU,in,"Amazon EU SARL France; ships to FR, ES, IT (decision 4)"
+AMAZ20124,IT,EU,in,Amazon EU SARL Italy
+AMAZ13100,IT,EU,in,Small IT account
+AMAZ29015,IT,EU,in,Small IT account
+AMAZ27050,IT,EU,in,Small IT account; category 'Other' not 'AMAZ'
+AMAZ00034,IT,EU,in,Small IT account
+AMAZ10037,IT,EU,in,Small IT account
+AMAZ20074,IT,EU,in,Small IT account
+AMAZ45020,IT,EU,in,Small IT account
+AMAZ02032,IT,EU,in,Small IT account
+AMAZ24050,IT,EU,in,Small IT account
+AMAZ2804,ES,EU,in,Amazon EU S.a r.l Spain; first invoice 2026-01
+AMAZ2000,AU,AU,out,Australia: no Vendor Central data (decision 6)
+AMAZ2178_BWU2,AU,AU,out,Australia: no Vendor Central data (decision 6)
+AMAZ6105_PER4,AU,AU,out,Australia: no Vendor Central data (decision 6)
+AMAZ2175_BWU6,AU,AU,out,Australia: no Vendor Central data (decision 6)
+AMAZ3023_MEL5,AU,AU,out,Australia: no Vendor Central data (decision 6)
+AMAZSL1P,UK,UK,excluded,Provision for receivables (ADJ lines only)
+AMASSL1P,UK,UK,excluded,Provision for receivables
+300031,US,US,excluded,Provision for receivables (ADJ lines only)
+30379,UK,UK,excluded,Intercompany: Daylight Company - Amazon replacements
+AMAZ2990,,,excluded,Amazing Products N.V. - NOT Amazon (category HEAL)
