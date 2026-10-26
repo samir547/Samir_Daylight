@@ -18,10 +18,16 @@ It never changes sales, inventory, invoices or the SKU map: it only reads them.
 6. First real run: `./scripts/run_monthly.sh`. Check the log ends with `=== done`, then check Power BI or run
    `SELECT TOP 20 * FROM dbo.vw_amazon_order_forecast_sku WHERE is_latest = 1`.
 
-## Scheduling (not switched on yet)
-`scripts/crontab.example` holds the line to add with `crontab -e`. It runs at 10:00 UTC on days 6 to 12 of each
-month. Once a month has loaded the script does nothing more; if Amazon's last closed month is not in the
-database yet, it exits and tries again the next day. It does not clash with the Thursday ingest jobs.
+## Scheduling
+The crontab lines are in `scripts/crontab.example`: 10:00 UTC (US) and 11:00 UTC (UK) on days 6 to 12 of each month.
+Add them to the existing crontab, never replace it (the ingest jobs are in there): `(crontab -l; cat the-two-lines) | crontab -`.
+Once a month has loaded the script does nothing more; if Amazon's last closed month is not in the database
+yet, it exits and tries again the next day.
+
+How to tell it worked: on day 13, `ls logs/.done_US_$(date -u +%Y%m)` should exist, and
+`SELECT MAX(created_at) FROM dbo.amazon_order_forecast_run` should show this month.
+If the file is missing, read `logs/monthly_US_<yyyymm>.log` (exit code 3 means the monthly data was not loaded in
+time: check the ingest) and run `./scripts/run_monthly.sh` by hand.
 
 ## Reading the log: exit codes
 | Code | Meaning | What to do |
