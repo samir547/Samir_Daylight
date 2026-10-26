@@ -32,7 +32,11 @@ def external_predictions(raw: pd.DataFrame, snap: Snapshot, horizon: int, label:
 def compare(snap: Snapshot, ext: pd.DataFrame, target: str, horizon: int, min_history: int) -> dict:
     months = snap.months
     sell = to_wide(snap.sales, "asin", target, months, mask_before_first=True)
-    base = forecast_series(sell, [len(months) - horizon], horizon, METHODS, min_history)
+    from .seasonal import VARIANTS, forecast_seasonal
+    origin = [len(months) - horizon]
+    base = pd.concat([forecast_series(sell, origin, horizon, METHODS, min_history)] +
+                     [forecast_seasonal(sell, origin, horizon, min_history, sh, nm) for nm, sh in VARIANTS.items()],
+                     ignore_index=True)
     common = set(ext["asin"]) & set(base["asin"])
     pred = pd.concat([base[base["asin"].isin(common)], ext[ext["asin"].isin(common)]], ignore_index=True)
     return {"scores": score_predictions(pred, snap, target), "predictions": pred,

@@ -1,0 +1,5 @@
+# Only for the optional Azure AutoML experiments (laptop). Not needed on the VM.
+-r requirements.txt
+pyarrow>=14
+azure-ai-ml>=1.19
+azure-identity>=1.17

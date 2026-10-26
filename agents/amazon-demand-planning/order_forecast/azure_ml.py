@@ -23,7 +23,22 @@ MAX_NODES = int(os.environ.get("AZUREML_MAX_NODES", "2"))
 FREQUENCY = "MS"
 
 METRICS = ("normalized_mean_absolute_error", "normalized_root_mean_squared_error")
+VALID_MODELS = ("AutoArima", "Prophet", "Naive", "SeasonalNaive", "Average", "SeasonalAverage", "ExponentialSmoothing",
+                "Arimax", "TCNForecaster", "ElasticNet", "GradientBoosting", "DecisionTree", "KNN", "LassoLars", "SGD",
+                "RandomForest", "ExtremeRandomTrees", "LightGBM", "XGBoostRegressor")
+
+
+def parse_models(text: str) -> list[str]:
+    names = [t.strip() for t in text.split(",") if t.strip()]
+    bad = [n for n in names if n not in VALID_MODELS]
+    if bad:
+        raise SystemExit(f"Unknown AutoML model(s) {bad}. Valid: {', '.join(VALID_MODELS)}")
+    return names
+
+
 PRESETS = {
+    # classical per-series models that carry a seasonal pattern
+    "seasonal": ["SeasonalNaive", "SeasonalAverage", "ExponentialSmoothing", "AutoArima", "Prophet"],
     # models that learn across series from engineered features
     "learned": ["LightGBM", "XGBoostRegressor", "RandomForest", "ExtremeRandomTrees", "ElasticNet",
                 "GradientBoosting", "LassoLars", "DecisionTree", "KNN", "SGD"],
@@ -67,6 +82,12 @@ def register_assets(client, export_dir: Path) -> list[str]:
     man = read_manifest(export_dir)
     out = []
     for name, folder in zip(asset_names(man["pool"]), ("train", "horizon")):
+        try:   # the version is a hash of the content, so an existing one is identical: reuse it
+            a = client.data.get(name=name, version=man["version"])
+            out.append(f"{a.name}:{a.version} (already registered)")
+            continue
+        except Exception:
+            pass
         a = client.data.create_or_update(Data(
             name=name, version=man["version"], type=AssetTypes.MLTABLE, path=str(Path(export_dir) / folder),
             description=f"train_end {man['train_end']}, target {man['target']}"))
@@ -103,3 +124,39 @@ def build_job(manifest: dict, trials: int = 20, timeout_min: int = 60, concurren
                      **({"allowed_training_algorithms": allow} if allow else {}))
     job.display_name = f"amazon-order-{manifest['pool'].lower()}-{v}" + (f"-{tag}" if tag else "")
     return job
+
+
+def fetch_predictions(client, job_name: str, dest: Path, best: str | None = None) -> Path | None:
+    """Download the best trial of a finished AutoML job plus its child runs (the held-out test run
+    writes the predictions there) and return the first CSV with series_id, ds and y_predicted.
+    Only the best trial is fetched: the other trials have no artifacts and just raise errors."""
+    import pandas as pd
+    job = client.jobs.get(job_name)
+    print(f"{job_name}: status={job.status}")
+    if "COMPLETED" not in str(job.status).upper():
+        raise SystemExit(f"Job is {job.status}, not Completed; nothing to fetch yet.")
+    best = best or (getattr(job, "properties", None) or {}).get("best_child_run_id")
+    if not best:
+        raise SystemExit("Could not tell which trial was best; pass --best <name> (the one marked Best in the portal).")
+    names = [best] + [j.name for j in client.jobs.list(parent_job_name=best)]
+    print("Fetching:", ", ".join(names))
+    for n in names:
+        out = Path(dest) / n
+        out.mkdir(parents=True, exist_ok=True)
+        try:
+            client.jobs.download(name=n, download_path=str(out), all=True)
+        except Exception as e:
+            print(f"  {n}: download skipped ({type(e).__name__}: {str(e)[:120]})")
+    files = sorted(p for p in Path(dest).rglob("*") if p.is_file() and any(n in p.parts for n in names))
+    for f in files:
+        print(f"  {f.relative_to(dest)}  ({f.stat().st_size:,} bytes)")
+    for f in files:
+        if f.suffix.lower() != ".csv":
+            continue
+        try:
+            cols = set(pd.read_csv(f, nrows=1).columns)
+        except Exception:
+            continue
+        if {"series_id", "ds", "y_predicted"} <= cols:
+            return f
+    return None

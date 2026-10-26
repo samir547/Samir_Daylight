@@ -10,3 +10,6 @@ results/
 !config/amazon_accounts.csv
 
 .env
+
+logs/
+automl_export/

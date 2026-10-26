@@ -17,7 +17,12 @@ SELECT  r.order_forecast_run_id, r.marketplace, r.method, r.target_measure, r.tr
         f.asin, f.month_start, f.units_forecast, f.units_lower, f.units_upper,
         m.product_code, m.family, m.product_description,
         CASE WHEN m.product_code IS NULL OR LTRIM(RTRIM(m.product_code)) IN ('', 'NULL')
-             THEN 1 ELSE 0 END AS is_unmapped
+             THEN 1 ELSE 0 END AS is_unmapped,
+        CASE WHEN r.order_forecast_run_id = (SELECT TOP 1 r2.order_forecast_run_id
+                                             FROM dbo.amazon_order_forecast_run r2
+                                             WHERE r2.marketplace = r.marketplace
+                                             ORDER BY r2.train_end DESC, r2.created_at DESC, r2.order_forecast_run_id DESC)
+             THEN 1 ELSE 0 END AS is_latest        -- Power BI: filter is_latest = 1 for the current forecast
 FROM    dbo.amazon_order_forecast f
 JOIN    dbo.amazon_order_forecast_run r ON r.order_forecast_run_id = f.order_forecast_run_id
 LEFT JOIN dbo.amazon_asin_sku_map m ON m.asin = f.asin AND m.market = r.marketplace;

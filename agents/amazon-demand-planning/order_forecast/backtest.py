@@ -15,6 +15,7 @@ import pandas as pd
 
 from .baselines import METHODS
 from .metrics import bias, wape
+from .seasonal import VARIANTS as SEASONAL_VARIANTS, forecast_seasonal
 from .series import to_wide
 from .snapshot import Snapshot
 
@@ -104,7 +105,8 @@ def score_predictions(pred: pd.DataFrame, snap: Snapshot, target: str) -> pd.Dat
 
 
 def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6, min_train: int = 24,
-                 stride: int | None = None, min_history: int = 12, methods: dict | None = None) -> dict:
+                 stride: int | None = None, min_history: int = 12, methods: dict | None = None,
+                 order_step: bool = False) -> dict:
     methods = methods or METHODS
     months = snap.months
     stride = stride or horizon
@@ -113,6 +115,12 @@ def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6
         raise ValueError(f"{len(months)} months is too few for min_train={min_train}, horizon={horizon}")
     sell = to_wide(snap.sales, "asin", target, months, mask_before_first=True)
     pred = forecast_series(sell, origins, horizon, methods, min_history)
+    pred = pd.concat([pred] + [forecast_seasonal(sell, origins, horizon, min_history, sh, nm)
+                               for nm, sh in SEASONAL_VARIANTS.items()], ignore_index=True)
+    stats = {}
+    if order_step:        # the stock top-up rule (apply_order_step) made every method worse, so only the open-PO tweak is scored
+        from .order_step import apply_open_po
+        pred = pd.concat([pred, apply_open_po(pred, snap, sell.fillna(0.0))], ignore_index=True)
     scores = score_predictions(pred, snap, target)
-    return {"predictions": pred, "scores": scores, "origins": [months[t - 1] for t in origins],
+    return {"order_step_stats": stats, "predictions": pred, "scores": scores, "origins": [months[t - 1] for t in origins],
             "coverage": coverage(pred, sell), "series": int(len(sell)), "months": len(months)}

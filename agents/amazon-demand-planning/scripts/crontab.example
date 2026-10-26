@@ -1,0 +1,11 @@
+# NOT INSTALLED. Add to the VM's crontab only when the first manual runs have been reviewed:  crontab -e
+#
+# Runs at 10:00 UTC on days 6 to 12 of each month. The script does nothing once the month has loaded,
+# and exits quietly if Amazon's last closed month is not in the database yet, so a late month just
+# means it tries again the next day. 10:00 UTC never overlaps the Thursday 06:00 and 07:00 UTC
+# amazon-sp-api-ingest jobs, and the script holds its own lock.
+#
+# Change the path to wherever the repository is cloned on the VM.
+0 10 6-12 * *  /home/azureuser/Samir_Daylight/agents/amazon-demand-planning/scripts/run_monthly.sh
+# UK (add only after its back-test is reviewed). A different hour: the script uses one lock for both pools.
+# 0 11 6-12 * *  POOL=UK /home/azureuser/Samir_Daylight/agents/amazon-demand-planning/scripts/run_monthly.sh

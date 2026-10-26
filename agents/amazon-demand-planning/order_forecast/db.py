@@ -22,7 +22,7 @@ def load_env_file(path: Path | str) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def connect():
+def connect(readonly: bool = True):
     missing = [k for k in REQUIRED if not os.getenv(k)]
     if missing:
         raise RuntimeError(f"Missing {', '.join(missing)}; set them or pass --env-file.")
@@ -31,7 +31,8 @@ def connect():
         f"DRIVER={{{os.getenv('DB_DRIVER', 'ODBC Driver 18 for SQL Server')}}};"
         f"SERVER={os.getenv('DB_SERVER')},{os.getenv('DB_PORT', '1433')};"
         f"DATABASE={os.getenv('DB_NAME')};UID={os.getenv('DB_USER')};PWD={os.getenv('DB_PASSWORD')};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;ApplicationIntent=ReadOnly;"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        + ("ApplicationIntent=ReadOnly;" if readonly else "") +
         "Packet Size=4096;"   # larger TDS packets have hung on this network path (agents/product-review)
     )
     return pyodbc.connect(conn_str, timeout=30, autocommit=True)

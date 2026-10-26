@@ -1,0 +1,12 @@
+{
+  "method": "seasonal_half",
+  "open_po_tweak": true,
+  "target": "ordered_units",
+  "horizon": 6,
+  "min_history": 12,
+  "sanity_ratio_min": 0.5,
+  "sanity_ratio_max": 1.6,
+  "pools": {
+    "UK": {"method": "seasonal"}
+  }
+}

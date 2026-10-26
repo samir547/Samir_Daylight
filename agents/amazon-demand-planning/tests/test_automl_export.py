@@ -31,6 +31,7 @@ def test_export_never_contains_holdout_actuals():
 
 
 def test_write_export_files(tmp_path):
+    pytest.importorskip("pyarrow")
     t = build_tables(make_snap(), horizon=6)
     d = write_export(t, "US", tmp_path, "ordered_units", 6, 12)
     for f in ("train/train.parquet", "train/MLTable", "horizon/horizon.parquet", "horizon/MLTable", "holdout_actuals.csv", "manifest.json"):
