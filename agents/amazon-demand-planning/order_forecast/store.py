@@ -22,20 +22,30 @@ def split_batches(script: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def init_db(conn=None) -> int:
+def init_db(conn=None) -> tuple[int, list[str]]:
+    """Apply the SQL scripts batch by batch. Returns (batches applied, problems). A problem does not stop
+    the rest, so one missing permission (for example CREATE VIEW) is reported together with the others."""
     own = conn is None
     conn = conn or db.connect(readonly=False)
-    n = 0
+    applied, problems = 0, []
     try:
         cur = conn.cursor()
         for name in SQL_FILES:
             for batch in split_batches((SQL_DIR / name).read_text(encoding="utf-8")):
-                cur.execute(batch)
-                n += 1
+                try:
+                    cur.execute(batch)
+                    applied += 1
+                except Exception as e:
+                    first = next((ln.strip() for ln in batch.splitlines() if ln.strip() and not ln.strip().startswith("--")), "")
+                    msg = str(e)
+                    hint = ""
+                    if "permission" in msg.lower() or "denied" in msg.lower():
+                        hint = " (a permission is missing for the shared login: ask an admin to run this script by hand)"
+                    problems.append(f"{name}: {first[:70]} -> {msg[-160:]}{hint}")
     finally:
         if own:
             conn.close()
-    return n
+    return applied, problems
 
 
 def load_forecast(f: LiveForecast, marketplace: str, snapshot_ref: str = "", conn=None) -> int:

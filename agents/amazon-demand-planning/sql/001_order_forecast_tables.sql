@@ -1,5 +1,5 @@
 -- ============================================================================
--- 001  Stored order forecasts. NOT APPLIED, NOT YET TESTED: review first.
+-- 001  Stored order forecasts. Applied by `python -m order_forecast init-db`.
 --
 -- Layer 1 of the design (README.md): forecasts are keyed by marketplace + ASIN
 -- + month. There is deliberately NO product_code column here. Product codes
@@ -33,8 +33,10 @@ CREATE TABLE dbo.amazon_order_forecast (
     units_forecast        DECIMAL(12,2) NOT NULL,
     units_lower           DECIMAL(12,2) NULL,
     units_upper           DECIMAL(12,2) NULL,
-    CONSTRAINT PK_amazon_order_forecast PRIMARY KEY (order_forecast_run_id, asin, month_start),
-    CONSTRAINT FK_amazon_order_forecast_run FOREIGN KEY (order_forecast_run_id)
-        REFERENCES dbo.amazon_order_forecast_run (order_forecast_run_id)
+    CONSTRAINT PK_amazon_order_forecast PRIMARY KEY (order_forecast_run_id, asin, month_start)
+    -- No foreign key to the run table on purpose: creating one needs the REFERENCES permission, which the
+    -- shared daylight_agents login does not have. The loader writes both tables in one transaction and
+    -- replaces a run in both, so rows cannot be orphaned by the tool. An admin can add the key with
+    -- sql/003_optional_foreign_key.sql.
 );
 GO

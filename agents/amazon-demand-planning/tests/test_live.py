@@ -121,3 +121,32 @@ def test_pool_settings_override(tmp_path):
     p.write_text('{"pools": {"UK": {"method": "magic"}}}')
     with pytest.raises(SystemExit):
         load_settings(p)
+
+
+def test_init_db_reports_problems_and_keeps_going():
+    from order_forecast.store import init_db
+
+    class Cur:
+        def __init__(self):
+            self.n = 0
+        def execute(self, sql):
+            self.n += 1
+            if "CREATE OR ALTER VIEW" in sql:
+                raise RuntimeError("The CREATE VIEW permission was denied")
+
+    class Conn:
+        def __init__(self):
+            self.c = Cur()
+        def cursor(self):
+            return self.c
+        def close(self):
+            pass
+
+    applied, problems = init_db(Conn())
+    assert applied >= 3 and len(problems) == 1
+    assert "002_views.sql" in problems[0] and "ask an admin" in problems[0]
+
+
+def test_tables_script_has_no_foreign_key():
+    from order_forecast.store import SQL_DIR
+    assert "FOREIGN KEY" not in (SQL_DIR / "001_order_forecast_tables.sql").read_text().replace("-- ", "").split("PK_amazon_order_forecast PRIMARY KEY (order_forecast_run_id, asin, month_start)")[1]

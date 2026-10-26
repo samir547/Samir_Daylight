@@ -125,8 +125,11 @@ def main(argv=None) -> int:
 
     if a.cmd == "init-db":
         from .store import init_db
-        print(f"Applied {init_db()} SQL batches (tables and views are created only if missing).")
-        return 0
+        applied, problems = init_db()
+        print(f"Applied {applied} SQL batches (tables and views are created only if missing).")
+        for pr in problems:
+            print("PROBLEM:", pr)
+        return 1 if problems else 0
 
     if a.cmd in ("forecast", "run-cycle"):
         return _forecast_and_maybe_load(a)
