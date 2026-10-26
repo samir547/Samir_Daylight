@@ -87,6 +87,22 @@ def coverage(pred: pd.DataFrame, sellout_wide: pd.DataFrame) -> float:
     return float(scored / allv) if allv else float("nan")
 
 
+def score_predictions(pred: pd.DataFrame, snap: Snapshot, target: str) -> pd.DataFrame:
+    """Score any predictions frame (method, train_end, target_month, step, asin, predicted)
+    against the three answer keys. Used for the baselines and for external models alike."""
+    months = snap.months
+    sell = to_wide(snap.sales, "asin", target, months, mask_before_first=True).fillna(0.0)
+    receipts = to_wide(snap.inventory, "asin", "net_received_units", months, mask_before_first=False)
+    inv_total = snap.invoices.groupby("month_start")["gross_units"].sum()
+    return pd.concat([
+        score_asin_level(pred, sell, "sellout"),
+        score_asin_level(pred, receipts, "receipts"),
+        score_total_level(pred, sell.sum(), "sellout"),
+        score_total_level(pred, receipts.sum(), "receipts"),
+        score_total_level(pred, inv_total, "invoices"),
+    ], ignore_index=True)
+
+
 def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6, min_train: int = 24,
                  stride: int | None = None, min_history: int = 12, methods: dict | None = None) -> dict:
     methods = methods or METHODS
@@ -97,14 +113,6 @@ def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6
         raise ValueError(f"{len(months)} months is too few for min_train={min_train}, horizon={horizon}")
     sell = to_wide(snap.sales, "asin", target, months, mask_before_first=True)
     pred = forecast_series(sell, origins, horizon, methods, min_history)
-    receipts = to_wide(snap.inventory, "asin", "net_received_units", months, mask_before_first=False)
-    inv_total = snap.invoices.groupby("month_start")["gross_units"].sum()
-    scores = pd.concat([
-        score_asin_level(pred, sell.fillna(0.0), "sellout"),
-        score_asin_level(pred, receipts, "receipts"),
-        score_total_level(pred, sell.fillna(0.0).sum(), "sellout"),
-        score_total_level(pred, receipts.sum(), "receipts"),
-        score_total_level(pred, inv_total, "invoices"),
-    ], ignore_index=True)
+    scores = score_predictions(pred, snap, target)
     return {"predictions": pred, "scores": scores, "origins": [months[t - 1] for t in origins],
             "coverage": coverage(pred, sell), "series": int(len(sell)), "months": len(months)}

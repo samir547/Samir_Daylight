@@ -1,3 +1,9 @@
 pandas>=2.0
 numpy>=1.26
 pyodbc>=5.0
+
+# AutoML (VM and laptop that submits jobs)
+pyarrow>=14
+mltable>=1.6
+azure-ai-ml>=1.19
+azure-identity>=1.17

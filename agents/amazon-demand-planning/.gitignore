@@ -8,3 +8,5 @@ snapshots/
 results/
 *.csv
 !config/amazon_accounts.csv
+
+.env
