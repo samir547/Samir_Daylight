@@ -1,0 +1,13 @@
+# Lines to add to the VM's crontab (crontab -e). Do NOT replace the existing entries: the amazon-sp-api-ingest
+# weekly jobs (Thursday 06:00 and 07:00 UTC) live in the same crontab.
+#
+# The VM runs in UTC. These run at 10:00 UTC on days 6 to 12 of each month. The first Thursday ingest
+# (day 1 to 7) loads the previous month, so by day 6 the month is normally there. The script does nothing
+# more once the month has loaded, and exits quietly if the month is not in the database yet, so a late month
+# just means it tries again the next day. If nothing has loaded by day 12 there is no retry until next month:
+# check logs/.done_US_<yyyymm> exists on day 13, or look at "forecast as of" in Power BI.
+#
+# Adjust the folder if the repository is cloned somewhere else.
+0 10 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+# UK runs an hour later because the script holds one lock for both pools.
+0 11 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=UK ./scripts/run_monthly.sh >> logs/cron.log 2>&1

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# pulled business data and run outputs - never commit
+snapshots/
+results/
+*.csv
+!config/amazon_accounts.csv
+
+.env
+
+logs/
+automl_export/

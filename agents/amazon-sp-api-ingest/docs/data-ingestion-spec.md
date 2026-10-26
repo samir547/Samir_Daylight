@@ -22,7 +22,7 @@ Daylight sells to Amazon as a 1P vendor, so Amazon Vendor Central reports are th
 3. Keep sales and inventory current automatically, weekly, including the month in progress (through weekly rows).
 4. Keep every weekly Amazon demand forecast as a separate version so forecast accuracy can be measured over time.
 
-Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The measure that matters most for demand planning is `shipped_units` (sell-out).
+Downstream consumers are the `amazon-demand-planning` agent and Power BI. The measure that matters most for demand planning is `shipped_units` (sell-out).
 
 ## 2. Current state
 
@@ -68,7 +68,7 @@ Downstream consumers are the `amazon-demand-forecast` agent and Power BI. The me
 - Daily (DAY) report data, and month-to-date figures built from daily data.
 - Azure Key Vault and managed identity.
 - Power BI datasets and dashboards.
-- Changes to the `amazon-demand-forecast` agent.
+- Changes to the `amazon-demand-planning` agent.
 - A weekly (WEEK) history backfill. Amazon only serves about 6 weeks back (section 5), so weekly rows start at go-live (section 6.3).
 - Row-level history of restated values (we log how many rows changed per run, nothing more).
 

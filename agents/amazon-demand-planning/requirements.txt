@@ -1,0 +1,4 @@
+# Everything the monthly job needs on the VM.
+pandas>=2.0
+numpy>=1.26
+pyodbc>=5.0
