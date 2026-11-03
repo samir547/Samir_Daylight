@@ -9,6 +9,8 @@
 # Exit code: 0 loaded (or already done this month); 1 failed after the retry; 2 could not run
 # (settings, credentials, no virtual environment); 3 data not ready yet; 4 sanity check refused to load.
 # Manual run:   POOL=US ./scripts/run_monthly.sh        Dry run (no database write): NO_LOAD=1 ./scripts/run_monthly.sh
+# Settings file: SETTINGS=config/forecast_settings.replenish.json POOL=UK ./scripts/run_monthly.sh
+#   (optional; without it the default config/forecast_settings.json is used, as before)
 set -u
 cd "$(dirname "$0")/.." || exit 2
 mkdir -p logs
@@ -20,6 +22,8 @@ LOG="logs/monthly_${POOL}_${MONTH}.log"
 DONE="logs/.done_${POOL}_${MONTH}"
 EXTRA=""
 [ "${NO_LOAD:-0}" = "1" ] && EXTRA="--no-load"
+SETTINGS_ARG=""
+[ -n "${SETTINGS:-}" ] && SETTINGS_ARG="--settings $SETTINGS"
 
 log() { echo "$(date -u -Is) $*" >> "$LOG"; }
 
@@ -31,8 +35,8 @@ if [ -f "$DONE" ] && [ "${NO_LOAD:-0}" != "1" ] && [ -z "${FORCE_RERUN:-}" ]; th
 fi
 
 for attempt in 1 2; do
-  log "=== attempt $attempt of 2 (pool $POOL)"
-  timeout 2h "$PY" -m order_forecast run-cycle --pool "$POOL" $EXTRA >> "$LOG" 2>&1
+  log "=== attempt $attempt of 2 (pool $POOL, settings ${SETTINGS:-default})"
+  timeout 2h "$PY" -m order_forecast run-cycle --pool "$POOL" $SETTINGS_ARG $EXTRA >> "$LOG" 2>&1
   rc=$?
   log "run-cycle exit code $rc"
   case "$rc" in
