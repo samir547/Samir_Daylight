@@ -39,6 +39,8 @@ def main(argv=None) -> int:
     b.add_argument("--stride", type=int, help="months between origins (default = horizon, non-overlapping)")
     b.add_argument("--min-history", type=int, default=12)
     b.add_argument("--order-step", action="store_true", help="also score each method with the stock-based order step (+orders)")
+    b.add_argument("--replenish", action="store_true",
+                   help="also score the replenishment replay (method 'replenish'; uses our own demand forecast)")
     b.add_argument("--out", default=str(ROOT / "results"))
     e = sub.add_parser("automl-export", help="write AutoML train/horizon tables from a snapshot (offline)")
     e.add_argument("--snapshot", required=True)
@@ -191,7 +193,8 @@ def main(argv=None) -> int:
     from .backtest import run_backtest
     from .snapshot import load_snapshot
     snap = load_snapshot(Path(a.snapshot))
-    r = run_backtest(snap, a.target, a.horizon, a.min_train, a.stride, a.min_history, order_step=a.order_step)
+    r = run_backtest(snap, a.target, a.horizon, a.min_train, a.stride, a.min_history, order_step=a.order_step,
+                     replenish=a.replenish)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = Path(a.out) / snap.pool / stamp
     out.mkdir(parents=True, exist_ok=True)
@@ -220,6 +223,11 @@ def _write_live_csv(f, pool: str, out_root: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     path = d / "forecast.csv"
     f.table.assign(method=f.method, target=f.target, train_end=f.train_end.date()).to_csv(path, index=False)
+    if "habits" in f.extras:              # replenish: what was learned per ASIN, so a number can be explained
+        f.extras["habits"].to_csv(d / "habits.csv", index=False)
+    if "unadjusted" in f.extras:          # replenish: the same forecast without the client adjustments
+        u = f.extras["unadjusted"]
+        u.table.assign(method=u.method, target=u.target, train_end=u.train_end.date()).to_csv(d / "forecast_unadjusted.csv", index=False)
     return path
 
 
@@ -232,6 +240,11 @@ def _forecast_and_maybe_load(a) -> int:
             from . import pull
             snap_dir = pull.pull_snapshot(a.pool, Path(a.out))
             print(f"Snapshot: {snap_dir}")
+            if settings_for_pool(settings, a.pool)["method"] == "replenish":     # needs Amazon's weekly forecast too
+                from .amazon_forecast import pull_forecast
+                from .snapshot import load_snapshot as _ls
+                fpath = pull_forecast(snap_dir, _ls(snap_dir).manifest.get("marketplace", a.pool))
+                print(f"Amazon forecast: {fpath}")
         else:
             snap_dir = Path(a.snapshot)
         snap = load_snapshot(snap_dir)
@@ -245,6 +258,10 @@ def _forecast_and_maybe_load(a) -> int:
         print(f"{snap.pool}: method {f.method}, target {f.target}, data to {f.train_end.date()}, "
               f"{f.table['asin'].nunique()} ASINs forecast ({f.skipped_short} skipped: under {settings['min_history']} months), "
               f"{f.horizon} months, total {f.table['units_forecast'].sum():,.0f} units, sanity ratio {f.sanity_ratio:.2f}")
+        if f.extras.get("stats"):
+            print(f"Replenish: {f.extras['stats']}; Amazon forecast used: {f.extras['amazon_used']}; "
+                  f"P80/P90 uplift when Amazon is missing: {f.extras['scenario_ratios'][0]:.2f}/{f.extras['scenario_ratios'][1]:.2f}; "
+                  f"open orders received next month: {f.extras['po_share']:.0%}")
         reason = sanity_check(f, settings)
         if reason and not getattr(a, "force", False):
             print(f"SANITY CHECK FAILED: {reason}. Nothing was written. Use --force only after checking the data.")
@@ -257,6 +274,9 @@ def _forecast_and_maybe_load(a) -> int:
             marketplace = snap.manifest.get("marketplace", snap.pool)
             run_id = load_forecast(f, marketplace, snapshot_ref=snap_dir.name)
             print(f"Loaded run {run_id} into dbo.amazon_order_forecast ({len(f.table)} rows).")
+            if "unadjusted" in f.extras:      # keep the no-adjustments forecast beside it, so the effect of the notes is visible
+                u = f.extras["unadjusted"]
+                print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
         return EXIT_OK
     except SystemExit:
         raise

@@ -7,7 +7,7 @@ settings edit, not a code change. Any method that was back-tested can be named t
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -20,9 +20,13 @@ from .seasonal import VARIANTS, forecast_seasonal
 from .series import to_wide
 from .snapshot import Snapshot
 
-SETTINGS_PATH = Path(__file__).resolve().parent.parent / "config" / "forecast_settings.json"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+SETTINGS_PATH = ROOT_DIR / "config" / "forecast_settings.json"
 DEFAULTS = {"method": "seasonal_half", "open_po_tweak": True, "target": "ordered_units", "horizon": 6,
-            "min_history": 12, "sanity_ratio_min": 0.5, "sanity_ratio_max": 1.6}
+            "min_history": 12, "sanity_ratio_min": 0.5, "sanity_ratio_max": 1.6,
+            # used only by method "replenish" (see replenish.py)
+            "amazon_weight": 0.5, "percentile_shrink": 1.0, "min_order_share": 0.25, "demand_method": "seasonal_half",
+            "adjustments_file": "config/order_adjustments.csv"}
 
 
 def load_settings(path: Path | None = None) -> dict:
@@ -38,7 +42,7 @@ def load_settings(path: Path | None = None) -> dict:
 
 
 def _check_method(name: str) -> None:
-    known = set(METHODS) | set(VARIANTS)
+    known = set(METHODS) | set(VARIANTS) | {"replenish"}
     if name not in known:
         raise SystemExit(f"Unknown method '{name}' in settings. Choose one of: {', '.join(sorted(known))}")
 
@@ -59,6 +63,7 @@ class LiveForecast:
     horizon: int
     skipped_short: int
     sanity_ratio: float            # forecast total / (last 12 months actual scaled to the horizon)
+    extras: dict = field(default_factory=dict)   # method-specific side outputs (replenish: habits, stats, unadjusted run)
 
 
 def expected_last_closed_month(today: date | None = None) -> pd.Timestamp:
@@ -72,6 +77,9 @@ def data_is_current(snap: Snapshot, today: date | None = None) -> bool:
 
 def build_live_forecast(snap: Snapshot, settings: dict | None = None) -> LiveForecast:
     s = settings or load_settings()
+    if s["method"] == "replenish":
+        from .replenish import build_replenish_forecast
+        return build_replenish_forecast(snap, s)
     months, H, mh = snap.months, int(s["horizon"]), int(s["min_history"])
     future = pd.date_range(months[-1] + pd.offsets.MonthBegin(1), periods=H, freq="MS")
     wide = to_wide(snap.sales, "asin", s["target"], months, mask_before_first=True)

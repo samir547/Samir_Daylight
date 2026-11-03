@@ -1,6 +1,8 @@
 -- ============================================================================
 -- 002  The only place the SKU map touches a forecast. NOT APPLIED, NOT YET TESTED.
 --
+-- Needs 004 applied first (order_chance column): init-db applies 001, 004, 002 in that order.
+--
 -- Fixing or extending dbo.amazon_asin_sku_map changes what these views return
 -- immediately. It never changes dbo.amazon_order_forecast.
 -- ASINs with no usable product code are kept and flagged, never dropped.
@@ -14,7 +16,7 @@ GO
 
 CREATE OR ALTER VIEW dbo.vw_amazon_order_forecast_sku AS
 SELECT  r.order_forecast_run_id, r.marketplace, r.method, r.target_measure, r.train_end, r.created_at,
-        f.asin, f.month_start, f.units_forecast, f.units_lower, f.units_upper,
+        f.asin, f.month_start, f.units_forecast, f.units_lower, f.units_upper, f.order_chance,
         m.product_code, m.family, m.product_description,
         CASE WHEN m.product_code IS NULL OR LTRIM(RTRIM(m.product_code)) IN ('', 'NULL')
              THEN 1 ELSE 0 END AS is_unmapped,

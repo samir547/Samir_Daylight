@@ -106,7 +106,7 @@ def score_predictions(pred: pd.DataFrame, snap: Snapshot, target: str) -> pd.Dat
 
 def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6, min_train: int = 24,
                  stride: int | None = None, min_history: int = 12, methods: dict | None = None,
-                 order_step: bool = False) -> dict:
+                 order_step: bool = False, replenish: bool = False) -> dict:
     methods = methods or METHODS
     months = snap.months
     stride = stride or horizon
@@ -121,6 +121,9 @@ def run_backtest(snap: Snapshot, target: str = "ordered_units", horizon: int = 6
     if order_step:        # the stock top-up rule (apply_order_step) made every method worse, so only the open-PO tweak is scored
         from .order_step import apply_open_po
         pred = pd.concat([pred, apply_open_po(pred, snap, sell.fillna(0.0))], ignore_index=True)
+    if replenish:         # the replenishment replay at each past origin, own demand forecast (Amazon's has no history)
+        from .replenish import backtest_predictions
+        pred = pd.concat([pred, backtest_predictions(snap, target, origins, horizon, min_history)], ignore_index=True)
     scores = score_predictions(pred, snap, target)
     return {"order_step_stats": stats, "predictions": pred, "scores": scores, "origins": [months[t - 1] for t in origins],
             "coverage": coverage(pred, sell), "series": int(len(sell)), "months": len(months)}
