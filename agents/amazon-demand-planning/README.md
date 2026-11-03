@@ -30,6 +30,13 @@ Answer keys, none of which is ever a model input:
 Gross units (Qty > 0) are used for invoices (Phase 1b: credits are under 1.5%
 since 2024 and the large earlier ones are bulk returns, not reversed orders).
 
+## Replenishment method (new)
+
+`replenish` predicts Amazon's orders by replaying its stock, open purchase orders and its own weekly forecast
+(mean, P80, P90), with client notes applied from `config/order_adjustments.csv`. Design, settings, back-test
+results and limits: [docs/replenish.md](docs/replenish.md). The live job still uses the method in
+`config/forecast_settings.json`.
+
 ## Run it (PowerShell, from this folder)
 
 ```powershell

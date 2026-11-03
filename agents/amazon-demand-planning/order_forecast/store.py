@@ -13,7 +13,7 @@ from . import db
 from .live import LiveForecast
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
-SQL_FILES = ("001_order_forecast_tables.sql", "002_views.sql")
+SQL_FILES = ("001_order_forecast_tables.sql", "004_replenish_columns.sql", "002_views.sql")   # 004 before 002: the view reads its column
 
 
 def split_batches(script: str) -> list[str]:
@@ -66,14 +66,25 @@ def load_forecast(f: LiveForecast, marketplace: str, snapshot_ref: str = "", con
                        OUTPUT INSERTED.order_forecast_run_id VALUES (?, ?, ?, ?, ?, ?)""",
                     (marketplace, f.method, f.target, f.train_end.date(), f.horizon, snapshot_ref or None))
         run_id = int(cur.fetchone()[0])
-        rows = [(run_id, a, m.date(), float(u)) for a, m, u in
-                zip(f.table["asin"], f.table["month_start"], f.table["units_forecast"])]
         try:
             cur.fast_executemany = True
         except Exception:
             pass
-        cur.executemany("""INSERT INTO dbo.amazon_order_forecast (order_forecast_run_id, asin, month_start, units_forecast)
-                           VALUES (?, ?, ?, ?)""", rows)
+        if "units_upper" in f.table.columns:           # the replenish method: likely case, high case, chance of order
+            cur.execute("SELECT COL_LENGTH('dbo.amazon_order_forecast', 'order_chance')")
+            has_chance = cur.fetchone()[0] is not None
+            t = f.table
+            chance = [None if v != v else float(v) for v in t["order_chance"]]
+            rows = [(run_id, a, m.date(), float(u), float(hi)) + ((c,) if has_chance else ())
+                    for a, m, u, hi, c in zip(t["asin"], t["month_start"], t["units_forecast"], t["units_upper"], chance)]
+            cols = "units_forecast, units_upper" + (", order_chance" if has_chance else "")
+            cur.executemany(f"""INSERT INTO dbo.amazon_order_forecast (order_forecast_run_id, asin, month_start, {cols})
+                                VALUES (?, ?, ?, ?, ?{', ?' if has_chance else ''})""", rows)
+        else:
+            rows = [(run_id, a, m.date(), float(u)) for a, m, u in
+                    zip(f.table["asin"], f.table["month_start"], f.table["units_forecast"])]
+            cur.executemany("""INSERT INTO dbo.amazon_order_forecast (order_forecast_run_id, asin, month_start, units_forecast)
+                               VALUES (?, ?, ?, ?)""", rows)
         conn.commit()
         return run_id
     except Exception:

@@ -1,0 +1,13 @@
+{
+  "method": "replenish",
+  "target": "ordered_units",
+  "horizon": 6,
+  "min_history": 12,
+  "sanity_ratio_min": 0.5,
+  "sanity_ratio_max": 1.6,
+  "amazon_weight": 0.5,
+  "percentile_shrink": 1.0,
+  "min_order_share": 0.25,
+  "demand_method": "seasonal_half",
+  "adjustments_file": "config/order_adjustments.csv"
+}

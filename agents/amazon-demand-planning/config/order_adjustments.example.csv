@@ -1,0 +1,4 @@
+marketplace,asin,month_start,type,value,note,entered_by,valid_until
+UK,B000EXAMPLE,2026-12-01,demand_multiplier,1.5,Prime deal planned in December,ankush,2026-12-31
+UK,B000EXAMPLE,2027-02-01,pinned_order,600,Amazon confirmed a February bulk order,ankush,2027-02-28
+UK,B000NEWITEM,,discontinue,,Being delisted,ankush,

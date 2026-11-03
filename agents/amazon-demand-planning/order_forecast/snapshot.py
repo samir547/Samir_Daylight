@@ -21,6 +21,7 @@ class Snapshot:
     inventory: pd.DataFrame    # asin, month_start, net_received_units, sellable_units, open_po_units
     invoices: pd.DataFrame     # marketplace, product_code, month_start, gross_units, credit_units
     manifest: dict
+    directory: Path | None = None    # where it was loaded from; optional files (amazon_forecast.csv) live beside it
 
     @property
     def months(self) -> pd.DatetimeIndex:
@@ -43,4 +44,4 @@ def load_snapshot(directory: Path) -> Snapshot:
         raise SystemExit(f"No snapshot at {directory} (manifest.json missing).{hint}")
     manifest = json.loads((directory / "manifest.json").read_text())
     frames = {n: pd.read_csv(directory / f, parse_dates=["month_start"]) for n, f in FILES.items()}
-    return Snapshot(manifest["pool"], frames["sales"], frames["inventory"], frames["invoices"], manifest)
+    return Snapshot(manifest["pool"], frames["sales"], frames["inventory"], frames["invoices"], manifest, directory)

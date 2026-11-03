@@ -48,3 +48,9 @@ Edit `config/forecast_settings.json` (`method`, `horizon`, `target`). Methods: `
 ## What the numbers mean
 Totals per month are the dependable output: typically within about 15 to 25 percent of actuals in testing.
 Single ASINs in a single month are indicative only (Amazon orders in lumps).
+
+## The `replenish` method (UK trial, not scheduled)
+A second method that replays Amazon's stock, open orders and its own weekly forecast to predict when and how much
+Amazon will order. Not used by the monthly job unless you set `"method": "replenish"` (or run with
+`--settings config/forecast_settings.replenish.json`). Before using it for real: apply `sql/004` (`init-db` does),
+run `pull-forecast` on a snapshot, and read `docs/replenish.md`. Client notes go in `config/order_adjustments.csv`.

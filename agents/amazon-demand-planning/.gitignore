@@ -8,6 +8,9 @@ snapshots/
 results/
 *.csv
 !config/amazon_accounts.csv
+!config/order_adjustments.example.csv
+# the real adjustments file holds business information: keep it out of git
+config/order_adjustments.csv
 
 .env
 
