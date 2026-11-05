@@ -199,6 +199,31 @@ def load_successor_map() -> pd.DataFrame:
     return df
 
 
+# ── Duplicate-batch check ─────────────────────────────────────────────────────
+
+def latest_batch_first_month() -> str | None:
+    """First forecast month of the newest batch in dbo.forecast_output.
+
+    None when there is nothing to compare with: the table does not exist yet
+    (write_outputs() creates it on the first publish) or it is empty.
+    """
+    exists = _read_sql(queries.FORECAST_OUTPUT_EXISTS, "forecast_output existence")
+    if pd.isna(exists.iloc[0, 0]):
+        return None
+    latest = _read_sql(queries.LATEST_BATCH_FIRST_MONTH, "latest forecast batch")
+    value = latest.iloc[0, 0]
+    return None if pd.isna(value) else str(value).strip()
+
+
+def batch_already_delivered(first_month: str, latest_first_month: str | None) -> bool:
+    """True if a run starting at `first_month` adds nothing new to the database.
+
+    Not-later rather than equal, so an anchor that moved backwards is stopped
+    too: publishing it would replace a newer forecast in Power BI.
+    """
+    return latest_first_month is not None and first_month <= latest_first_month
+
+
 # ── Optional write-back ───────────────────────────────────────────────────────
 
 def _check_output_schema(conn) -> None:

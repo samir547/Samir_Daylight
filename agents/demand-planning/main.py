@@ -117,6 +117,11 @@ def parse_args() -> argparse.Namespace:
                          "has no static fallback: if no month qualifies it stops with "
                          "exit 3. Without this flag the run is a development run and "
                          "behaves as before.")
+    ap.add_argument("--force", action="store_true",
+                    help="Only with --write-db. Publish even though the latest batch in "
+                         "dbo.forecast_output already starts at this run's first forecast "
+                         "month (or a later one). Without it such a run stops with exit "
+                         "3 before fitting.")
     ap.add_argument("--item", action="append", metavar="ITEM_CODE",
                     help="Restrict fitting/forecasting to this item_code. "
                          "Repeatable (--item A --item B) for more than one. "
@@ -371,6 +376,9 @@ def main() -> int:
                 "cycle.", ", ".join(blocked), ", ".join(blocked),
             )
             return 2
+    if args.force and not args.write_db:
+        logger.error("--force only makes sense together with --write-db.")
+        return 2
     if args.require_roll and not (args.auto_window or args.production):
         logger.error("--require-roll only makes sense together with --auto-window.")
         return 2
@@ -408,6 +416,26 @@ def main() -> int:
                 "forecast or written.", test_end_before,
             )
             return 3
+
+    # Every publish is checked, development runs included: whichever batch is
+    # newest becomes the forecast in Power BI, so a re-run or an older window
+    # would replace it. This compares against what was actually delivered,
+    # which --require-roll's static config.TEST_END cannot do.
+    if args.write_db:
+        latest_first = loader.latest_batch_first_month()
+        if loader.batch_already_delivered(config.FORECAST_START, latest_first):
+            if not args.force:
+                logger.error(
+                    "Latest batch in dbo.forecast_output starts at %s; this run would "
+                    "start at %s. Stopping with exit 3: nothing was forecast or "
+                    "written. Use --force to publish anyway.",
+                    latest_first, config.FORECAST_START,
+                )
+                return 3
+            logger.warning(
+                "--force: publishing a batch starting at %s although the latest "
+                "batch already starts at %s.", config.FORECAST_START, latest_first,
+            )
 
     family_map = family.build_family_map(master)
 
