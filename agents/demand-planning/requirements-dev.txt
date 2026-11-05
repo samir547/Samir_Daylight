@@ -1,0 +1,3 @@
+# Test tooling. Run from agents/demand-planning:  python -m pytest tests
+-r requirements.txt
+pytest>=8.0
