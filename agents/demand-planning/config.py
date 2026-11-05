@@ -24,12 +24,13 @@ DB_PORT     = int(os.getenv("DB_PORT", "1433"))
 #   TRAIN_END = -6, TEST_START = -5, FORECAST_START = +1, FORECAST_END = +6.
 # Re-derive the proposed anchor any time with `python -m analysis.window_proposal`.
 # ONE static anchor, everything else derived. TEST_END below is only the FALLBACK
-# window: it is what a run WITHOUT --auto-window uses, and what --auto-window
-# compares the newest complete month against (a run whose newest complete month
-# is not after it keeps this window; with --require-roll it exits 3 instead).
-# A scheduled run (run_forecast_cycle.sh) overrides all five constants in memory
-# from the data, so this value never needs editing for the cron path. Bump it by
-# hand only when you want manual / analysis-script runs to default to a newer
+# window: it is what a development run WITHOUT --auto-window uses, and what
+# --auto-window compares the newest complete month against (a run whose newest
+# complete month is not after it keeps this window; with --require-roll it exits
+# 3 instead). A scheduled run (run_forecast_cycle.sh) uses --production, which
+# sets all five constants in memory from the data and never reads this value, so
+# it needs no editing for the cron path. Bump it by hand before the quarterly
+# development run, or when you want manual / analysis-script runs to default to a newer
 # window. TRAIN_END, TEST_START, FORECAST_START and FORECAST_END are computed from
 # it, so they can no longer drift out of step with each other.
 OFFSETS_FROM_TEST_END = {

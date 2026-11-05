@@ -16,13 +16,15 @@ FROM dbo.forecast_output
 GROUP BY run_date, model, run_kind
 ORDER BY run_date DESC, model;
 
--- 2. Confirm forecast_accuracy got the sibling write (Prophet-only —
---    Naive routes have no fit to score, so their absence here is
---    expected, not a gap).
-SELECT run_date, model, COUNT(*) AS rows
-FROM dbo.forecast_accuracy
-GROUP BY run_date, model
-ORDER BY run_date DESC;
+-- 2. Delivered accuracy, newest batches first. Production runs do
+--    not write dbo.forecast_accuracy, so that table only gains rows
+--    from development runs; a batch missing from it is expected.
+--    Complete months only. A new batch appears once its first month
+--    has actuals. Needs the table and view in database/.
+SELECT grain, first_forecast_month, training_basis, year_month, horizon,
+       series_count, forecast_units, actual_units, wape_pct, bias_pct
+FROM dbo.vw_forecast_delivered_accuracy
+ORDER BY first_forecast_month DESC, year_month, grain;
 
 -- 3. item_code whitespace check — untrimmed values silently break
 --    the join to Map_Master Product Table[NAME] in Power BI.
@@ -36,8 +38,8 @@ LEFT JOIN [dbo].[MASTER RODUCT TABLE] mpt ON TRIM(mpt.[NAME]) = TRIM(fo.item_cod
 WHERE mpt.[NAME] IS NULL;
 
 -- 5. forecast_training_data freshness spot-check — confirms the
---    upstream staging table (refreshed externally via
---    forecast_training_data.sql, not by this pipeline) actually
---    has data for a given month before trusting a TEST_END/
---    FORECAST_START anchored on it. Replace '2026-08' as needed.
+--    staging table (rebuilt by this pipeline from INVOICES_TEMP,
+--    which is refreshed externally) actually has data for a given
+--    month before trusting an anchor on it. Replace '2026-08' as
+--    needed.
 SELECT MAX(year_month), COUNT(*) FROM dbo.forecast_training_data WHERE year_month = '2026-08';
