@@ -37,6 +37,20 @@ OFFSETS_FROM_TEST_END = {
     "FORECAST_START": 1, "FORECAST_END": 6,      # 6-month forward forecast
 }
 
+# Production windows (`main.py --production`). The models train right up to the
+# anchor and forecast the next six months; there is no held-out test window.
+# Accuracy is tracked instead by scoring delivered batches against actuals as
+# they arrive (evaluation/delivered_accuracy.py).
+#
+# TEST_END stays equal to the anchor rather than being removed: prepare() cuts
+# the data at it and detect_channel_mismatch() anchors on it. TEST_START is one
+# month AFTER TEST_END on purpose, which makes the test window empty, so every
+# ">= TEST_START and <= TEST_END" filter selects nothing with no special case.
+OFFSETS_PRODUCTION = {
+    "TRAIN_END": 0, "TEST_START": 1, "TEST_END": 0,
+    "FORECAST_START": 1, "FORECAST_END": 6,
+}
+
 
 def shift_month(ym: str, months: int) -> str:
     """'YYYY-MM' shifted by `months` (negative = earlier). No pandas needed."""

@@ -205,3 +205,38 @@ def latest_complete_month(raw: pd.DataFrame) -> tuple[str, pd.DataFrame]:
     if complete.empty:
         raise ValueError("No month in the extract passes the completeness check.")
     return complete["month"].max(), ev
+
+
+def current_month(today: pd.Timestamp | None = None) -> str:
+    """'YYYY-MM' of `today` (UTC now if omitted)."""
+    ts = pd.Timestamp.now(tz="UTC") if today is None else pd.Timestamp(today)
+    return ts.strftime("%Y-%m")
+
+
+def latest_elapsed_complete_month(
+    raw: pd.DataFrame, today: pd.Timestamp | None = None
+) -> tuple[str, pd.DataFrame]:
+    """
+    The newest month that passes the completeness check AND has fully elapsed.
+
+    Used by production runs, which train on the anchor month itself, so a
+    half-filled anchor is a bigger risk there than in a development run. The
+    ratio test alone is not enough: the extract pulled on 2026-08-29 passed
+    2026-08 at 1.195 although the month finished 10% higher, and with
+    transactions running well ahead of last year a month only about 45% filled
+    would clear MIN_SEASONAL_TXN_RATIO. A month that has not ended cannot be
+    complete, whatever its ratio says.
+
+    Raises ValueError if no month qualifies.
+    """
+    ev = month_completeness(raw)
+    if ev.empty:
+        raise ValueError("The extract has no months to assess.")
+    this_month = current_month(today)
+    eligible = ev[ev["is_complete"] & (ev["month"] < this_month)]
+    if eligible.empty:
+        raise ValueError(
+            f"No month in the extract is both complete and fully elapsed "
+            f"(current month {this_month})."
+        )
+    return eligible["month"].max(), ev
