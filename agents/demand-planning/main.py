@@ -16,6 +16,11 @@ Usage:
                                     # written) if there is no newer complete month
                                     # than config.TEST_END to roll onto. What
                                     # run_forecast_cycle.sh calls.
+    python main.py --production --write-db
+                                    # production cycle: train to the latest complete,
+                                    # fully elapsed month, forecast the next six, and
+                                    # skip the test window, BDM benchmark and metrics.
+                                    # What run_forecast_cycle.sh calls.
     python main.py --cached --item A25090 --plots
                                     # fit + plot ONLY this item (fast single-item
                                     # debugging) — repeatable: --item A --item B
@@ -55,7 +60,9 @@ from data import loader
 from preprocessing import (
     prepare, scope, family, family_pool, demand_classification, model_routing
 )
-from analysis.month_completeness import latest_complete_month
+from analysis.month_completeness import (
+    latest_complete_month, latest_elapsed_complete_month,
+)
 from analysis.window_proposal import propose as propose_window, verify_offsets
 from models.prophet_model import run_forecasts, refresh_window_constants
 from models.naive_model import run_naive_forecasts
@@ -102,6 +109,14 @@ def parse_args() -> argparse.Namespace:
                          "anything, instead of re-forecasting the old static window "
                          "and exiting 0. Meant for scheduled runs, where a silent "
                          "no-op is worse than a loud failure.")
+    ap.add_argument("--production", action="store_true",
+                    help="Production mode: train to the anchor (the latest complete, "
+                         "fully elapsed month) and forecast the next six months. No "
+                         "test window, BDM benchmark or model metrics, and nothing is "
+                         "written to dbo.forecast_accuracy. Implies --auto-window, but "
+                         "has no static fallback: if no month qualifies it stops with "
+                         "exit 3. Without this flag the run is a development run and "
+                         "behaves as before.")
     ap.add_argument("--item", action="append", metavar="ITEM_CODE",
                     help="Restrict fitting/forecasting to this item_code. "
                          "Repeatable (--item A --item B) for more than one. "
@@ -294,6 +309,30 @@ def apply_auto_window(raw: pd.DataFrame, bdm_df: pd.DataFrame) -> None:
     config.BENCHMARK_END = new_end
 
 
+def apply_production_window(raw: pd.DataFrame) -> bool:
+    """Set the production windows for this run; False if no anchor qualifies.
+
+    Unlike apply_auto_window() this never falls back to config.py's static
+    window and never compares against config.TEST_END. A production forecast
+    built on a stale window would be published as current, so stopping is safer.
+    """
+    try:
+        anchor, _evidence = latest_elapsed_complete_month(raw)
+    except ValueError as err:
+        logger.error("--production: no usable anchor month: %s", err)
+        return False
+
+    proposed = propose_window(anchor, production=True)
+    for name, value in proposed.items():
+        setattr(config, name, value)
+    refresh_window_constants()
+    logger.info(
+        "--production: anchor %s. Training to %s, forecasting %s..%s.",
+        anchor, config.TRAIN_END, config.FORECAST_START, config.FORECAST_END,
+    )
+    return True
+
+
 def forecast_filename() -> str:
     """The forward-forecast CSV's name for the CURRENT window.
 
@@ -332,8 +371,14 @@ def main() -> int:
                 "cycle.", ", ".join(blocked), ", ".join(blocked),
             )
             return 2
-    if args.require_roll and not args.auto_window:
+    if args.require_roll and not (args.auto_window or args.production):
         logger.error("--require-roll only makes sense together with --auto-window.")
+        return 2
+    if args.production and args.require_roll:
+        logger.error(
+            "--require-roll does not apply to --production, which never reuses the "
+            "static window."
+        )
         return 2
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -347,7 +392,11 @@ def main() -> int:
     # modules cache their own Timestamp copies at import time and cannot be
     # fixed by an override this late; they self-refresh on entry instead —
     # see apply_auto_window() and prophet_model.refresh_window_constants().
-    if args.auto_window:
+    if args.production:
+        if not apply_production_window(raw):
+            logger.error("Stopping with exit 3: nothing was forecast or written.")
+            return 3
+    elif args.auto_window:
         test_end_before = config.TEST_END
         apply_auto_window(raw, bdm_df)
         if args.require_roll and config.TEST_END == test_end_before:
@@ -541,6 +590,12 @@ def main() -> int:
     # not a failure — step 5c's naive path still has a real result to
     # contribute. The combined check sits after that merge, below.
 
+    # Production has an empty test window, so run_forecasts() returns no test
+    # rows and all-NaN metrics. Drop both here so nothing below treats them as a
+    # score; the steps that follow already skip empty frames.
+    if args.production:
+        test_df, metrics_df = pd.DataFrame(), pd.DataFrame()
+
     # ── 5a. Split family forecasts back to item_code grain ────────────────────
     # After this block every frame is plain item_code grain again, so
     # family.enrich(), benchmark.build_comparison() and the CSV writers below
@@ -643,7 +698,8 @@ def main() -> int:
         return 1
 
     # ── 6. Benchmark ──────────────────────────────────────────────────────────
-    bench_df = benchmark.build_comparison(test_df, bdm_df, prepared, series_meta)
+    bench_df = (pd.DataFrame() if args.production
+                else benchmark.build_comparison(test_df, bdm_df, prepared, series_meta))
 
     # ── 7. Save outputs ───────────────────────────────────────────────────────
     if not test_df.empty:
