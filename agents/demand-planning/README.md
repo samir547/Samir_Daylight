@@ -26,14 +26,14 @@ by design, and the reason is recorded.
 | **Models** | Prophet (Smooth / Erratic demand with ≥ 24 months history) · Naive-3mo and Naive-12mo trailing averages (Lumpy / Intermittent demand) · *Blocked* (no forecast) |
 | **Latest run** (anchor month 2026-09) | 202 items forecast (Prophet 154 · Naive-3mo 23 · Naive-12mo 25); 64 of 266 routed items blocked (24%) |
 | **Source of truth** | `dbo.forecast_training_data` (rebuilt from `dbo.INVOICES_TEMP` by this repo) |
-| **Destination** | `dbo.forecast_output`, `dbo.forecast_accuracy`, view `dbo.vw_forecast_output_latest` → Power BI |
+| **Destination** | `dbo.forecast_output`, view `dbo.vw_forecast_output_latest` → Power BI; `dbo.forecast_delivered_accuracy` for tracking accuracy. `dbo.forecast_accuracy` is development history only |
 | **Runs** | Monthly, unattended, via `run_forecast_cycle.sh` (Linux VM + cron) |
 | **Stack** | Python 3.10+, Prophet, pandas, SQLAlchemy + pyodbc, Azure SQL |
 
 ### Accuracy in one paragraph
 
-Scored on a held-out six-month window against a "same month last year" baseline
-(like-for-like, 895 item-months): Prophet WAPE **50.9%** vs **62.2%** baseline
+Scored by a development run on a held-out six-month window against a "same month
+last year" baseline (like-for-like, 895 item-months): Prophet WAPE **50.9%** vs **62.2%** baseline
 (n = 799); Naive-12mo 57.3% vs 59.9%; Naive-3mo 76.5% vs 106.3% (n = 28, low
 confidence). The forecast leans about **10% low** overall, as does the baseline.
 WAPE is the metric to use — MAPE explodes on low-volume items. Full results and
@@ -122,13 +122,13 @@ Offline runs (`--cached`) never touch the database.
 
 | Setting | Value | Meaning |
 |---|---|---|
-| `TEST_END` | hand-set fallback anchor | The *fallback* window for runs **without** `--auto-window`. All other window constants are offsets from it. `--auto-window` overrides it in memory from the data. |
-| `TRAIN_END` / `TEST_START` / `FORECAST_START` / `FORECAST_END` | `TEST_END` −6 / −5 / +1 / +6 | Derived — never edit directly |
+| `TEST_END` | hand-set fallback anchor | The *fallback* window for development runs **without** `--auto-window`. All other window constants are offsets from it. `--auto-window` overrides it in memory from the data; `--production` ignores it |
+| `TRAIN_END` / `TEST_START` / `FORECAST_START` / `FORECAST_END` | Development: `TEST_END` −6 / −5 / +1 / +6. Production: 0 / +1 / +1 / +6 | Derived — never edit directly. `OFFSETS_FROM_TEST_END` and `OFFSETS_PRODUCTION` hold the two layouts |
 | `TRAIN_START` | `2018-01` | |
 | `GROUP_COLS` | `["item_code"]` | Modelling grain |
 | `MIN_TRAIN_MONTHS` | `24` | Calendar months of history Prophet needs (two yearly cycles) |
 | `CROSTON_MIN_OCCURRENCES` | `10` | Minimum sales months for the naive routes. **Provisional / unvalidated** — see open issues |
-| `ACTIVE_SINCE` | hand-bumped (`2025-06` at last edit) | Active = on the BDM sheet **and** traded at/after this month. **Bump by hand monthly** (keep ≈ 14 months before `TEST_END`) or long-dead items stay in scope |
+| `ACTIVE_SINCE` | hand-bumped (`2025-06` at last edit) | Active = on the BDM sheet **and** traded at/after this month. **Bump by hand monthly** (keep ≈ 14 months before the anchor) or long-dead items stay in scope |
 | `PROPHET_PARAMS` | `yearly_seasonality=3`, multiplicative, `changepoint_prior_scale=0.05`, `seasonality_prior_scale=10`, `interval_width=0.95` | Each deviation from Prophet defaults is justified with evidence in the file's comments |
 | `CHANGEPOINT_PRIOR_KNOWN_CHANGEOVER` | `0.25` | Looser trend prior for pooled families with a confirmed changeover date |
 | `SB_ADI_THRESHOLD` / `SB_CV2_THRESHOLD` | `1.32` / `0.49` | Standard Syntetos-Boylan cut-offs |
@@ -145,13 +145,15 @@ Offline runs (`--cached`) never touch the database.
 ./run_forecast_cycle.sh
 ```
 
-It does exactly two things, in order, and stops on the first failure:
+It does exactly three things, in order:
 
 1. `python database/build_training_data.py` — drops and rebuilds
-   `dbo.forecast_training_data` from `dbo.INVOICES_TEMP`.
-2. `python main.py --auto-window --require-roll --write-db` — rolls the
-   train/test/forecast windows onto the latest *complete* month, fits and routes
-   every item, and appends the result to Azure SQL.
+   `dbo.forecast_training_data` from `dbo.INVOICES_TEMP`. A failure stops the cycle.
+2. `python -m evaluation.delivered_accuracy` — scores earlier delivered batches
+   against the refreshed actuals. A failure logs a warning and the cycle continues.
+3. `python main.py --production --write-db` — trains every model to the latest
+   complete, fully elapsed month, forecasts the next six months and appends the
+   result to `dbo.forecast_output`. There is no test window and no BDM benchmark.
 
 Each run keeps its CSVs in `output/runs/<timestamp>/` and its console log in
 `logs/cycle_<date>.log`.
@@ -160,8 +162,8 @@ Each run keeps its CSVs in `output/runs/<timestamp>/` and its console log in
 |---|---|---|
 | `0` | Cycle complete | — |
 | `1` | A step failed (DB error, exception) | Read the log; nothing partial is written (the DB write is one transaction) |
-| `2` | Bad flag combination | `--write-db` is refused together with `--item`, `--cached` or `--pilot` so a partial run can never be published |
-| `3` | No newer complete month than `config.TEST_END` | Normal if the source table has not been refreshed yet; nothing forecast, nothing written |
+| `2` | Bad flag combination | `--write-db` is refused together with `--item`, `--cached` or `--pilot` so a partial run can never be published. Also `--force` without `--write-db`, and `--require-roll` with `--production` |
+| `3` | Nothing new to publish: no month is complete and fully elapsed, or the latest batch already covers this first forecast month | Normal if the source table has not been refreshed yet; nothing forecast, nothing written. To publish anyway, run `python main.py --production --write-db --force` |
 
 Example crontab (06:30 on the 5th, after the upstream invoice refresh finishes —
 that refresh is **not** owned by this repo):
@@ -177,26 +179,40 @@ MAILTO=you@example.com
 2. Bump `ACTIVE_SINCE` in `config.py` (≈ 14 months before the new anchor).
 3. After the run: check the exit code, then run
    `database/diagnostics/forecast_output_checks.sql` in SSMS.
-4. Optionally bump `TEST_END` to the new anchor so manual runs default to it.
+
+**Quarterly:** run a development cycle without publishing, to refresh the held-out
+evidence that production runs no longer produce:
+
+```bash
+python main.py --auto-window        # never add --write-db here
+```
+
+Bump `TEST_END` first if the newest complete month is not after it, otherwise the
+run keeps the old window. Keep the CSVs from this run with the quarter's records.
 
 ### 4b. Ad-hoc / development runs
 
 ```bash
+python main.py --production             # production windows, no DB write
 python main.py                          # fallback window from config.py, loads from the DB
 python main.py --auto-window            # roll the window to the latest complete month
 python main.py --cached                 # reuse CSVs in output/ (no DB access)
 python main.py --pilot                  # A-rated items only (fast validation)
 python main.py --plots                  # also save Prophet component plots
 python main.py --cached --item A25090 --plots   # one item, fast debugging (repeatable)
-python main.py --auto-window --write-db # publish (normally done by the cron script)
+python main.py --production --cached    # production windows on cached CSVs (no DB access)
+python -m evaluation.delivered_accuracy --dry-run   # score delivered batches, CSV only
+python -m pytest tests                  # unit tests (pip install -r requirements-dev.txt)
 python -m analysis.window_proposal      # show the window --auto-window would choose
 ```
 
 | Flag | Effect |
 |---|---|
-| `--auto-window` | Derive TRAIN/TEST/FORECAST (and benchmark window) from the newest complete month |
-| `--require-roll` | With `--auto-window`: exit 3 instead of re-forecasting if the window did not move |
-| `--write-db` | Append to `dbo.forecast_output` / `dbo.forecast_accuracy` (one transaction, schema-checked first) |
+| `--production` | Train to the anchor, forecast the next six months, skip the test window, benchmark and metrics. Implies `--auto-window` but has no static fallback: exit 3 if no month qualifies. Without this flag a run is a development run |
+| `--auto-window` | Development: derive TRAIN/TEST/FORECAST (and benchmark window) from the newest complete month |
+| `--require-roll` | Development, with `--auto-window`: exit 3 instead of re-forecasting if the window did not move |
+| `--write-db` | Append to `dbo.forecast_output`, plus `dbo.forecast_accuracy` for development runs (one transaction, schema-checked first). Exits 3 first if the latest batch already starts at this run's first forecast month or later |
+| `--force` | With `--write-db`: publish despite that check |
 | `--cached` | Skip the database; use cached CSVs |
 | `--pilot` | A-rated items only |
 | `--item CODE` | Fit only these items (repeatable) |
@@ -208,12 +224,22 @@ python -m analysis.window_proposal      # show the window --auto-window would ch
 tables have exactly the expected columns. If an older version of
 `dbo.forecast_output` or `dbo.forecast_accuracy` exists with different columns,
 the check fails with the offending column names — **drop the old tables once**
-and rerun (they are recreated). Application code never auto-runs DDL for views:
-apply `database/views/vw_forecast_output_latest.sql` yourself.
+and rerun (they are recreated). Those two tables are the only ones application
+code creates. Everything newer is applied by hand, once, in SSMS:
+
+- `database/views/vw_forecast_output_latest.sql`
+- `database/tables/forecast_delivered_accuracy.sql`
+- `database/views/vw_forecast_delivered_accuracy.sql`
+
+If the accuracy table is missing, the scoring step warns and the forecast still runs.
 
 ## 5. Outputs
 
 ### 5a. Files (per run folder)
+
+`test_validation.csv`, `model_metrics.csv` and `benchmark_comparison.csv` are written
+by development runs only. Several `analysis/` scripts read them, so they need a
+development run folder.
 
 | File | Contents |
 |---|---|
@@ -222,7 +248,8 @@ apply `database/views/vw_forecast_output_latest.sql` yourself.
 | `model_metrics.csv` | Per-item MAE / RMSE / MAPE / WAPE / bias, `n_train_months`, `n_test_months`, `changepoint_segment`. **Prophet items only** |
 | `benchmark_comparison.csv` | Model vs BDM vs prior-year per item-month, with `winner`. *BDM side includes Amazon — see caveats* |
 | `model_routing.csv` | Every item's demand category, route and block reason. **Not written by `main.py`** — produce it with `python -m analysis.model_routing_report` |
-| `successor_split_ratios.csv` | How pooled family forecasts were split back to item codes (test ratio and forward ratio) |
+| `successor_split_ratios.csv` | How pooled family forecasts were split back to item codes (test ratio and forward ratio; the two are equal in production) |
+| `delivered_accuracy.csv` | Copy of what the scoring step wrote to `dbo.forecast_delivered_accuracy` |
 | `excluded_channel_mismatch.csv` | Items dropped because their demand moved to Amazon, with the figures |
 | `excluded_amazon_rows.csv` | Amazon rows removed from training (audit) |
 | `region_ambiguity_log.csv` | (item, BDM) pairs that mapped to several regions and were collapsed (written by `database/build_training_data.py`) |
@@ -240,12 +267,16 @@ apply `database/views/vw_forecast_output_latest.sql` yourself.
 | `dbo.product_successor_map`, `dbo.product_successor_review` | Retired → successor code pairings and confirmed changeover dates |
 | `dbo.[MASTER RODUCT TABLE]` | Product Family (**the table name has a typo in the live database; code uses it as is**) |
 | `dbo.forecast_output` | **Append-only**; columns `item_code, family, year_month, yhat, yhat_lower, yhat_upper, model, run_kind, run_date` |
-| `dbo.forecast_accuracy` | **Append-only**; `item_code, family, model, mae, rmse, mape_pct, n_train_months, n_test_months, run_date` |
+| `dbo.forecast_accuracy` | **Append-only, development runs only**; `item_code, family, model, mae, rmse, mape_pct, n_train_months, n_test_months, run_date`. Production stops writing here, so its rows are the history of the held-out test windows |
+| `dbo.forecast_delivered_accuracy` | Delivered batches scored against the latest actuals, one row per batch, item and month. Rebuilt in full each cycle |
+| `dbo.vw_forecast_delivered_accuracy` | WAPE and bias per batch and month, at item and successor-family grain, complete months only |
 | `dbo.vw_forecast_output_latest` | Rows of the newest `run_date` for the three delivered models. **This is what Power BI reads** ("Forecast Qty (Prophet)", Global – Demand Planning page) |
 
 Because `forecast_output` is append-only and the view takes `MAX(run_date)`, **a
 bad batch becomes "the current forecast" immediately.** To roll back, delete
-that `run_date`'s rows from `forecast_output` and `forecast_accuracy`.
+that `run_date`'s rows from `forecast_output`, and from `forecast_accuracy` if it
+was a development batch. The next scoring step drops it from
+`forecast_delivered_accuracy`, and the duplicate check then allows a re-run.
 
 ## 6. Reading the results
 
@@ -260,6 +291,8 @@ that `run_date`'s rows from `forecast_output` and `forecast_accuracy`.
   routes it is a fixed empirical band (p10/p90 ratios), *not* a model-derived
   prediction interval.
 - **`n_test_months`** — a MAPE built from 1–3 months is weak evidence.
+- **`horizon`** (delivered accuracy) — months from the last training month to the
+  scored month: 1–6 for production batches, 7–12 for development batches.
 - **`ratio_basis`** — `forward` for pooled-family items split back to item codes
   using the freshest sales mix; `na` otherwise.
 
@@ -270,7 +303,8 @@ agents/demand-planning/
 ├── main.py                       # entry point / orchestration
 ├── config.py                     # all tunables, each with its justification
 ├── run_forecast_cycle.sh         # the monthly cron entry point
-├── requirements.txt, .env.example, .gitignore, .gitattributes
+├── requirements.txt, requirements-dev.txt, .env.example, .gitignore, .gitattributes
+├── tests/                        # pytest unit tests; no database or Prophet fit needed
 ├── data/
 │   ├── queries.py                # SQL as named constants
 │   └── loader.py                 # connection, loading, schema-checked transactional write
@@ -288,6 +322,7 @@ agents/demand-planning/
 ├── evaluation/
 │   ├── metrics.py                # MAE / RMSE / MAPE / WAPE / bias
 │   ├── benchmark.py              # model vs BDM vs prior-year
+│   ├── delivered_accuracy.py     # scores delivered batches against the latest actuals
 │   └── plots.py
 ├── analysis/                     # window selection, completeness, diagnostics, experiments
 ├── database/
@@ -300,9 +335,10 @@ agents/demand-planning/
 config and write no database rows). `month_completeness.py` and
 `window_proposal.py` are the exceptions in that **production calls them**.
 Several experiment scripts read cached CSVs from `output/` and document their
-conclusions in their own docstrings. There is no automated unit-test suite for
-this agent; correctness has been established by the experiments, run-to-run
-reconciliation checks and manual review (see open issues).
+conclusions in their own docstrings. `tests/` covers window derivation, the
+calendar gate, the duplicate-batch check and delivered scoring. The modelling
+itself is not unit-tested; it rests on the experiments, run-to-run reconciliation
+checks and manual review (see open issues).
 
 ## 8. Troubleshooting
 
@@ -312,20 +348,22 @@ reconciliation checks and manual review (see open issues).
 | `Can't open lib 'ODBC Driver 18…'` | Install the driver, or set `DB_DRIVER` to the version you have |
 | `Login failed` / connection timeout | Wrong credentials, or this machine's IP is not on the Azure SQL firewall |
 | `ModuleNotFoundError: sqlalchemy` | Wrong Python — activate the venv first (`source venv/bin/activate`) |
-| Exit code 3 | No new complete month. Check that `INVOICES_TEMP` was refreshed and that the build step ran |
-| Exit code 2 | `--write-db` used with `--item/--cached/--pilot`, or `--require-roll` without `--auto-window` |
+| Exit code 3 | Nothing new to publish. Check that `INVOICES_TEMP` was refreshed and that the build step ran. The log says whether no month qualified or the batch already exists |
+| Exit code 2 | `--write-db` used with `--item/--cached/--pilot`, `--force` without `--write-db`, `--require-roll` without `--auto-window`, or `--require-roll` with `--production` |
 | Schema check fails on `forecast_output` | Old table layout — drop it once (see 4c) |
-| `model_metrics.csv not found` warning from model routing | Diagnostic only. Occurs because each cycle writes to a fresh run folder; it only affects the "currently fitted" cross-check column |
+| `model_metrics.csv not found` warning from model routing | Diagnostic only. Occurs because each cycle writes to a fresh run folder, and production runs do not write that file; it only affects the "currently fitted" cross-check column |
 | Prophet install fails | Install a C++ toolchain, or use conda-forge |
 | Convergence warnings | Usually harmless; suppressed by default |
-| A forecast looks near zero for an item that is clearly selling | Run `python -m analysis.model_routing_report` and check `successor_split_ratios.csv`: it is usually a pooled successor family whose split gave the item ~0 share (see open issues) |
+| A forecast looks near zero for an item that is clearly selling | Usually Prophet's fitted trend has gone negative and the result is clipped to 0 (see [open issue 2](HOW_IT_WORKS.md#9-open-issues-and-challenges)). Pooling is not the cause |
+| `dbo.forecast_delivered_accuracy does not exist` warning | Apply `database/tables/forecast_delivered_accuracy.sql`. The forecast still ran |
 
 ## 9. Security and handover checklist
 
 - Credentials are environment-only; `.env` is git-ignored. **Rotate the database
   password before go-live** if it has ever been in a repository, ticket or chat.
 - Use a dedicated SQL login with only the rights needed (read on source tables;
-  create/insert on the two output tables; drop/create on `forecast_training_data`).
+  create/insert on the two output tables; delete/insert on
+  `forecast_delivered_accuracy`; drop/create on `forecast_training_data`).
 - The VM's outbound IP must be allow-listed on the Azure SQL firewall.
 - Confirm who owns the upstream `INVOICES_TEMP` refresh — this agent depends on
   it and cannot trigger it.

@@ -1,4 +1,10 @@
 """
+SUPERSEDED by evaluation/delivered_accuracy.py, which scores every delivered batch
+in the database each cycle. Kept for its split-family error decomposition. This
+script no longer works as it stands: FORECAST_MONTHS is hard-coded to 2026-05..07,
+it looks for the forecast file named after config.py's static window, and a run
+folder's raw_data.csv holds no later actuals.
+
 Out-of-sample scoring of the delivered forward forecast (Phase 1 — analysis only).
 
 WHY THIS IS THE HONEST NUMBER

@@ -199,6 +199,70 @@ def load_successor_map() -> pd.DataFrame:
     return df
 
 
+# ── Duplicate-batch check ─────────────────────────────────────────────────────
+
+def latest_batch_first_month() -> str | None:
+    """First forecast month of the newest batch in dbo.forecast_output.
+
+    None when there is nothing to compare with: the table does not exist yet
+    (write_outputs() creates it on the first publish) or it is empty.
+    """
+    exists = _read_sql(queries.FORECAST_OUTPUT_EXISTS, "forecast_output existence")
+    if pd.isna(exists.iloc[0, 0]):
+        return None
+    latest = _read_sql(queries.LATEST_BATCH_FIRST_MONTH, "latest forecast batch")
+    value = latest.iloc[0, 0]
+    return None if pd.isna(value) else str(value).strip()
+
+
+def batch_already_delivered(first_month: str, latest_first_month: str | None) -> bool:
+    """True if a run starting at `first_month` adds nothing new to the database.
+
+    Not-later rather than equal, so an anchor that moved backwards is stopped
+    too: publishing it would replace a newer forecast in Power BI.
+    """
+    return latest_first_month is not None and first_month <= latest_first_month
+
+
+# ── Delivered-forecast scoring ────────────────────────────────────────────────
+
+def load_delivered_forecasts() -> pd.DataFrame:
+    """Every delivered batch in dbo.forecast_output; empty if the table is absent."""
+    exists = _read_sql(queries.FORECAST_OUTPUT_EXISTS, "forecast_output existence")
+    if pd.isna(exists.iloc[0, 0]):
+        return pd.DataFrame()
+    df = _read_sql(queries.DELIVERED_FORECASTS, "delivered forecasts")
+    for col in ("yhat", "yhat_lower", "yhat_upper"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def load_development_run_dates() -> pd.Series:
+    """run_dates that have dbo.forecast_accuracy rows, i.e. development batches."""
+    return _read_sql(queries.DEVELOPMENT_RUN_DATES, "development run dates")["run_date"]
+
+
+def replace_delivered_accuracy(scored: pd.DataFrame) -> None:
+    """Replace dbo.forecast_delivered_accuracy with `scored` in one transaction.
+
+    The table comes from database/tables/forecast_delivered_accuracy.sql and is
+    never created here; a missing table is an error for the caller to report.
+    """
+    engine = _get_engine()
+    with engine.begin() as conn:
+        table_id = conn.execute(
+            text("SELECT OBJECT_ID('dbo.forecast_delivered_accuracy', 'U')")
+        ).scalar()
+        if table_id is None:
+            raise RuntimeError(
+                "dbo.forecast_delivered_accuracy does not exist. Apply "
+                "database/tables/forecast_delivered_accuracy.sql first."
+            )
+        conn.execute(text("DELETE FROM dbo.forecast_delivered_accuracy"))
+        scored.to_sql("forecast_delivered_accuracy", conn, if_exists="append", index=False)
+    logger.info("Replaced dbo.forecast_delivered_accuracy with %s rows", f"{len(scored):,}")
+
+
 # ── Optional write-back ───────────────────────────────────────────────────────
 
 def _check_output_schema(conn) -> None:

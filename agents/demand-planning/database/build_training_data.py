@@ -72,10 +72,11 @@ def rebuild_table() -> None:
     Retries transient connection failures the same way data.loader._read_sql()
     does for ordinary reads. This call is now the first step of an unattended,
     scheduled chain (run_forecast_cycle.sh) — a connection blip here should not
-    fail the whole two-month cycle any more readily than a normal data pull
+    fail the whole monthly cycle any more readily than a normal data pull
     would. The DROP + SELECT INTO run inside one transaction (engine.begin()),
     so a failed/retried attempt rolls back cleanly and never leaves the table
     half-dropped; each retry starts from the same known state as the last.
+    A concurrent reader waits for the commit rather than finding no table.
     """
     sql = SQL_PATH.read_text(encoding="utf-8")
     logger.info("Rebuilding [dbo].[forecast_training_data] from %s …", SQL_PATH.name)

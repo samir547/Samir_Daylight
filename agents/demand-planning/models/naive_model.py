@@ -172,13 +172,14 @@ def run_naive_forecasts(pooled_data: pd.DataFrame,
     mix = fit_keys["route"].value_counts().to_dict()
     logger.info(
         "Forecasting %s naive fit key(s) [%s] over %s month(s) — trailing mean "
-        "anchored at %s, plus the same level over the %s-month test window "
-        "(%s..%s) for the benchmark",
+        "anchored at %s%s",
         f"{len(fit_keys):,}",
         " | ".join(f"{r} {mix.get(r, 0)} @ {n}mo"
                    for r, n in config.NAIVE_WINDOW_MONTHS.items()),
         len(forecast_dates), config.TRAIN_END,
-        len(test_dates), config.TEST_START, config.TEST_END,
+        (f", plus the same level over the {len(test_dates)}-month test window "
+         f"({config.TEST_START}..{config.TEST_END}) for the benchmark"
+         if len(test_dates) else " (no test window)"),
     )
 
     fc_rows: list[pd.DataFrame] = []

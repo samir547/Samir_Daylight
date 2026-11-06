@@ -61,9 +61,15 @@ def verify_offsets() -> list[str]:
     return problems
 
 
-def propose(anchor: str) -> dict[str, str]:
-    """The five window constants implied by anchoring TEST_END on `anchor`."""
-    return {name: _shift(anchor, off) for name, off in OFFSETS_FROM_TEST_END.items()}
+def propose(anchor: str, production: bool = False) -> dict[str, str]:
+    """The five window constants implied by anchoring on `anchor`.
+
+    `production=False` is the development layout (train to anchor-6, test window
+    anchor-5..anchor). `production=True` trains to the anchor with an empty test
+    window; see config.OFFSETS_PRODUCTION. Both forecast anchor+1..anchor+6.
+    """
+    offsets = config.OFFSETS_PRODUCTION if production else OFFSETS_FROM_TEST_END
+    return {name: _shift(anchor, off) for name, off in offsets.items()}
 
 
 def bdm_coverage(bdm_df: pd.DataFrame, months: list[str],

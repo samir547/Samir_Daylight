@@ -91,6 +91,34 @@ LEFT JOIN [dbo].[product_successor_review] r
        ON r.review_id = m.review_id
 """
 
+# ── Duplicate-batch check (read-only) ─────────────────────────────────────────
+# The first forecast month of the newest batch is derived rather than stored, so
+# the check needs no schema change. Same MAX(run_date) rule as
+# dbo.vw_forecast_output_latest, so "latest" means what Power BI shows.
+FORECAST_OUTPUT_EXISTS = """
+SELECT OBJECT_ID('dbo.forecast_output', 'U') AS table_id
+"""
+
+LATEST_BATCH_FIRST_MONTH = """
+SELECT MIN(year_month) AS first_month
+FROM dbo.forecast_output
+WHERE run_date = (SELECT MAX(run_date) FROM dbo.forecast_output)
+"""
+
+# ── Delivered-forecast scoring (evaluation/delivered_accuracy.py) ─────────────
+# Same model filter as dbo.vw_forecast_output_latest: what the business received.
+DELIVERED_FORECASTS = """
+SELECT item_code, family, year_month, yhat, yhat_lower, yhat_upper, model, run_date
+FROM dbo.forecast_output
+WHERE model IN ('Prophet', 'Naive-3mo', 'Naive-12mo')
+"""
+
+# Only development runs write to forecast_accuracy, so its run_dates identify them.
+DEVELOPMENT_RUN_DATES = """
+SELECT DISTINCT run_date
+FROM dbo.forecast_accuracy
+"""
+
 # ── Optional write-back targets ───────────────────────────────────────────────
 
 # Grain change (2026-07): forecasts are now item-level, so bdm_name is dropped
