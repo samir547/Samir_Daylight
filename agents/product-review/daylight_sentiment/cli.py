@@ -23,9 +23,11 @@ from daylight_sentiment.config import (
     Config,
     LLMProvider,
     parse_min_reviews,
+    parse_min_reviews_scoped,
+    parse_scopes,
     parse_window_months,
 )
-from daylight_sentiment.domain.action_items import format_action_items
+from daylight_sentiment.domain.action_items import DEFAULT_SCOPE_KEYS, format_action_items
 from daylight_sentiment.logging_setup import configure_logging as _configure_logging
 from daylight_sentiment.infra.analyzers import (
     FatalProviderError,
@@ -69,6 +71,20 @@ def _window_months(value: str) -> tuple:
 def _min_reviews(value: str) -> int:
     try:
         return parse_min_reviews(value, name="--action-items-min-reviews")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _min_reviews_scoped(value: str) -> int:
+    try:
+        return parse_min_reviews_scoped(value, name="--action-items-min-reviews-scoped")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _scopes(value: str) -> tuple:
+    try:
+        return parse_scopes(value, name="--action-items-scopes")
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
@@ -139,18 +155,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--action-items-months", type=_window_months, metavar="N[,N...]",
                    help="The review windows to generate to-do items for, in months, "
                         "comma-separated: one set of items for each 'last N months', "
-                        "counted back from the newest review date in the database "
+                        "counted back from the newest review date of each review scope "
                         "(default 3,6,12, or ACTION_ITEMS_WINDOWS_MONTHS)")
+    p.add_argument("--action-items-scopes", type=_scopes, metavar="KEY[,KEY...]",
+                   help="The review scopes to generate to-do items for, comma-separated: "
+                        "one set of items per scope and review window. Keys: "
+                        f"{', '.join(DEFAULT_SCOPE_KEYS)} (default: all of them, or "
+                        "ACTION_ITEMS_SCOPES)")
     p.add_argument("--action-items-min-reviews", type=_min_reviews, metavar="N",
-                   help="Skip a review window with fewer than N analysed reviews; "
-                        "at least 10 (default 50, or ACTION_ITEMS_MIN_REVIEWS)")
+                   help="For the 'all' scope, skip a review window with fewer than N "
+                        "analysed reviews; at least 10 (default 50, or "
+                        "ACTION_ITEMS_MIN_REVIEWS)")
+    p.add_argument("--action-items-min-reviews-scoped", type=_min_reviews_scoped,
+                   metavar="N",
+                   help="For every scope other than 'all', skip a review window with "
+                        "fewer than N analysed reviews; at least 10 (default 30, or "
+                        "ACTION_ITEMS_MIN_REVIEWS_SCOPED)")
     p.add_argument("--action-items-only", action="store_true",
                    help="Skip SharePoint sync, loading and analysis entirely -- just generate "
-                        "the to-do items for every review window from the reviews already in "
-                        "the database, then exit (1 if any window failed)")
+                        "the to-do items for every review scope and window from the reviews "
+                        "already in the database, then exit (1 if any of them failed)")
     p.add_argument("--action-items-dry-run", action="store_true",
-                   help="Generate and print every window's to-do items but don't save them "
-                        "to the database. Combine with --action-items-only to preview them.")
+                   help="Generate and print every scope and window's to-do items but don't "
+                        "save them to the database. Combine with --action-items-only to "
+                        "preview them.")
     return p.parse_args(argv)
 
 
@@ -166,8 +194,12 @@ def build_config(args: argparse.Namespace) -> Config:
         getattr(config, config.llm_provider.value).model = args.model
     if args.action_items_months is not None:
         config.action_items.windows_months = args.action_items_months
+    if args.action_items_scopes is not None:
+        config.action_items.scopes = args.action_items_scopes
     if args.action_items_min_reviews is not None:
         config.action_items.min_reviews = args.action_items_min_reviews
+    if args.action_items_min_reviews_scoped is not None:
+        config.action_items.min_reviews_scoped = args.action_items_min_reviews_scoped
     config.output_dir.mkdir(parents=True, exist_ok=True)
     return config
 
@@ -463,41 +495,51 @@ def count_newly_analysed(results: List[Dict[str, Any]],
 
 def run_action_items(config: Config, analyzer: SentimentAnalyzer,
                      run_timestamp: Optional[str] = None, dry_run: bool = False) -> int:
-    """Generate the top 3 business to-do items for each review window from
-    the reviews in the database and save them (see
-    application/action_items.py). Logs one ERROR line per window that
-    failed and returns how many failed; a skipped window (too few reviews)
-    is not a failure. Raises if the reviews can't be read at all, and on a
-    FatalProviderError."""
-    logger.info("Generating the top 3 action items for the review windows %s from the "
-                "stored review results...",
-                ", ".join(str(m) for m in config.action_items.windows_months))
+    """Generate the top 3 business to-do items for each review scope and
+    review window from the reviews in the database and save them (see
+    application/action_items.py). Logs one ERROR line per scope and window
+    that failed and returns how many failed; a skipped one (too few
+    reviews, saved as a placeholder row) is not a failure. Raises if the
+    reviews can't be read at all, and on a FatalProviderError."""
+    settings = config.action_items
+    logger.info("Generating the top 3 action items for the review windows %s and the "
+                "review scopes %s from the stored review results...",
+                ", ".join(str(m) for m in settings.windows_months),
+                ", ".join(settings.scopes))
     outcome = generate_action_items(
-        analyzer, ActionItemRepository(config.db), config.action_items,
+        analyzer, ActionItemRepository(config.db), settings,
         config.llm_provider.value, config.model_name,
         run_timestamp=run_timestamp, dry_run=dry_run)
     for result in outcome.windows:
+        name = result.window.name
         if result.failed:
-            report_action_items_failure(result.error, result.window.label)
+            report_action_items_failure(result.error, name)
+        elif result.placeholder and dry_run:
+            print(f"\n{name}: no to-do items -- {result.placeholder['title']}. Outside a "
+                  "dry run, one placeholder row saying so is saved.")
+        elif result.placeholder:
+            logger.info("Placeholder saved for %s: %s", name, result.placeholder["title"])
         elif result.items and dry_run:
             print("\n" + format_action_items(result.items, result.window))
         elif result.items:
-            logger.info("Action items saved for %s: %s", result.window.label,
+            logger.info("Action items saved for %s: %s", name,
                         "; ".join(f"{i['rank']}. {i['title']}" for i in result.items))
     return len(outcome.failed)
 
 
-def report_action_items_failure(exc: Exception, window_label: Optional[str] = None) -> None:
+def report_action_items_failure(exc: Exception, window_name: Optional[str] = None) -> None:
+    """One ERROR line; ``window_name`` is the window and its scope, e.g.
+    "Last 6 months (Amazon product reviews only)"."""
     message = str(exc)
-    which = f" for {window_label}" if window_label else ""
+    which = f" for {window_name}" if window_name else ""
     logger.error("Action items were not generated%s: %s%s", which, type(exc).__name__,
                  f": {message}" if message else "")
 
 
 def action_items_only(config: Config, dry_run: bool) -> int:
-    """--action-items-only: generate every review window from what's already
-    in the database. Exit 1 if any window failed (a skipped window is not a
-    failure)."""
+    """--action-items-only: generate every review scope and window from
+    what's already in the database. Exit 1 if any of them failed (a skipped
+    window is not a failure)."""
     if not config.db.configured:
         logger.error("--action-items-only needs the database: set DB_SERVER/DB_NAME/"
                      "DB_USER/DB_PASSWORD in .env")

@@ -6,7 +6,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
-from daylight_sentiment.domain.action_items import MIN_WINDOW_REVIEWS
+from daylight_sentiment.domain.action_items import (
+    ALL_SCOPE,
+    DEFAULT_SCOPE_KEYS,
+    MIN_SCOPED_WINDOW_REVIEWS,
+    MIN_WINDOW_REVIEWS,
+    SCOPES_BY_KEY,
+)
 
 # Repo root -- daylight_sentiment/ sits directly under it.
 BASE = Path(__file__).resolve().parent.parent
@@ -223,7 +229,8 @@ def parse_window_months(raw: str, name: str = "ACTION_ITEMS_WINDOWS_MONTHS") -> 
 MIN_REVIEWS_FLOOR = 10
 
 
-def parse_min_reviews(raw: str, name: str = "ACTION_ITEMS_MIN_REVIEWS") -> int:
+def parse_min_reviews(raw: str, name: str = "ACTION_ITEMS_MIN_REVIEWS",
+                      example: int = MIN_WINDOW_REVIEWS) -> int:
     """The minimum number of analysed reviews a window needs, as a whole
     number. Raises ValueError, naming ``name``, for anything that is not a
     whole number of at least MIN_REVIEWS_FLOOR."""
@@ -234,25 +241,61 @@ def parse_min_reviews(raw: str, name: str = "ACTION_ITEMS_MIN_REVIEWS") -> int:
     if value < MIN_REVIEWS_FLOOR:
         raise ValueError(
             f"{name} must be a whole number of reviews, {MIN_REVIEWS_FLOOR} or more "
-            f"(e.g. 50); got {raw!r}")
+            f"(e.g. {example}); got {raw!r}")
     return value
+
+
+def parse_min_reviews_scoped(raw: str,
+                             name: str = "ACTION_ITEMS_MIN_REVIEWS_SCOPED") -> int:
+    """parse_min_reviews() for the minimum of every scope other than "all":
+    the same rule and the same floor."""
+    return parse_min_reviews(raw, name=name, example=MIN_SCOPED_WINDOW_REVIEWS)
+
+
+def parse_scopes(raw: str, name: str = "ACTION_ITEMS_SCOPES") -> Tuple[str, ...]:
+    """Comma-separated review scope keys ("all,amazon", or a single key),
+    in any letter case, returned in the order the scopes are defined with
+    repeats removed. Raises ValueError, naming ``name`` and the keys that
+    exist, for an empty list or any key that is not a scope."""
+    keys = {p.strip().lower() for p in str(raw).split(",")}
+    unknown = sorted(k for k in keys if k not in SCOPES_BY_KEY)
+    if unknown:
+        raise ValueError(
+            f"{name} must be one or more of {', '.join(DEFAULT_SCOPE_KEYS)}, separated by "
+            f"commas (e.g. all,amazon); unknown: {', '.join(repr(k) for k in unknown)} "
+            f"in {raw!r}")
+    return tuple(k for k in DEFAULT_SCOPE_KEYS if k in keys)
 
 
 @dataclass
 class ActionItemSettings:
     """The business to-do items generated after a run (see
-    application/action_items.py): one set per review window. Each window is
-    the last N months ending on the newest review date in the data (or
+    application/action_items.py): one set per review scope and review
+    window.
+
+    scopes are the keys of the review scopes to generate (see REVIEW_SCOPES
+    in domain/action_items.py; default all six), overridable with
+    ACTION_ITEMS_SCOPES and, per run, --action-items-scopes. Each window is
+    the last N months ending on the newest review date of its scope (or
     today, if that is earlier); windows_months is overridable with
     ACTION_ITEMS_WINDOWS_MONTHS and, per run, --action-items-months. A
-    window with fewer than min_reviews analysed reviews is skipped;
-    overridable with ACTION_ITEMS_MIN_REVIEWS and, per run,
-    --action-items-min-reviews."""
+    window with too few analysed reviews is skipped: fewer than min_reviews
+    for the "all" scope (ACTION_ITEMS_MIN_REVIEWS,
+    --action-items-min-reviews), fewer than min_reviews_scoped for every
+    other scope (ACTION_ITEMS_MIN_REVIEWS_SCOPED,
+    --action-items-min-reviews-scoped)."""
     windows_months: Tuple[int, ...] = (3, 6, 12)
+    scopes: Tuple[str, ...] = DEFAULT_SCOPE_KEYS
     min_reviews: int = MIN_WINDOW_REVIEWS
+    min_reviews_scoped: int = MIN_SCOPED_WINDOW_REVIEWS
     top_themes: int = 15
     max_excerpts: int = 10
     excerpt_chars: int = 300
+
+    def min_reviews_for(self, scope_key: str) -> int:
+        """The minimum number of analysed reviews a window of that scope
+        needs."""
+        return self.min_reviews if scope_key == ALL_SCOPE.key else self.min_reviews_scoped
 
     @classmethod
     def from_env(cls) -> "ActionItemSettings":
@@ -260,9 +303,15 @@ class ActionItemSettings:
         raw = os.getenv("ACTION_ITEMS_WINDOWS_MONTHS")
         if raw:
             settings.windows_months = parse_window_months(raw)
+        raw = os.getenv("ACTION_ITEMS_SCOPES")
+        if raw:
+            settings.scopes = parse_scopes(raw)
         raw = os.getenv("ACTION_ITEMS_MIN_REVIEWS")
         if raw:
             settings.min_reviews = parse_min_reviews(raw)
+        raw = os.getenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED")
+        if raw:
+            settings.min_reviews_scoped = parse_min_reviews_scoped(raw)
         return settings
 
 

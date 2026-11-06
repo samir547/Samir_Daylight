@@ -1,6 +1,7 @@
-"""Business to-do items: window selection, the summary the model is shown,
-the prompt, validation of the reply, and the orchestration with a fake
-analyzer and a fake repository (no API or database access)."""
+"""Business to-do items: review scopes, window selection, the summary the
+model is shown, the prompt, validation of the reply, placeholder rows, and
+the orchestration with a fake analyzer and a fake repository (no API or
+database access)."""
 import json
 import re
 from datetime import date, datetime, timedelta
@@ -14,12 +15,17 @@ from daylight_sentiment.application.action_items import (
 from daylight_sentiment.config import ActionItemSettings
 from daylight_sentiment.domain import taxonomy
 from daylight_sentiment.domain.action_items import (
+    ALL_SCOPE,
     ASPECT_NAMES,
     BANNED_WORDS,
+    DEFAULT_SCOPE_KEYS,
     ActionItemsValidationError,
     FIELD_MAX_CHARS,
+    MIN_SCOPED_WINDOW_REVIEWS,
     MIN_TREND_COUNT,
     MIN_WINDOW_REVIEWS,
+    REVIEW_SCOPES,
+    SCOPES_BY_KEY,
     SMALL_SAMPLE_REVIEWS,
     STRONG_ACTION_VERBS,
     TREND_THEMES,
@@ -34,8 +40,10 @@ from daylight_sentiment.domain.action_items import (
     months_before,
     theme_key,
     parse_themes,
+    placeholder_item,
     products_most_negative,
     recent_part_start,
+    scope_rows,
     select_excerpts,
     select_windows,
     shorten,
@@ -47,6 +55,8 @@ from daylight_sentiment.domain.action_items import (
     unsupported_numbers,
     validate_action_items,
     window_label,
+    window_start,
+    with_period,
 )
 from daylight_sentiment.domain.action_items_prompt import (
     build_action_items_prompt,
@@ -1074,8 +1084,8 @@ class TestNewPromptRules:
 def test_format_action_items():
     rows = [review(i, date(2026, 6, 1)) for i in range(3)]
     text = format_action_items(validate_action_items(good_reply(), AREAS), window_of(rows))
-    assert text.startswith("Last 12 months: top 3 to-do items -- Based on 3 reviews from "
-                           "2026-06-01 to 2026-06-01")
+    assert text.startswith("Last 12 months (All reviews): top 3 to-do items -- Based on 3 "
+                           "reviews from 2026-06-01 to 2026-06-01")
     assert "1. Monitor delivery packaging  [Shipping quality]" in text
     assert "   Evidence strength: early signal" in text
 
@@ -1106,21 +1116,36 @@ class FakeAnalyzer(SentimentAnalyzer):
 
 
 class FakeRepository:
+    """Same save() signature as ActionItemRepository. ``saved`` holds every
+    generation; ``real`` the ones with items, ``placeholders`` the rest."""
     def __init__(self, rows):
         self.rows = rows
         self.saved = []
+        self.fetches = 0
 
     def fetch_analysed_rows(self):
+        self.fetches += 1
         return self.rows
 
     def save(self, items, window_label, window_months, window_start, window_end,
-             reviews_analysed, llm_provider, llm_model, run_timestamp=None):
+             reviews_analysed, llm_provider, llm_model, run_timestamp=None,
+             source_scope="All", review_type_scope="All", is_placeholder=False):
         self.saved.append(dict(items=items, window_label=window_label,
                                window_months=window_months, window_start=window_start,
                                window_end=window_end, reviews_analysed=reviews_analysed,
                                llm_provider=llm_provider, llm_model=llm_model,
-                               run_timestamp=run_timestamp))
+                               run_timestamp=run_timestamp, source_scope=source_scope,
+                               review_type_scope=review_type_scope,
+                               is_placeholder=is_placeholder))
         return f"generation-{len(self.saved)}"
+
+    @property
+    def real(self):
+        return [s for s in self.saved if not s["is_placeholder"]]
+
+    @property
+    def placeholders(self):
+        return [s for s in self.saved if s["is_placeholder"]]
 
 
 def dataset(n=120):
@@ -1141,13 +1166,20 @@ def dataset_reply():
     return reply
 
 
+ALL_ONLY = ("all",)
+
+
 class TestGenerate:
+    """One scope ("all"), so each test is about the windows; the scopes
+    themselves are in TestGenerateScopes."""
+
     def run(self, reply=None, error=None, rows=None, dry_run=False, replies=None,
             settings=None):
         analyzer = FakeAnalyzer(reply if reply is not None else dataset_reply(), error,
                                 replies=replies)
         repo = FakeRepository(rows if rows is not None else dataset())
-        outcome = generate_action_items(analyzer, repo, settings or ActionItemSettings(),
+        outcome = generate_action_items(analyzer, repo,
+                                        settings or ActionItemSettings(scopes=ALL_ONLY),
                                         "claude", "model-x",
                                         run_timestamp="2026-10-24T10:00:00",
                                         dry_run=dry_run, today=TODAY)
@@ -1167,6 +1199,8 @@ class TestGenerate:
             assert saved["reviews_analysed"] == 121
             assert (saved["llm_provider"], saved["llm_model"]) == ("claude", "model-x")
             assert saved["run_timestamp"] == "2026-10-24T10:00:00"
+            assert (saved["source_scope"], saved["review_type_scope"],
+                    saved["is_placeholder"]) == ("All", "All", False)
         ids = [w.generation_id for w in outcome.windows]
         assert len(set(ids)) == 3 and None not in ids
         assert outcome.failed == [] and len(outcome.generated) == 3
@@ -1217,13 +1251,15 @@ class TestGenerate:
 
         repo = FlakyRepository(dataset())
         outcome = generate_action_items(FakeAnalyzer(dataset_reply()), repo,
-                                        ActionItemSettings(), "claude", "m", today=TODAY)
+                                        ActionItemSettings(scopes=ALL_ONLY), "claude", "m",
+                                        today=TODAY)
         assert [w.window.label for w in outcome.failed] == ["Last 3 months"]
         assert [s["window_label"] for s in repo.saved] == ["Last 6 months", "Last 12 months"]
 
     def generate(self, analyzer, repo, dry_run=False, months=(12,)):
-        return generate_action_items(analyzer, repo, ActionItemSettings(windows_months=months),
-                                     "claude", "m", dry_run=dry_run, today=TODAY)
+        return generate_action_items(
+            analyzer, repo, ActionItemSettings(windows_months=months, scopes=ALL_ONLY),
+            "claude", "m", dry_run=dry_run, today=TODAY)
 
     def test_invalid_then_valid_reply_is_saved_once(self, caplog):
         bad = dataset_reply()
@@ -1293,29 +1329,44 @@ class TestGenerate:
         assert [w.skipped for w in outcome.windows] == [True, False, False]
         assert outcome.windows[0].items == [] and outcome.failed == []
         assert len(analyzer.calls) == 2
-        assert [s["window_label"] for s in repo.saved] == ["Last 6 months", "Last 12 months"]
-        assert ("Action items for Last 3 months: skipped -- only 41 analysed reviews"
-                in caplog.text)
+        assert [s["window_label"] for s in repo.real] == ["Last 6 months", "Last 12 months"]
+        # The skipped window is saved as one placeholder row, not left out.
+        [placeholder] = repo.placeholders
+        assert placeholder["window_label"] == "Last 3 months"
+        assert [i["title"] for i in placeholder["items"]] == [
+            "Not enough reviews yet (41 of 50 needed)"]
+        assert ("Action items for Last 3 months (All reviews): skipped -- only 41 analysed "
+                "reviews") in caplog.text
         assert "(minimum 50)" in caplog.text
 
     def test_minimum_comes_from_the_settings_and_is_logged(self, caplog):
         rows = ([review(i, date(2026, 8, 20)) for i in range(60)]
                 + [review(9000, date(2026, 8, 20), "negative", review_type="service")])
-        settings = ActionItemSettings(windows_months=(3,), min_reviews=100)
+        settings = ActionItemSettings(windows_months=(3,), min_reviews=100, scopes=ALL_ONLY)
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             outcome, analyzer, repo = self.run(rows=rows, settings=settings)
         assert [w.skipped for w in outcome.windows] == [True]
-        assert analyzer.calls == [] and repo.saved == []
-        assert ("Action items for Last 3 months: skipped -- only 61 analysed reviews "
-                "from 2026-05-21 to 2026-08-20 (minimum 100)") in caplog.text
+        assert analyzer.calls == [] and repo.real == []
+        assert [s["items"][0]["title"] for s in repo.placeholders] == [
+            "Not enough reviews yet (61 of 100 needed)"]
+        assert ("Action items for Last 3 months (All reviews): skipped -- only 61 analysed "
+                "reviews from 2026-05-21 to 2026-08-20 (minimum 100)") in caplog.text
 
-    def test_all_windows_skipped_saves_nothing_and_is_not_a_failure(self, caplog):
+    def test_all_windows_skipped_saves_only_placeholders_and_is_not_a_failure(self, caplog):
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             outcome, analyzer, repo = self.run(rows=dataset(10))
         assert all(w.skipped for w in outcome.windows)
         assert outcome.failed == [] and outcome.generated == []
-        assert analyzer.calls == [] and repo.saved == []
+        assert analyzer.calls == [] and repo.real == []
+        assert [s["window_label"] for s in repo.placeholders] == [
+            "Last 3 months", "Last 6 months", "Last 12 months"]
         assert caplog.text.count("skipped") == 3
+
+    def test_all_windows_skipped_in_a_dry_run_saves_nothing(self):
+        outcome, analyzer, repo = self.run(rows=dataset(10), dry_run=True)
+        assert all(w.skipped and w.placeholder for w in outcome.windows)
+        assert all(w.generation_id is None for w in outcome.windows)
+        assert analyzer.calls == [] and repo.saved == []
 
     def test_window_cap_is_logged_once(self, caplog):
         future = TODAY + timedelta(days=30)
@@ -1534,9 +1585,10 @@ class TestReliabilityPromptRules:
                 'For a row marked "small_sample": true or "few_mentions": true, never say '
                 "that it is rising, worsening, improving, increased or decreased; say that "
                 "there are too few reviews to tell.",
-                "16. This period alone. Write the items for this period only. Other periods "
-                "get their own items, so do not repeat an issue only because it appears in "
-                "another period.",
+                "16. This period and this scope alone. Write the items for this period and "
+                "this scope only. Other periods and other scopes get their own items, so do "
+                "not repeat an issue only because it appears in another period or another "
+                "scope.",
                 "17. Never copy field names, flags or true/false values from the data into "
                 'an item. Say "small sample" or "too few reviews to tell" in plain words.'):
             assert rule in flat, rule
@@ -1581,3 +1633,695 @@ class TestRetryOnTheNewChecks:
         [failed] = outcome.failed
         assert "title starts with 'Stop'" in str(failed.error)
         assert len(analyzer.calls) == 2 and repo.saved == []
+
+
+# -- review scopes --------------------------------------------------------------
+
+def scoped_rows(amazon=60, tp_product=60, tp_service=40, amazon_day=date(2026, 8, 20),
+                tp_product_day=date(2026, 8, 20), tp_service_day=date(2026, 8, 20)):
+    """Amazon product, Trustpilot product and Trustpilot service reviews,
+    every fourth one negative."""
+    def sentiment(i):
+        return "negative" if i % 4 == 0 else "positive"
+    rows = [review(i, amazon_day, sentiment(i), review_source="amazon",
+                   uid=f"amazon:product:{i:04d}") for i in range(amazon)]
+    rows += [review(1000 + i, tp_product_day, sentiment(i)) for i in range(tp_product)]
+    rows += [review(2000 + i, tp_service_day, sentiment(i), review_type="service")
+             for i in range(tp_service)]
+    return rows
+
+
+def plain_reply():
+    """A reply that is valid for every scope: "overall" items, no figures."""
+    return {"items": [
+        {"rank": r, "title": f"Review complaint handling {r}", "description": "Do it.",
+         "rationale": "Most reviews are positive.", "related_area": "overall",
+         "evidence": "Negative reviews mention brightness.",
+         "evidence_strength": "moderate"}
+        for r in (1, 2, 3)]}
+
+
+def scope_window(rows, key, months=3, today=TODAY, min_reviews=30):
+    scope = SCOPES_BY_KEY[key]
+    [window] = select_windows(scope_rows(rows, scope), [months], today=today,
+                              min_reviews=min_reviews, scope=scope)
+    return window
+
+
+class TestReviewScopes:
+    def test_the_six_scopes(self):
+        assert [(s.key, s.review_source, s.review_type, s.source_scope, s.review_type_scope,
+                 s.label) for s in REVIEW_SCOPES] == [
+            ("all", None, None, "All", "All", "All reviews"),
+            ("product", None, "product", "All", "Product", "Product reviews only"),
+            ("amazon", "amazon", "product", "Amazon", "Product",
+             "Amazon product reviews only"),
+            ("trustpilot", "trustpilot", None, "Trustpilot", "All",
+             "Trustpilot reviews only"),
+            ("trustpilot_product", "trustpilot", "product", "Trustpilot", "Product",
+             "Trustpilot product reviews only"),
+            ("trustpilot_service", "trustpilot", "service", "Trustpilot", "Service",
+             "Trustpilot service reviews only"),
+        ]
+
+    def test_default_is_all_six_in_that_order(self):
+        assert DEFAULT_SCOPE_KEYS == ("all", "product", "amazon", "trustpilot",
+                                      "trustpilot_product", "trustpilot_service")
+        assert list(SCOPES_BY_KEY) == list(DEFAULT_SCOPE_KEYS)
+        assert ALL_SCOPE is SCOPES_BY_KEY["all"]
+        assert ActionItemSettings().scopes == DEFAULT_SCOPE_KEYS
+
+    def test_stored_values_fit_their_columns_and_are_all_different(self):
+        # source_scope / review_type_scope are NVARCHAR(20).
+        for s in REVIEW_SCOPES:
+            assert len(s.source_scope) <= 20 and len(s.review_type_scope) <= 20
+        pairs = [(s.source_scope, s.review_type_scope) for s in REVIEW_SCOPES]
+        assert len(set(pairs)) == 6
+
+    @pytest.mark.parametrize("key, expected", [
+        ("all", 152),                  # every row
+        ("product", 111),              # 60 Amazon + 50 Trustpilot + 1 other website
+        ("amazon", 60),                # Amazon AND product: not the Amazon service row
+        ("trustpilot", 90),            # 50 product + 40 service
+        ("trustpilot_product", 50),
+        ("trustpilot_service", 40),
+    ])
+    def test_rows_of_each_scope(self, key, expected):
+        rows = scoped_rows(60, 50, 40) + [
+            review(8000, date(2026, 8, 20), review_type="service", review_source="amazon"),
+            review(8001, date(2026, 8, 20), review_source="other")]
+        scope = SCOPES_BY_KEY[key]
+        picked = scope_rows(rows, scope)
+        assert len(picked) == expected
+        if scope.review_source:
+            assert {r["review_source"] for r in picked} == {scope.review_source}
+        if scope.review_type:
+            assert {r["review_type"] for r in picked} == {scope.review_type}
+
+    def test_filtering_keeps_the_rows_themselves_and_their_order(self):
+        rows = scoped_rows(3, 3, 3)
+        picked = scope_rows(rows, SCOPES_BY_KEY["trustpilot"])
+        assert picked == rows[3:] and all(a is b for a, b in zip(picked, rows[3:]))
+        assert scope_rows(rows, ALL_SCOPE) == rows
+
+    def test_single_source(self):
+        assert [s.key for s in REVIEW_SCOPES if s.single_source] == [
+            "amazon", "trustpilot", "trustpilot_product", "trustpilot_service"]
+
+
+class TestScopeWindows:
+    def test_a_stale_scope_ends_on_its_own_newest_date(self):
+        # Amazon reviews run to 20 August; the last Trustpilot service review
+        # is from 10 March. The service windows end in March, not August.
+        rows = scoped_rows(tp_service_day=date(2026, 3, 10))
+        service = scope_window(rows, "trustpilot_service")
+        assert service.end == date(2026, 3, 10)
+        assert service.start == date(2025, 12, 11)
+        assert service.review_count == 40 and not service.skipped
+        for key in ("all", "product", "amazon", "trustpilot", "trustpilot_product"):
+            assert scope_window(rows, key).end == date(2026, 8, 20), key
+        # With one end date for everything, its 3-month window would be empty.
+        assert all(r["review_date_parsed"] < window_start(date(2026, 8, 20), 3)
+                   for r in service.rows)
+
+    def test_every_window_of_a_scope_shares_that_scopes_end_date(self):
+        rows = scoped_rows(amazon_day=date(2026, 6, 30))
+        scope = SCOPES_BY_KEY["amazon"]
+        windows = select_windows(scope_rows(rows, scope), (3, 6, 12), today=TODAY,
+                                 min_reviews=30, scope=scope)
+        assert {w.end for w in windows} == {date(2026, 6, 30)}
+        assert [w.start for w in windows] == [
+            date(2026, 3, 31), date(2025, 12, 31), date(2025, 7, 1)]
+
+    def test_a_scopes_end_date_is_still_capped_at_today(self):
+        rows = scoped_rows() + [review(8000, date(2027, 5, 1), review_type="service")]
+        service = scope_window(rows, "trustpilot_service")
+        assert service.end == TODAY and service.capped_from == date(2027, 5, 1)
+        # The Amazon scope has no future-dated review: no cap there.
+        amazon = scope_window(rows, "amazon")
+        assert amazon.end == date(2026, 8, 20) and amazon.capped_from is None
+
+    def test_windows_carry_their_scope_and_minimum(self):
+        window = scope_window(scoped_rows(), "amazon", min_reviews=30)
+        assert window.scope is SCOPES_BY_KEY["amazon"] and window.min_reviews == 30
+        assert window.name == "Last 3 months (Amazon product reviews only)"
+        [plain] = select_windows(scoped_rows(), [3], today=TODAY)
+        assert plain.scope is ALL_SCOPE and plain.min_reviews == MIN_WINDOW_REVIEWS
+        assert plain.name == "Last 3 months (All reviews)"
+
+    def test_a_scope_with_no_dated_reviews_has_skipped_windows_without_dates(self):
+        scope = SCOPES_BY_KEY["amazon"]
+        windows = select_windows(scope_rows(scoped_rows(amazon=0), scope), (3, 12),
+                                 today=TODAY, min_reviews=30, scope=scope)
+        assert [(w.skipped, w.start, w.end, w.review_count) for w in windows] == [
+            (True, None, None, 0)] * 2
+        assert {w.scope.key for w in windows} == {"amazon"}
+
+    def test_minimum_constants(self):
+        assert MIN_WINDOW_REVIEWS == 50 and MIN_SCOPED_WINDOW_REVIEWS == 30
+        settings = ActionItemSettings()
+        assert settings.min_reviews == 50 and settings.min_reviews_scoped == 30
+        assert [settings.min_reviews_for(k) for k in DEFAULT_SCOPE_KEYS] == [
+            50, 30, 30, 30, 30, 30]
+
+
+class TestPlaceholder:
+    def test_content(self):
+        window = scope_window(scoped_rows(tp_service=18), "trustpilot_service")
+        assert window.skipped
+        assert placeholder_item(window) == {
+            "rank": 1,
+            "title": "Not enough reviews yet (18 of 30 needed)",
+            "description": "No to-do items were generated for this selection (Trustpilot "
+                           "service reviews only, last 3 months), because it has too few "
+                           "reviews to base them on.",
+            "rationale": "Only 18 analysed reviews dated 2026-05-21 to 2026-08-20 fall in "
+                         "this selection, and at least 30 are needed. To-do items will "
+                         "appear here once enough reviews have arrived.",
+            "related_area": "overall",
+            "evidence": "18 analysed reviews from 2026-05-21 to 2026-08-20; the minimum "
+                        "is 30.",
+            "evidence_strength": None,
+            "is_placeholder": True,
+        }
+
+    def test_names_the_minimum_that_applied(self):
+        [window] = select_windows(scoped_rows(40, 0, 0), [6], today=TODAY)  # "all": 50
+        item = placeholder_item(window)
+        assert item["title"] == "Not enough reviews yet (40 of 50 needed)"
+        assert "(All reviews, last 6 months)" in item["description"]
+        assert "at least 50 are needed" in item["rationale"]
+
+    def test_one_review_reads_in_the_singular(self):
+        item = placeholder_item(scope_window(scoped_rows(tp_service=1), "trustpilot_service"))
+        assert item["title"] == "Not enough reviews yet (1 of 30 needed)"
+        assert item["rationale"].startswith("Only 1 analysed review dated 2026-05-21 to "
+                                            "2026-08-20 falls in this selection")
+        assert item["evidence"].startswith("1 analysed review from ")
+
+    def test_no_dated_reviews_uses_the_fallback_period_and_says_so(self):
+        window = scope_window(scoped_rows(amazon=0), "amazon")
+        assert window.start is None and window.end is None
+        dated = with_period(window, date(2026, 8, 20))
+        assert (dated.start, dated.end) == (date(2026, 5, 21), date(2026, 8, 20))
+        assert dated.skipped and dated.scope is window.scope and dated.review_count == 0
+        item = placeholder_item(dated)
+        assert item["title"] == "Not enough reviews yet (0 of 30 needed)"
+        assert item["rationale"].startswith(
+            "There are no analysed reviews with a review date in this selection for "
+            "2026-05-21 to 2026-08-20, and at least 30 are needed.")
+        assert item["evidence"] == ("0 analysed reviews from 2026-05-21 to 2026-08-20; "
+                                    "the minimum is 30.")
+
+    def test_a_window_with_its_own_dates_keeps_them(self):
+        window = scope_window(scoped_rows(tp_service=18, tp_service_day=date(2026, 3, 10)),
+                              "trustpilot_service")
+        assert with_period(window, date(2026, 8, 20)) is window
+        assert (window.start, window.end) == (date(2025, 12, 11), date(2026, 3, 10))
+
+    @pytest.mark.parametrize("key", DEFAULT_SCOPE_KEYS)
+    def test_fits_the_table_columns_for_every_scope(self, key):
+        scope = SCOPES_BY_KEY[key]
+        [window] = select_windows([], [255], today=TODAY, min_reviews=99999, scope=scope)
+        item = placeholder_item(with_period(window, TODAY))
+        for name, limit in FIELD_MAX_CHARS.items():
+            if name != "evidence_strength":
+                assert 0 < len(item[name]) <= limit, name
+        assert item["rank"] == 1 and item["evidence_strength"] is None
+        for name in ("title", "description", "rationale", "evidence"):
+            assert field_identifiers(item[name]) == [] and banned_wording(item[name]) == []
+
+
+class TestEmptySections:
+    """A scope with one review type has no sections for the other."""
+
+    def test_trustpilot_service_has_no_product_sections(self):
+        window = scope_window(scoped_rows(), "trustpilot_service")
+        summary = build_summary(window, 15, 10, 300)
+        assert summary["scope"] == "Trustpilot service reviews only"
+        for section in ("product_by_sector_group", "product_by_sector_group_and_source",
+                        "products_most_negative"):
+            assert summary[section] == [], section
+        assert "product_by_region" not in summary
+        assert "product_by_region_and_source" not in summary
+        assert summary["trend"]["product_by_sector_group"] == []
+        assert "product_by_region_and_source" not in summary["trend"]
+        assert summary["by_review_type_and_source"] == [
+            {"review_type": "service", "review_source": "trustpilot", "reviews": 40,
+             "negatives": 10, "negative_share_pct": 25.0, "small_sample": False}]
+        assert summary_areas(summary) == ["overall", "Shipping quality"]
+        assert small_sample_areas(summary) == []
+        json.dumps(summary)
+
+    def test_trustpilot_service_validation(self):
+        summary = build_summary(scope_window(scoped_rows(), "trustpilot_service"), 15, 10, 300)
+        reply = plain_reply()
+        reply["items"][0].update(related_area="shipping quality",
+                                 rationale="10 of 40 service reviews are negative (25%).")
+        items = validate_action_items(reply, summary)
+        assert items[0]["related_area"] == "Shipping quality"
+        # A product area is not offered in a service-only scope.
+        reply["items"][1]["related_area"] = "Sewing & Needlecraft"
+        with pytest.raises(ActionItemsValidationError,
+                           match="item 2 related_area 'Sewing & Needlecraft' is not in the "
+                                 "summary"):
+            validate_action_items(reply, summary)
+
+    def test_trustpilot_service_prompt(self):
+        scope = SCOPES_BY_KEY["trustpilot_service"]
+        summary = build_summary(scope_window(scoped_rows(), scope.key), 15, 10, 300)
+        prompt = build_action_items_prompt(summary, summary_areas(summary), scope)
+        assert '"product_by_sector_group": [],' in prompt
+        assert '"related_area" must be exactly one of these values: "overall", ' \
+               '"Shipping quality"\n' in prompt
+        assert "A section below that is an\n  empty list has no reviews in this scope" in prompt
+
+    def test_amazon_has_no_service_sections(self):
+        window = scope_window(scoped_rows(), "amazon")
+        summary = build_summary(window, 15, 10, 300)
+        assert summary["scope"] == "Amazon product reviews only"
+        assert summary["service_by_aspect"] == []
+        assert summary["service_by_aspect_and_source"] == []
+        assert summary["trend"]["service_by_aspect"] == []
+        assert {e["review_source"] for e in summary["product_by_sector_group_and_source"]} == {
+            "amazon"}
+        assert summary["by_review_type_and_source"] == [
+            {"review_type": "product", "review_source": "amazon", "reviews": 60,
+             "negatives": 15, "negative_share_pct": 25.0, "small_sample": False}]
+        assert summary_areas(summary) == ["overall", "Sewing & Needlecraft", "UK"]
+        json.dumps(summary)
+
+    def test_amazon_validation(self):
+        summary = build_summary(scope_window(scoped_rows(), "amazon"), 15, 10, 300)
+        reply = plain_reply()
+        reply["items"][0].update(related_area="Sewing & Needlecraft",
+                                 evidence="15 of 60 reviews are negative.")
+        assert validate_action_items(reply, summary)[0]["related_area"] == (
+            "Sewing & Needlecraft")
+        # A service aspect is not offered in a product-only scope.
+        reply["items"][1]["related_area"] = "Shipping quality"
+        with pytest.raises(ActionItemsValidationError,
+                           match="item 2 related_area 'Shipping quality' is not in the "
+                                 "summary"):
+            validate_action_items(reply, summary)
+
+    def test_amazon_prompt(self):
+        scope = SCOPES_BY_KEY["amazon"]
+        summary = build_summary(scope_window(scoped_rows(), scope.key), 15, 10, 300)
+        prompt = build_action_items_prompt(summary, summary_areas(summary), scope)
+        assert '"service_by_aspect": [],' in prompt
+        assert '"Shipping quality"' not in prompt
+
+    def test_numbers_of_another_scope_are_not_accepted(self):
+        # 160 is the count of the "all" scope; the Amazon summary has 60.
+        summary = build_summary(scope_window(scoped_rows(), "amazon"), 15, 10, 300)
+        known = summary_numbers(summary)
+        assert unsupported_numbers("60 reviews, 15 negative", known) == []
+        assert unsupported_numbers("160 reviews", known) == ["160"]
+
+
+class TestScopePrompt:
+    def prompt(self, key):
+        scope = SCOPES_BY_KEY[key]
+        summary = build_summary(scope_window(scoped_rows(), key), 15, 10, 300)
+        return build_action_items_prompt(summary, summary_areas(summary), scope)
+
+    @pytest.mark.parametrize("scope", REVIEW_SCOPES, ids=lambda s: s.key)
+    def test_summary_names_its_scope(self, scope):
+        summary = build_summary(scope_window(scoped_rows(), scope.key), 15, 10, 300)
+        assert summary["scope"] == scope.label
+        assert list(summary)[:2] == ["window", "scope"]
+        assert f'"scope": "{scope.label}",' in self.prompt(scope.key)
+
+    def test_scope_adds_no_numbers_for_the_validator(self):
+        summary = build_summary(scope_window(scoped_rows(), "amazon"), 15, 10, 300)
+        without = {k: v for k, v in summary.items() if k != "scope"}
+        assert summary_numbers(summary) == summary_numbers(without)
+
+    @pytest.mark.parametrize("key, websites", [
+        ("all", "Trustpilot and Amazon"), ("product", "Trustpilot and Amazon"),
+        ("amazon", "Amazon"), ("trustpilot", "Trustpilot"),
+        ("trustpilot_product", "Trustpilot"), ("trustpilot_service", "Trustpilot"),
+    ])
+    def test_intro_names_only_the_websites_in_the_scope(self, key, websites):
+        prompt = self.prompt(key)
+        assert (f"It is based on customer reviews from {websites}\nthat have already been "
+                "classified as positive, negative or neutral.") in prompt
+        if websites != "Trustpilot and Amazon":
+            assert "Trustpilot and Amazon" not in prompt
+
+    @pytest.mark.parametrize("key", ["product", "amazon", "trustpilot", "trustpilot_product",
+                                     "trustpilot_service"])
+    def test_says_the_briefing_covers_only_that_scope(self, key):
+        label = SCOPES_BY_KEY[key].label
+        assert (f"(last 3 months).\nThe briefing covers ONLY this scope: {label}.\n"
+                "Reviews outside the scope are not in the summary, so say nothing about "
+                "them.\n") in self.prompt(key)
+
+    def test_the_all_scope_says_it_covers_everything(self):
+        prompt = self.prompt("all")
+        assert ("(last 3 months).\nThe briefing covers every review of that period: product "
+                "and service reviews,\nfrom both review websites.\n") in prompt
+        assert "ONLY this scope" not in prompt
+
+    @pytest.mark.parametrize("key", ["all", "product"])
+    def test_rule_5_compares_the_websites_when_the_scope_has_both(self, key):
+        flat = " ".join(self.prompt(key).split())
+        assert "5. Compare like with like. Never compare regions, review websites" in flat
+        assert ("A difference between Amazon and Trustpilot is background only, never "
+                "evidence of a problem by itself.") in flat
+        assert "5. One review website." not in flat
+
+    @pytest.mark.parametrize("key, website", [
+        ("amazon", "Amazon"), ("trustpilot", "Trustpilot"),
+        ("trustpilot_product", "Trustpilot"), ("trustpilot_service", "Trustpilot")])
+    def test_rule_5_says_plainly_that_there_is_one_website(self, key, website):
+        flat = " ".join(self.prompt(key).split())
+        assert (f"5. One review website. All the reviews in this summary come from one "
+                f"website, {website}: there are no reviews from any other website here. "
+                "Never compare them with, or mention, reviews from another website. "
+                "Regions, sector groups, service aspects and products may be compared with "
+                "each other directly: their reviews all come from the same website, so the "
+                "warnings above about mixing review websites do not apply. 6. Small "
+                "samples.") in flat
+        assert "5. Compare like with like." not in flat
+        assert "Amazon and Trustpilot reviewers are different groups" not in flat
+        other = "Trustpilot" if website == "Amazon" else "Amazon"
+        assert other not in flat.split("Rules:", 1)[1]
+
+    @pytest.mark.parametrize("key", DEFAULT_SCOPE_KEYS)
+    def test_every_scope_has_rules_1_to_17_once_each_and_rule_16(self, key):
+        prompt = self.prompt(key)
+        rules = prompt.split("\nRules:\n", 1)[1].split("\nRespond ONLY with JSON", 1)[0]
+        assert re.findall(r"^(\d+)\. ", rules, re.M) == [str(n) for n in range(1, 18)]
+        assert ("16. This period and this scope alone. Write the items for this period and "
+                "this scope only. Other periods and other scopes get their own items, so do "
+                "not repeat an issue only because it appears in another period or another "
+                "scope.") in " ".join(prompt.split())
+        assert "{" not in prompt.split("SUMMARY:", 1)[0]  # no unfilled placeholder
+
+    def test_without_a_scope_the_prompt_is_for_all_reviews(self):
+        summary = build_summary(window_of(TestBuildSummary().rows()), 15, 10, 300)
+        assert build_action_items_prompt(summary, summary_areas(summary)) == (
+            build_action_items_prompt(summary, summary_areas(summary), ALL_SCOPE))
+        assert summary["scope"] == "All reviews"
+
+
+class TestGenerateScopes:
+    """generate_action_items() over all six scopes (the default)."""
+
+    def run(self, rows=None, reply=None, replies=None, dry_run=False, settings=None,
+            repo=None, analyzer=None):
+        analyzer = analyzer or FakeAnalyzer(reply if reply is not None else plain_reply(),
+                                            replies=replies)
+        repo = repo or FakeRepository(rows if rows is not None else scoped_rows())
+        outcome = generate_action_items(analyzer, repo, settings or ActionItemSettings(),
+                                        "claude", "model-x",
+                                        run_timestamp="2026-10-24T10:00:00",
+                                        dry_run=dry_run, today=TODAY)
+        return outcome, analyzer, repo
+
+    def test_six_scopes_times_three_windows_is_18_calls_from_one_fetch(self):
+        outcome, analyzer, repo = self.run()
+        assert repo.fetches == 1
+        assert len(analyzer.calls) == 18 and len(repo.saved) == 18
+        assert repo.placeholders == [] and outcome.failed == []
+        assert [(s["source_scope"], s["review_type_scope"], s["window_label"])
+                for s in repo.saved] == [
+            (source, review_type, label)
+            for source, review_type in [("All", "All"), ("All", "Product"),
+                                        ("Amazon", "Product"), ("Trustpilot", "All"),
+                                        ("Trustpilot", "Product"), ("Trustpilot", "Service")]
+            for label in ("Last 3 months", "Last 6 months", "Last 12 months")]
+        assert [w.window.scope.key for w in outcome.windows] == [
+            key for key in DEFAULT_SCOPE_KEYS for _ in range(3)]
+        assert len({w.generation_id for w in outcome.windows}) == 18
+
+    def test_each_scope_is_summarised_from_its_own_rows(self):
+        _, analyzer, repo = self.run(settings=ActionItemSettings(windows_months=(3,)))
+        counts = [160, 120, 60, 100, 60, 40]
+        assert [s["reviews_analysed"] for s in repo.saved] == counts
+        for (prompt, _), count, scope in zip(analyzer.calls, counts, REVIEW_SCOPES):
+            assert (f"covers {count}\nreviews dated 2026-05-21 to 2026-08-20 "
+                    "(last 3 months)") in prompt
+            assert f'"scope": "{scope.label}",' in prompt
+        # Amazon reviews never reach a Trustpilot scope's prompt, and so on.
+        assert '"review_source": "amazon"' not in analyzer.calls[3][0]
+        assert '"review_source": "trustpilot"' not in analyzer.calls[2][0]
+        assert '"review_type": "service"' not in analyzer.calls[1][0]
+
+    def test_each_scope_ends_on_its_own_newest_review_date(self):
+        rows = scoped_rows(amazon_day=date(2026, 8, 20), tp_product_day=date(2026, 6, 30),
+                           tp_service_day=date(2026, 3, 10))
+        _, _, repo = self.run(rows=rows, settings=ActionItemSettings(windows_months=(3,)))
+        assert [(s["source_scope"], s["review_type_scope"], s["window_start"],
+                 s["window_end"]) for s in repo.saved] == [
+            ("All", "All", date(2026, 5, 21), date(2026, 8, 20)),
+            ("All", "Product", date(2026, 5, 21), date(2026, 8, 20)),
+            ("Amazon", "Product", date(2026, 5, 21), date(2026, 8, 20)),
+            ("Trustpilot", "All", date(2026, 3, 31), date(2026, 6, 30)),
+            ("Trustpilot", "Product", date(2026, 3, 31), date(2026, 6, 30)),
+            ("Trustpilot", "Service", date(2025, 12, 11), date(2026, 3, 10)),
+        ]
+        # The stale service scope still gets real items, from its own period.
+        assert repo.saved[-1]["reviews_analysed"] == 40
+        assert not repo.saved[-1]["is_placeholder"]
+
+    @pytest.mark.parametrize("amazon, all_generated, amazon_generated", [
+        (29, False, False), (30, False, True), (49, False, True), (50, True, True)])
+    def test_minimum_is_50_for_all_and_30_for_every_other_scope(self, amazon, all_generated,
+                                                                amazon_generated):
+        settings = ActionItemSettings(windows_months=(3,),
+                                      scopes=("all", "product", "amazon"))
+        outcome, analyzer, repo = self.run(rows=scoped_rows(amazon, 0, 0), settings=settings)
+        generated = {s["source_scope"] + "/" + s["review_type_scope"] for s in repo.real}
+        assert ("All/All" in generated) is all_generated
+        assert ("Amazon/Product" in generated) is amazon_generated
+        assert ("All/Product" in generated) is amazon_generated
+        titles = {s["source_scope"] + "/" + s["review_type_scope"]: s["items"][0]["title"]
+                  for s in repo.placeholders}
+        if not all_generated:
+            assert titles["All/All"] == f"Not enough reviews yet ({amazon} of 50 needed)"
+        if not amazon_generated:
+            assert titles["Amazon/Product"] == (
+                f"Not enough reviews yet ({amazon} of 30 needed)")
+        assert len(analyzer.calls) == len(repo.real)
+        assert len(repo.saved) == 3 and outcome.failed == []
+
+    def test_both_minimums_come_from_the_settings(self, caplog):
+        settings = ActionItemSettings(windows_months=(3,), scopes=("all", "amazon"),
+                                      min_reviews=70, min_reviews_scoped=65)
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            _, analyzer, repo = self.run(rows=scoped_rows(60, 8, 0), settings=settings)
+        assert analyzer.calls == []
+        assert [s["items"][0]["title"] for s in repo.placeholders] == [
+            "Not enough reviews yet (68 of 70 needed)",
+            "Not enough reviews yet (60 of 65 needed)"]
+        assert ("Action items for Last 3 months (All reviews): skipped -- only 68 analysed "
+                "reviews from 2026-05-21 to 2026-08-20 (minimum 70)") in caplog.text
+        assert ("Action items for Last 3 months (Amazon product reviews only): skipped -- "
+                "only 60 analysed reviews from 2026-05-21 to 2026-08-20 (minimum 65)"
+                ) in caplog.text
+
+    def test_a_skipped_scope_and_window_is_saved_as_one_placeholder_row(self):
+        rows = scoped_rows(60, 60, 18, tp_service_day=date(2026, 3, 10))
+        outcome, analyzer, repo = self.run(
+            rows=rows, settings=ActionItemSettings(windows_months=(3,)))
+        [saved] = repo.placeholders
+        assert len(saved["items"]) == 1
+        [item] = saved["items"]
+        assert item["rank"] == 1 and item["evidence_strength"] is None
+        assert item["title"] == "Not enough reviews yet (18 of 30 needed)"
+        assert "No to-do items were generated" in item["description"]
+        assert "Trustpilot service reviews only, last 3 months" in item["description"]
+        assert "at least 30 are needed" in item["rationale"]
+        assert item["evidence"] == ("18 analysed reviews from 2025-12-11 to 2026-03-10; the "
+                                    "minimum is 30.")
+        # Saved under the scope's own window dates and its actual count...
+        assert (saved["source_scope"], saved["review_type_scope"]) == ("Trustpilot", "Service")
+        assert saved["is_placeholder"] is True and saved["reviews_analysed"] == 18
+        assert (saved["window_label"], saved["window_months"]) == ("Last 3 months", 3)
+        assert (saved["window_start"], saved["window_end"]) == (
+            date(2025, 12, 11), date(2026, 3, 10))
+        # ...by the run, but by no model.
+        assert saved["run_timestamp"] == "2026-10-24T10:00:00"
+        assert saved["llm_provider"] is None and saved["llm_model"] is None
+        # It is its own generation, and the model wasn't called for it.
+        result = outcome.windows[-1]
+        assert result.skipped and result.placeholder is item and result.items == []
+        assert result.generation_id == "generation-6" and not result.failed
+        assert len(analyzer.calls) == 5 and len(repo.real) == 5
+        assert outcome.generated == outcome.windows[:5]
+
+    def test_placeholder_dates_fall_back_to_the_newest_date_of_all_the_data(self):
+        # Only Amazon reviews: the three Trustpilot scopes have no dated
+        # reviews at all, so their placeholders use the all-data end date.
+        rows = scoped_rows(60, 0, 0, amazon_day=date(2026, 7, 15))
+        _, _, repo = self.run(rows=rows)
+        placeholders = [s for s in repo.placeholders if s["source_scope"] == "Trustpilot"]
+        assert len(placeholders) == 9
+        assert {s["window_end"] for s in placeholders} == {date(2026, 7, 15)}
+        assert {(s["window_months"], s["window_start"]) for s in placeholders} == {
+            (3, date(2026, 4, 16)), (6, date(2026, 1, 16)), (12, date(2025, 7, 16))}
+        assert {s["reviews_analysed"] for s in placeholders} == {0}
+        assert {s["items"][0]["title"] for s in placeholders} == {
+            "Not enough reviews yet (0 of 30 needed)"}
+        assert len(repo.real) == 9  # all, product and amazon
+
+    def test_fallback_date_is_capped_at_today_like_every_window(self):
+        rows = scoped_rows(60, 0, 0) + [review(8000, date(2027, 5, 1), review_source="amazon")]
+        _, _, repo = self.run(rows=rows, settings=ActionItemSettings(windows_months=(3,)))
+        assert {s["window_end"] for s in repo.placeholders} == {TODAY}
+
+    @pytest.mark.parametrize("rows", [[], [review(1, None), review(2, "not a date")]])
+    def test_placeholder_dates_fall_back_to_today_without_any_dated_review(self, rows):
+        outcome, analyzer, repo = self.run(rows=rows)
+        assert analyzer.calls == [] and repo.real == [] and outcome.failed == []
+        assert len(repo.placeholders) == 18
+        assert {s["window_end"] for s in repo.placeholders} == {TODAY}
+        assert {(s["window_months"], s["window_start"]) for s in repo.placeholders} == {
+            (3, date(2026, 7, 25)), (6, date(2026, 4, 25)), (12, date(2025, 10, 25))}
+        assert all(s["window_start"] is not None and s["reviews_analysed"] == 0
+                   for s in repo.placeholders)
+        assert {s["items"][0]["title"] for s in repo.placeholders} == {
+            "Not enough reviews yet (0 of 50 needed)",
+            "Not enough reviews yet (0 of 30 needed)"}
+
+    def test_dry_run_saves_neither_items_nor_placeholders(self):
+        rows = scoped_rows(60, 60, 18)
+        outcome, analyzer, repo = self.run(
+            rows=rows, dry_run=True, settings=ActionItemSettings(windows_months=(3,)))
+        assert repo.saved == [] and len(analyzer.calls) == 5
+        assert all(w.generation_id is None for w in outcome.windows)
+        assert [bool(w.items) for w in outcome.windows] == [True] * 5 + [False]
+        assert outcome.windows[-1].placeholder["title"] == (
+            "Not enough reviews yet (18 of 30 needed)")
+
+    def test_only_the_configured_scopes_run(self):
+        settings = ActionItemSettings(windows_months=(3,),
+                                      scopes=("amazon", "trustpilot_service"))
+        _, analyzer, repo = self.run(settings=settings)
+        assert [(s["source_scope"], s["review_type_scope"]) for s in repo.saved] == [
+            ("Amazon", "Product"), ("Trustpilot", "Service")]
+        assert len(analyzer.calls) == 2 and repo.fetches == 1
+
+    def test_one_failing_scope_does_not_stop_the_others(self):
+        bad = {"items": []}
+        ok = plain_reply()
+        # Calls in scope order; the third scope (amazon) fails twice.
+        outcome, analyzer, repo = self.run(
+            replies=[ok, ok, bad, bad, ok, ok, ok],
+            settings=ActionItemSettings(windows_months=(3,)))
+        [failed] = outcome.failed
+        assert failed.window.name == "Last 3 months (Amazon product reviews only)"
+        assert isinstance(failed.error, ActionItemsValidationError)
+        assert failed.items == [] and failed.generation_id is None
+        assert [(s["source_scope"], s["review_type_scope"]) for s in repo.saved] == [
+            ("All", "All"), ("All", "Product"), ("Trustpilot", "All"),
+            ("Trustpilot", "Product"), ("Trustpilot", "Service")]
+        assert len(analyzer.calls) == 7
+
+    def test_one_failing_window_of_one_scope_spares_its_other_windows(self):
+        bad = {"items": []}
+        ok = plain_reply()
+        settings = ActionItemSettings(scopes=("amazon", "trustpilot"))
+        outcome, _, repo = self.run(replies=[ok, bad, bad, ok, ok, ok, ok],
+                                    settings=settings)
+        assert [w.window.name for w in outcome.failed] == [
+            "Last 6 months (Amazon product reviews only)"]
+        assert [(s["source_scope"], s["window_label"]) for s in repo.saved] == [
+            ("Amazon", "Last 3 months"), ("Amazon", "Last 12 months"),
+            ("Trustpilot", "Last 3 months"), ("Trustpilot", "Last 6 months"),
+            ("Trustpilot", "Last 12 months")]
+
+    def test_a_save_error_fails_only_that_scope_and_window(self):
+        class FlakyRepository(FakeRepository):
+            def save(self, items, window_label, *args, **kwargs):
+                if (kwargs["source_scope"], kwargs["review_type_scope"],
+                        window_label) == ("Trustpilot", "All", "Last 6 months"):
+                    raise RuntimeError("connection dropped")
+                return super().save(items, window_label, *args, **kwargs)
+
+        outcome, analyzer, repo = self.run(repo=FlakyRepository(scoped_rows()))
+        [failed] = outcome.failed
+        assert failed.window.name == "Last 6 months (Trustpilot reviews only)"
+        assert str(failed.error) == "connection dropped"
+        assert len(repo.saved) == 17 and len(analyzer.calls) == 18
+
+    def test_a_placeholder_that_cannot_be_saved_is_a_failure_of_that_window_only(self):
+        class FlakyRepository(FakeRepository):
+            def save(self, items, *args, **kwargs):
+                if kwargs["is_placeholder"]:
+                    raise RuntimeError("connection dropped")
+                return super().save(items, *args, **kwargs)
+
+        outcome, _, repo = self.run(repo=FlakyRepository(scoped_rows(60, 60, 18)),
+                                    settings=ActionItemSettings(windows_months=(3,)))
+        [failed] = outcome.failed
+        assert failed.window.name == "Last 3 months (Trustpilot service reviews only)"
+        assert failed.generation_id is None and len(repo.saved) == 5
+
+    def test_fatal_provider_error_stops_every_scope(self):
+        class DyingAnalyzer(FakeAnalyzer):
+            def complete_json(self, prompt, max_tokens=None):
+                if len(self.calls) == 4:
+                    self.calls.append((prompt, max_tokens))
+                    raise FatalProviderError("no credit")
+                return super().complete_json(prompt, max_tokens)
+
+        analyzer = DyingAnalyzer(plain_reply())
+        repo = FakeRepository(scoped_rows())
+        with pytest.raises(FatalProviderError):
+            self.run(analyzer=analyzer, repo=repo)
+        # Stopped in the second scope: nothing after the failing call.
+        assert len(analyzer.calls) == 5
+        assert [(s["source_scope"], s["review_type_scope"], s["window_label"])
+                for s in repo.saved] == [
+            ("All", "All", "Last 3 months"), ("All", "All", "Last 6 months"),
+            ("All", "All", "Last 12 months"), ("All", "Product", "Last 3 months")]
+
+    def test_retry_and_skip_logs_name_the_scope(self, caplog):
+        bad = {"items": []}
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            self.run(rows=scoped_rows(60, 0, 0), replies=[bad, plain_reply()],
+                     settings=ActionItemSettings(windows_months=(3,),
+                                                 scopes=("amazon", "trustpilot")))
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert messages[0].startswith(
+            "Action items for Last 3 months (Amazon product reviews only): the reply "
+            "failed validation, retrying once:")
+        assert messages[1] == ("Action items for Last 3 months (Trustpilot reviews only): "
+                               "skipped -- no analysed reviews with a review date")
+
+    def test_future_date_cap_and_undated_rows_are_logged_once_for_all_scopes(self, caplog):
+        rows = scoped_rows() + [review(8000, TODAY + timedelta(days=30),
+                                       review_type="service"), review(8001, None)]
+        with caplog.at_level("INFO", logger="multi_source_sentiment"):
+            _, _, repo = self.run(rows=rows)
+        assert caplog.text.count("is after today, so the windows end today") == 1
+        assert "1 review(s) dated after today" in caplog.text
+        assert caplog.text.count("have no parsed review date") == 1
+        ends = {(s["source_scope"], s["review_type_scope"]): s["window_end"]
+                for s in repo.saved}
+        # Capped only where the future-dated service review is in scope.
+        assert ends == {("All", "All"): TODAY, ("All", "Product"): date(2026, 8, 20),
+                        ("Amazon", "Product"): date(2026, 8, 20),
+                        ("Trustpilot", "All"): TODAY,
+                        ("Trustpilot", "Product"): date(2026, 8, 20),
+                        ("Trustpilot", "Service"): TODAY}
+
+    def test_no_reviewer_names_reach_any_scopes_prompt(self):
+        rows = scoped_rows()
+        for r in rows:
+            r["reviewer_name"] = "Private Person"
+        _, analyzer, _ = self.run(rows=rows)
+        assert len(analyzer.calls) == 18
+        assert all("Private Person" not in prompt for prompt, _ in analyzer.calls)
+
+
+def test_format_action_items_heads_each_set_with_its_scope():
+    window = scope_window(scoped_rows(), "amazon")
+    text = format_action_items(validate_action_items(plain_reply(), build_summary(
+        window, 15, 10, 300)), window)
+    assert text.startswith("Last 3 months (Amazon product reviews only): top 3 to-do items "
+                           "-- Based on 60 reviews from 2026-05-21 to 2026-08-20\n")
