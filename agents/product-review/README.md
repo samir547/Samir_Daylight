@@ -6,7 +6,9 @@ review's sentiment with an LLM (Claude), translates non-English
 reviews, and loads the results into the Azure SQL Server database that the
 Power BI dashboards read from — unattended, end to end, on a single
 invocation. After loading new reviews it also writes the top 3 to-do items
-for the business for the last 3, 6 and 12 months, for Power BI (§7.6). Structured as the `daylight_sentiment` package; see `DESIGN.md`
+for the business for the last 3, 6 and 12 months, once for each review scope
+the report can filter on (all reviews, product reviews, Amazon, Trustpilot,
+Trustpilot product, Trustpilot service), for Power BI (§7.6). Structured as the `daylight_sentiment` package; see `DESIGN.md`
 for the full architecture and current known issues.
 
 ---
@@ -87,10 +89,11 @@ without touching the pipeline (see §5).
         │
         ▼
  ┌─────────────────┐   run_action_items() (only when this run loaded new reviews)
- │ 10. ACTION ITEMS  │  per review window (last 3, 6, 12 months): one LLM
- │                    │  call over a summary of that window (one retry if the
- │                    │  reply fails the checks); saves its top 3 to-do items
- │                    │  for Power BI (§7.6)
+ │ 10. ACTION ITEMS  │  per review scope (6) and review window (last 3, 6, 12
+ │                    │  months): one LLM call over a summary of that scope
+ │                    │  and window (one retry if the reply fails the checks);
+ │                    │  saves its top 3 to-do items for Power BI, or one
+ │                    │  "not enough reviews" row (§7.6)
  └─────────────────┘
 ```
 
@@ -449,13 +452,15 @@ review type), `--skip-sharepoint-sync`,
 `--sync-sharepoint-only` (download the new files into `Reviews/` and stop),
 `--keep-output-files` (don't delete the JSON outputs after a successful DB
 load), `--skip-action-items`, `--action-items-months 3,6,12`,
-`--action-items-only`, `--action-items-dry-run` (see §7.6).
+`--action-items-scopes all,amazon`, `--action-items-min-reviews 50`,
+`--action-items-min-reviews-scoped 30`, `--action-items-only`,
+`--action-items-dry-run` (see §7.6).
 
 Exit codes: `0` finished (including "nothing new in SharePoint" and "every
 review already in the database"), `1` the Claude API rejected the run (key,
 billing or model — see §4.5), the database couldn't be read to find the
 reviews already analysed (§4.6), or `--action-items-only` couldn't produce
-the items for a window, `2`
+the items for a scope and window, `2`
 SharePoint sign-in is needed (see §7.5).
 
 Operator tools live in `scripts/` and are run as modules from the repo root
@@ -628,8 +633,10 @@ straight away instead of waiting, run the pipeline once by hand
 
 After a run that analysed and loaded new reviews, the pipeline writes the
 **top 3 to-do items** for the business, for the Financial Director to read
-in Power BI, once for each of three review windows: the **last 3, 6 and 12
-months**. Each item has a rank (1 = biggest business impact), a short title
+in Power BI, once for each of three review windows (the **last 3, 6 and 12
+months**) and each of six **review scopes** (which review website and which
+kind of review the items cover), so the report's source and review-type
+slicers each show their own items. Each item has a rank (1 = biggest business impact), a short title
 that starts with a verb, what to do, why (citing the review numbers), the
 area it concerns (a sector group, a service aspect such as "Returns &
 refunds", a region, or "overall" for an issue that spans several), one
@@ -640,40 +647,105 @@ write-back.
 **The three windows.** Advice from one long period can be driven by
 problems that have already been dealt with, so each run generates a
 separate set of items for each window, and the report lets the reader pick
-one. Every window ends on the **newest review date in the database** and
-covers the N months before it ("Last 3 months", "Last 6 months", "Last 12
-months"), so the windows slide forward whenever newer reviews are loaded.
-They never end later than today: if a wrongly parsed review date lies in the
-future, the windows end today instead (those reviews are still counted) and a
-WARNING says so. Reviews with no parsed review date are left out, and the log
-says how many. A window with **fewer than 50 analysed reviews is skipped**
-(a WARNING names it and the minimum that applied); it is never stretched to
-cover more months, so its label is always true. If every window is skipped, nothing is saved and the
-run carries on as normal.
+one. Every window ends on the **newest review date of its scope** (see the
+end-date rule below) and covers the N months before it ("Last 3 months",
+"Last 6 months", "Last 12 months"), so the windows slide forward whenever
+newer reviews are loaded. They never end later than today: if a wrongly
+parsed review date lies in the future, the windows of every scope that holds
+that review end today instead (those reviews are still counted) and a WARNING
+says so. Reviews with no parsed review date are left out, and the log says
+how many. A window is never stretched to cover more months, so its label is
+always true.
+
+**The six scopes.** The report has a review-source slicer (All / Amazon /
+Trustpilot) and a review-type slicer (All / Product / Service). A slicer
+can't make the model write new advice, so each run generates a separate set
+of items for every scope a reader can pick, and stores it with the scope in
+`source_scope` and `review_type_scope`:
+
+| Scope key | Reviews it covers | Stored as (source / type) |
+|---|---|---|
+| `all` | every review | All / All |
+| `product` | product reviews from both websites | All / Product |
+| `amazon` | Amazon reviews (always product reviews) | Amazon / Product |
+| `trustpilot` | Trustpilot product and service reviews | Trustpilot / All |
+| `trustpilot_product` | Trustpilot product reviews | Trustpilot / Product |
+| `trustpilot_service` | Trustpilot service reviews | Trustpilot / Service |
+
+Amazon has no service reviews, so there is no Amazon / Service scope. Two
+slicer combinations hold exactly the same reviews as a stored scope, and the
+view shows the stored items under them too, without extra model calls:
+Amazon / All shows the Amazon / Product items, and All / Service shows the
+Trustpilot / Service items. Amazon / Service shows nothing.
+
+The analysed reviews are read from the database **once** per run; each
+scope's reviews are then picked out of them.
+
+**End-date rule.** Each scope's windows end on **that scope's own newest
+review date**, not on the newest date in the whole database. The sources
+arrive on different schedules: if the last Trustpilot service file is from
+March and the last Amazon file from August, "Last 3 months" for Trustpilot
+service is the three months up to March, and for Amazon the three months up
+to August. With one end date for everything, the staler scope's windows would
+be empty. The `basis` line in the report shows each set's dates and, when
+they end more than 45 days ago, says the items may be out of date.
+
+**Minimum number of reviews.** A scope and window with too few analysed
+reviews is skipped: fewer than **50** for the `all` scope, fewer than **30**
+for every other scope (they hold a part of the reviews, so they get a lower
+bar). A WARNING names the window, the scope and the minimum that applied.
+
+**Placeholder rows.** A skipped scope and window is not left empty. One row
+is saved for it instead (rank 1, `is_placeholder = 1`) with the title "Not
+enough reviews yet (18 of 30 needed)" and a description, rationale and
+evidence that say in plain words that no to-do items were generated and why.
+It has no evidence strength, `reviews_analysed` is the actual count, and no
+model call is made for it. It is saved under that scope's own window dates;
+a scope with no dated reviews at all has none, so its placeholders use the
+window ending on the newest review date of all the data (or today, if
+nothing is dated). A placeholder becomes the newest generation of its scope
+and window like any other, so when a window that used to have enough reviews
+slides below the minimum, the placeholder **replaces the older items**
+rather than leaving stale advice on show. That is intended.
 
 A run that analyses nothing new generates nothing, so the stored items stay
 as they are. `--action-items-only` regenerates them on demand from what's
 already in the database.
 
-The windows are set with `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`
-(comma-separated, default `3,6,12`) or `--action-items-months 3,6,12` for one
-run; a single number gives one window. The minimum is set with
-`ACTION_ITEMS_MIN_REVIEWS` in `.env` (default `50`) or
-`--action-items-min-reviews 50` for one run; it must be a whole number of 10
-or more, and anything lower stops the run with an error naming the setting.
-Rule of thumb: an N-month window needs about minimum / N reviews a month, so
-with the default of 50 the 3-month window works while reviews arrive at about
-17 or more a month (34 a month at a minimum of 100). If monthly review volume
-grows well beyond about 150, try shorter windows (for example `1,3,6`).
+**Settings.** The windows are set with `ACTION_ITEMS_WINDOWS_MONTHS` in
+`.env` (comma-separated, default `3,6,12`) or `--action-items-months 3,6,12`
+for one run; a single number gives one window. The scopes are set with
+`ACTION_ITEMS_SCOPES` (comma-separated scope keys from the table above;
+default all six) or `--action-items-scopes all,amazon` for one run; an
+unknown key stops the run with an error that lists the valid keys. The two
+minimums are set with `ACTION_ITEMS_MIN_REVIEWS` (the `all` scope, default
+`50`) and `ACTION_ITEMS_MIN_REVIEWS_SCOPED` (every other scope, default
+`30`), or `--action-items-min-reviews 50` and
+`--action-items-min-reviews-scoped 30` for one run; each must be a whole
+number of 10 or more, and anything lower stops the run with an error naming
+the setting. Rule of thumb: an N-month window needs about minimum / N
+reviews a month, so with the default of 50 the 3-month window of the `all`
+scope works while reviews arrive at about 17 or more a month (34 a month at
+a minimum of 100), and with the default of 30 a narrower scope needs about
+10 a month of its own reviews. If monthly review volume grows well beyond
+about 150, try shorter windows (for example `1,3,6`).
 
 **Why fixed windows, not the report's date slicer.** The items are written
 by an LLM at run time and stored; Power BI only reads them. A date slicer
 can't make new advice for a range someone picks in the report, so the
 choice is between a few fixed, named windows that are generated in advance.
-There is no real-time or on-demand generation from the report.
+The same goes for the source and review-type slicers, which is why each
+scope is generated in advance too. There is no real-time or on-demand
+generation from the report.
 
-**The summary.** For each window, the code summarises that window's reviews
-and makes one LLM call on that summary alone. It contains:
+**The summary.** For each scope and window, the code summarises that scope's
+reviews in that window and makes one LLM call on that summary alone. The
+summary names its scope (for example `"scope": "Amazon product reviews
+only"`), and the prompt says that the briefing covers only that scope. A
+section with no reviews in the scope is empty: the Trustpilot service scope
+has no sector groups, regions or products, and the Amazon scope has no
+service aspects, so an item's related area can only be one that the scope
+has. It contains:
 
 - counts and negative shares by review type and source, by sector group, by
   service aspect (under readable names such as "Shipping quality") and by
@@ -707,7 +779,14 @@ Every group carries its number of reviews, negatives, negative share and a
   such a gap is never the main reason for an item. Amazon and Trustpilot
   reviewers are different customers (most Trustpilot reviews are invited by
   the company and skew positive), so a difference between the two sites is
-  background, never a problem by itself.
+  background, never a problem by itself. This rule is given only for the
+  scopes that hold both websites (`all` and `product`). For a scope with one
+  website the prompt instead says plainly that all the reviews come from
+  that website, that it must not be compared with another, and that groups
+  can be compared directly.
+- *This period and this scope alone.* Other periods and other scopes get
+  their own items, so an issue is not repeated only because it shows up
+  elsewhere.
 - *Catch-all groups are not findings.* "General / No Use Stated", "Unknown",
   "No Region Data" and similar groups are never an item on their own, and no
   item's only action is to investigate or monitor one. An item may use them
@@ -741,9 +820,10 @@ figure rounded to a whole number; dates, years and periods such as
 "12 months" are not checked. Line breaks and runs of spaces in the reply
 become single spaces. A reply that fails is sent back to the model **once**,
 with the reasons; each failure is logged as a WARNING. If the second reply
-fails too, nothing is saved for that window. Each window's 3 items are saved
-together in `dbo.sentiment_action_items` with their own `generation_id`,
-`window_label` and `window_months`; every generation is kept.
+fails too, nothing is saved for that scope and window. Each set of 3 items
+is saved together in `dbo.sentiment_action_items` with its own
+`generation_id`, `window_label`, `window_months`, `source_scope` and
+`review_type_scope`; every generation is kept.
 
 The code can only check evidence strength against the related area itself:
 for an item whose related area is "overall", the rule that small-sample
@@ -771,14 +851,22 @@ for plain words such as "small sample" or "too few reviews to tell").
 - `--skip-action-items` — don't generate them in this run.
 - `--action-items-months 3,6,12` — the windows for this run, in months
   (or set `ACTION_ITEMS_WINDOWS_MONTHS` in `.env`; default `3,6,12`).
-- `--action-items-min-reviews 50` — skip a window with fewer analysed
-  reviews than this in this run; 10 or more (or set
+- `--action-items-scopes all,amazon` — the review scopes for this run, by
+  key (or set `ACTION_ITEMS_SCOPES` in `.env`; default all six).
+- `--action-items-min-reviews 50` — for the `all` scope, skip a window with
+  fewer analysed reviews than this in this run; 10 or more (or set
   `ACTION_ITEMS_MIN_REVIEWS` in `.env`; default `50`).
+- `--action-items-min-reviews-scoped 30` — the same for every other scope
+  (or set `ACTION_ITEMS_MIN_REVIEWS_SCOPED` in `.env`; default `30`).
 - `--action-items-only` — skip SharePoint, loading and analysis; generate
-  every window from what's already in the database, then exit. Exit code `1`
-  if any window failed (a skipped window isn't a failure).
-- `--action-items-dry-run` — generate and print every window's items but
-  don't save them.
+  every scope and window from what's already in the database, then exit.
+  Exit code `1` if any of them failed (a skipped window, saved as a
+  placeholder row, isn't a failure).
+- `--action-items-dry-run` — generate and print every scope and window's
+  items but don't save them, placeholder rows included. Each printed set is
+  headed by its window and scope, for example
+  `Last 3 months (Amazon product reviews only): top 3 to-do items -- ...`;
+  a skipped one prints one line saying that there are no items and why.
 
 ```bash
 # Preview from the data already in the database, saving nothing
@@ -789,34 +877,71 @@ python -m daylight_sentiment.cli --action-items-only
 
 # Only the last 6 months
 python -m daylight_sentiment.cli --action-items-only --action-items-months 6
+
+# Only the Amazon and the Trustpilot service scopes
+python -m daylight_sentiment.cli --action-items-only --action-items-scopes amazon,trustpilot_service
 ```
 
-Each run makes up to 3 LLM calls here (one per window), plus one retry for
-any window whose reply fails the checks. In a normal run, a failure (both
-replies failed the checks, the view is missing, a network error) logs one
-`ERROR` line per failed window, starting
-`Action items were not generated for Last N months`, and doesn't change the
-exit code: the reviews are already saved, and the other windows are still
-saved. An invalid API key or exhausted credit still stops the run with exit
-code `1`, as everywhere else.
+**Number of LLM calls.** Each run makes up to **18 LLM calls** here: 6
+scopes x 3 windows, one call each (it was 3 before the scopes existed, so
+this step costs and takes about six times as much), plus one retry for any
+whose reply fails the checks. A skipped scope and window makes no call.
+Fewer scopes or windows mean proportionally fewer calls.
+
+**Wording varies between runs.** Every call is independent, and the model
+does not give the same text twice. The same issue can be worded differently
+in two scopes or two windows of one run, ranked differently, or appear in
+one and not the other; and regenerating from the same reviews gives items
+that say much the same in different words. The numbers in an item are
+checked against the summary it was written from; the wording is not fixed.
+
+In a normal run, a failure (both replies failed the checks, the view is
+missing, a network error) logs one `ERROR` line per failed scope and window,
+starting `Action items were not generated for Last N months (<scope>)`, and
+doesn't change the exit code: the reviews are already saved, and the other
+scopes and windows are still saved. An invalid API key or exhausted credit
+still stops the run with exit code `1`, as everywhere else.
 
 **Power BI.** Use the view `dbo.vw_latest_action_items`
-(`SQL/views/vw_latest_action_items.sql`). It returns the 3 rows of the newest
-generation **for each `window_label`** (rows saved without a label form one
-"Custom window" group). Set the page up with:
+(`SQL/views/vw_latest_action_items.sql`). It returns the rows of the newest
+generation **for each `window_label`, `source_scope` and
+`review_type_scope`**: 3 items, or 1 placeholder row. Rows saved without a
+label form one "Custom window" group, and rows saved before the scope
+columns existed are shown as All / All. Set the page up with:
 
 - a **single-select slicer on `window_label`**, defaulting to "Last 6 months";
+- a **single-select slicer on `source_scope`** (All / Amazon / Trustpilot)
+  and one on **`review_type_scope`** (All / Product / Service), both
+  defaulting to "All". Every combination has rows except Amazon / Service,
+  which doesn't exist and shows nothing;
 - the items visual **sorted by `item_rank`**;
 - `basis`, which reads like "Based on 710 reviews from 2025-08-21 to
   2026-08-20" and, when the window ends more than 45 days before today,
-  goes on ". Newest review is from 2026-08-20, so this may be out of date.";
-- `evidence_strength`, which reads "Strong", "Moderate" or "Early signal".
+  goes on ". Newest review is from 2026-08-20, so this may be out of date.".
+  On a placeholder row it reads "Too few reviews for to-do items: 18 from
+  2026-05-21 to 2026-08-20" instead (or "... none with a review date in this
+  selection");
+- `evidence_strength`, which reads "Strong", "Moderate" or "Early signal",
+  and is empty on a placeholder row;
+- `is_placeholder`, to style or filter the "not enough reviews" rows.
 
 The report's date slicer does not drive these items: they are generated at
-run time, one fixed set per window. The pipeline creates the table and adds
-new columns to an existing one itself, but its database login can't create
-views: an administrator applies the view file in SSMS once (and again
-whenever it changes).
+run time, one fixed set per window and scope. The pipeline creates the table
+and adds new columns to an existing one itself (on its first save), but its
+database login can't create views: an administrator applies the view file in
+SSMS once (and again whenever it changes).
+
+**Deploying the scopes for the first time.** In SSMS, as an administrator,
+and **before** the first run of this version: (1) run
+`SQL/tables/sentiment_action_items.sql`, which adds `source_scope`,
+`review_type_scope` and `is_placeholder` to the existing table and is safe to
+re-run; (2) run `SQL/views/vw_latest_action_items.sql`. Then run the
+pipeline (or `--action-items-only`), and check with the two verification
+queries at the end of the view file. The order matters: the view needs the
+three columns, and the previous version of the view picks one generation per
+window whatever its scope, so if scoped items are saved before the new view
+is applied the report shows the last scope saved (possibly a placeholder)
+until it is.
 
 ## 8. Known things to watch
 

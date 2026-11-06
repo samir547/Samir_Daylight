@@ -36,8 +36,9 @@ daylight_sentiment/
     domain/                 pure logic, no I/O, depends on nothing in-tree
         taxonomy.py           SECTORS / ASPECTS / SENTIMENTS
         prompts.py            SENTIMENT_GUIDANCE, prompts, _build_context, ...
-        action_items.py       review window, summary, reply validation for
-                              the business to-do items (see §8a)
+        action_items.py       review scopes and windows, summary, placeholder
+                              row, reply validation for the business to-do
+                              items (see §8a)
         action_items_prompt.py  the to-do items prompt
         normalise.py          _normalise, _sanitise_sector_label, _strip_fences,
                               _align_batch
@@ -156,9 +157,9 @@ supported indefinitely.
                                                     analysed new reviews (not
                                                     replayed from the checkpoint),
                                                     not --skip-action-items]
-        the top 3 business to-do items for each review window (§8a). Each
-        failed window logs one ERROR line and the exit code is unchanged; a
-        FatalProviderError exits 1
+        the top 3 business to-do items for each review scope and review
+        window (§8a). Each failed scope and window logs one ERROR line and
+        the exit code is unchanged; a FatalProviderError exits 1
 ```
 
 **Key invariants:**
@@ -402,8 +403,8 @@ header), consolidates sectors via `dbo.sector_group_map`, and exposes
 
 The top 3 to-do items for the business, from the stored sentiment results,
 read by the client's Financial Director in Power BI. One set is generated
-for each review window (default: the last 3, 6 and 12 months). Read-only:
-no status tracking or write-back.
+for each review scope (default: six, below) and each review window (default:
+the last 3, 6 and 12 months). Read-only: no status tracking or write-back.
 
 **Position.** Step 13 of §3: after the database load, the move to Processed
 and the translation pass, so the reviews from this run are in the database
@@ -422,42 +423,118 @@ than date ranges chosen in the report: the items are written by the model at
 run time, so a Power BI date slicer can't change them, and there is no
 real-time generation.
 
+**Scopes.** The report filters on review source and review type, and a
+slicer can't regenerate items either, so each scope a reader can pick gets
+its own generated set. `domain/action_items.py` defines them as
+`ReviewScope` (pure logic) in `REVIEW_SCOPES`:
+
+| key | `review_source` | `review_type` | stored `source_scope` / `review_type_scope` | label |
+|---|---|---|---|---|
+| `all` | any | any | All / All | All reviews |
+| `product` | any | product | All / Product | Product reviews only |
+| `amazon` | amazon | product | Amazon / Product | Amazon product reviews only |
+| `trustpilot` | trustpilot | any | Trustpilot / All | Trustpilot reviews only |
+| `trustpilot_product` | trustpilot | product | Trustpilot / Product | Trustpilot product reviews only |
+| `trustpilot_service` | trustpilot | service | Trustpilot / Service | Trustpilot service reviews only |
+
+Amazon reviews are always `review_type = 'product'`, so `amazon` is stored
+as Amazon / Product and there is no Amazon service scope. The stored pairs
+are all different and none is (Amazon, All) or (All, Service): the view
+shows those two as copies (below). `ActionItemSettings.scopes` is a tuple of
+scope keys (default all six; `ACTION_ITEMS_SCOPES` or `--action-items-scopes`,
+comma-separated, parsed by `parse_scopes()`: any letter case, returned in
+the defined order with repeats removed, and an unknown or empty key raises
+a `ValueError` naming the setting and the valid keys). `ReviewWindow` carries
+its `scope` and the `min_reviews` it was checked against; `ReviewWindow.name`
+("Last 3 months (Amazon product reviews only)") is what logs, error lines
+and dry-run headings use.
+
 **Flow** (`generate_action_items()`):
 
 1. `ActionItemRepository.fetch_analysed_rows()` reads analysed rows
    (`sentiment IS NOT NULL`) from `dbo.vw_review_analysis` once for all
-   windows: `uid`, `review_type`, `review_source`, `sentiment`, `confidence`,
+   scopes and windows (never once per scope): `uid`, `review_type`, `review_source`, `sentiment`, `confidence`,
    `rating`, `sector_group`, `primary_aspect`, `product_region`,
    `resolved_sku`, `product_name`, `key_themes`, `review_date_parsed`, plus
    `review_text_en` / `review_text` for negative reviews only.
    `reviewer_name` is never read. If this fails, nothing is generated.
-2. `domain.action_items.select_windows()`: rows with no `review_date_parsed`
-   are left out and counted in the log. Every window ends on the earlier of
-   the newest review date and today, and starts N months before that
-   (`months_before()`, plus one day). When the cap at today applies (a review
-   dated in the future, usually a misparsed date) one WARNING names the date;
-   reviews dated after today stay in the windows. A window with fewer than
-   `ActionItemSettings.min_reviews` analysed reviews (default 50, from
-   `MIN_WINDOW_REVIEWS`; `ACTION_ITEMS_MIN_REVIEWS` or
-   `--action-items-min-reviews`, a whole number of 10 or more) is returned
-   skipped and logged as a WARNING naming that minimum, never widened, so
-   its label always describes it; a skipped window is not a failure. If every window is skipped nothing is saved.
-3. For each window that isn't skipped, `generate_window_items()`:
+2. For each scope in `settings.scopes`, `scope_rows()` picks that scope's
+   rows out of the fetched ones, and `domain.action_items.select_windows()`
+   builds its windows from them: the rows are filtered by scope *before* the
+   windows are selected. Rows with no `review_date_parsed` are left out.
+   - **End-date rule.** Every window of a scope ends on the earlier of *that
+     scope's* newest review date and today, and starts N months before that
+     (`window_start()`: `months_before()` plus one day). There is no global
+     end date: the sources are loaded on different schedules, and with one
+     end date a scope whose newest file is older (typically Trustpilot
+     service) would get empty or thin windows. Such a scope gets real items
+     from its own last N months instead, and the view's `basis` line shows
+     the dates and the out-of-date note.
+   - **Cap and undated rows.** Before the scopes are looped over,
+     `select_windows()` is run once on all the rows, whatever the scopes:
+     when the cap at today applies (a review dated in the future, usually a
+     misparsed date) one WARNING names the date for the whole run, and one
+     INFO line counts the rows with no parsed date; reviews dated after
+     today stay in the windows of every scope that holds them. That pass
+     also gives the fallback end date for placeholders (step 3).
+   - **Per-scope minimum.** `ActionItemSettings.min_reviews_for(key)`: the
+     `all` scope needs `min_reviews` analysed reviews in a window (default
+     50, from `MIN_WINDOW_REVIEWS`; `ACTION_ITEMS_MIN_REVIEWS` or
+     `--action-items-min-reviews`), every other scope `min_reviews_scoped`
+     (default 30, from `MIN_SCOPED_WINDOW_REVIEWS`;
+     `ACTION_ITEMS_MIN_REVIEWS_SCOPED` or `--action-items-min-reviews-scoped`).
+     Both are whole numbers of 10 or more (`MIN_REVIEWS_FLOOR`), validated
+     by the same `parse_min_reviews()`. A window below its minimum is
+     returned skipped and logged as a WARNING naming the window, the scope
+     and that minimum; it is never widened, so its label always describes
+     it. A skipped window is not a failure.
+3. **Placeholders.** A skipped scope and window is not left out silently:
+   `placeholder_item()` builds ONE row for it (rank 1) and it is saved as its
+   own generation with `is_placeholder = 1`. Title: "Not enough reviews yet
+   (18 of 30 needed)"; description, rationale and evidence say in plain
+   English that no items were generated and why, with the count, the period
+   and the minimum; `related_area` is "overall" (the column is `NOT NULL`);
+   `evidence_strength`, `llm_provider` and `llm_model` are NULL (no model
+   wrote it, and no call is made); `reviews_analysed` is the actual count.
+   It is saved under the scope's own window dates. A scope with no dated
+   reviews at all has no dates, so `with_period()` gives its placeholders
+   the window ending on the newest review date of all the data, capped at
+   today like every window, or on today if nothing in the data is dated:
+   `window_start` and `window_end` are `NOT NULL`. A placeholder that
+   becomes the newest generation of its scope and window replaces, in the
+   view, real items generated earlier; that is intended, for a window that
+   has slid below the minimum. A dry run saves no placeholder.
+4. For each scope and window that isn't skipped, `generate_window_items()`:
    `build_summary()` of that window's rows, one
    `analyzer.complete_json(prompt, max_tokens=1500)`, validation against that
-   window's summary, and one retry (below). Then
-   `ActionItemRepository.save()` with the window's label and length. Any
-   exception in one window (a reply that fails validation twice, a provider
-   error, a database error) is recorded on that window's `WindowOutcome`
-   and the remaining windows still run. A `FatalProviderError` stops all of
-   them, since every call would fail the same way. Up to 3 calls per run,
-   plus one retry per window that needs it.
+   summary, and one retry (below). Then `ActionItemRepository.save()` with
+   the window's label and length and the scope's `source_scope` /
+   `review_type_scope`. Any exception in one scope and window (a reply that
+   fails validation twice, a provider error, a database error, a placeholder
+   that can't be saved) is recorded on its `WindowOutcome` and the remaining
+   windows and scopes still run. A `FatalProviderError` stops everything,
+   since every call would fail the same way.
+
+**Number of calls.** One call per scope and window that isn't skipped: with
+the defaults 6 scopes x 3 windows = up to 18 calls per run (3 before the
+scopes existed, so about six times the cost and duration of this step),
+plus one retry for each that needs it. Fewer scopes or windows mean
+proportionally fewer calls; a placeholder costs none.
+
+**Wording varies between runs.** The calls are independent and the model is
+not deterministic. The same underlying issue may be worded or ranked
+differently in two scopes or windows of one run, or be picked in one and not
+in the other, and regenerating from unchanged reviews gives different text.
+Validation ties the *numbers* of every item to the summary it was written
+from; nothing fixes the wording, and nothing reconciles the sets with each
+other.
 
 **Summary** (`build_summary()`). Every grouped section gives `reviews`,
 `negatives`, `negative_share_pct` and `small_sample` (fewer than
 `SMALL_SAMPLE_REVIEWS` = 30 reviews; the threshold is in the summary as
 `small_sample_threshold_reviews`). Sections: `window` (label, dates,
-reviews); the sentiment split and `negative_reviews_total`;
+reviews); `scope` (the scope's label, e.g. "Amazon product reviews only");
+the sentiment split and `negative_reviews_total`;
 `by_review_type_and_source`; `product_by_sector_group` and
 `product_by_sector_group_and_source`; `service_by_aspect` and
 `service_by_aspect_and_source`, under the readable names in `ASPECT_NAMES`
@@ -469,6 +546,16 @@ to 10, most confident first, round-robin across areas, identical texts once,
 English text preferred, single-spaced, cut to 300 characters after the last
 whole word, email addresses and phone numbers blanked).
 
+- **Empty sections.** The summary is built from the scope's rows only, so a
+  scope with one review type has nothing for the other: `trustpilot_service`
+  has empty `product_by_sector_group`, `product_by_sector_group_and_source`
+  and `products_most_negative` and no region sections; `amazon` (and the
+  other product-only scopes) have empty `service_by_aspect` and
+  `service_by_aspect_and_source`. The trend lists are empty to match.
+  `summary_areas()` then offers "overall" plus the groups that exist, so
+  validation rejects an item whose `related_area` belongs to a section the
+  scope doesn't have, and the prompt tells the model to write nothing about
+  an empty section.
 - **Products.** `vw_review_analysis` has no product family or catalogue
   name; it exposes `resolved_sku` (the one key resolved for both sources)
   and the raw `product_name` each review was filed under. Products are
@@ -502,16 +589,30 @@ whole word, email addresses and phone numbers blanked).
 **Prompt** (`domain/action_items_prompt.py`): plain British English for a
 non-technical reader, exactly 3 items ranked by business impact, titles
 starting with a verb, only numbers from the summary (and no derived
-figures), cited evidence, no generic advice. Its rules:
+figures), cited evidence, no generic advice.
+`build_action_items_prompt(summary, areas, scope)` fits three parts of it to
+the scope: the intro names only the websites in the scope ("customer reviews
+from Trustpilot and Amazon", "from Amazon" or "from Trustpilot"); a sentence
+after the period says that the briefing covers ONLY that scope and that
+reviews outside it are not in the summary (for `all`: that it covers every
+review of the period); and rule 5 has two versions. Its rules:
 
-- *Like with like* (rule 5): regions, sources, sector groups, service
-  aspects and products are compared only within the same source (the
-  `..._and_source` tables and `reviews_by_source`), or the item says that
-  the source mix differs and treats the gap as background; a gap between
-  groups with different source mixes is never the main reason for an item.
-  Amazon and Trustpilot are different populations (Trustpilot reviews are
-  mostly company-invited and skew positive), so a difference between them
-  is context, never evidence of a problem by itself.
+- *Like with like* (rule 5, scopes with both websites: `all`, `product`):
+  regions, sources, sector groups, service aspects and products are compared
+  only within the same source (the `..._and_source` tables and
+  `reviews_by_source`), or the item says that the source mix differs and
+  treats the gap as background; a gap between groups with different source
+  mixes is never the main reason for an item. Amazon and Trustpilot are
+  different populations (Trustpilot reviews are mostly company-invited and
+  skew positive), so a difference between them is context, never evidence
+  of a problem by itself.
+- *One review website* (rule 5, single-source scopes: `amazon`,
+  `trustpilot`, `trustpilot_product`, `trustpilot_service`): the rule says
+  plainly that all the reviews come from that one website, that reviews
+  from another website must be neither compared with nor mentioned, and that
+  groups may be compared directly because the warnings about mixed websites
+  don't apply. The Amazon-versus-Trustpilot text is left out, and the other
+  website is not named in the rules at all.
 - *Small samples* (rule 6): an item based mainly on a small-sample group is
   framed as monitor or investigate, never overhaul or fix.
 - No claim that a difference is statistically significant or "not random";
@@ -573,8 +674,9 @@ words found. Each trend row carries `few_mentions` when its `negatives`
 `few_mentions`, and treat a theme or product with fewer than 10 negatives
 as an "early signal"; those rules rest on the prompt. The flag is a
 boolean, so `summary_numbers()` skips it and the accepted numbers are
-unchanged. Rule 16 asks for each window's items to stand on that window
-alone, without repeating an issue only because another window has it.
+unchanged. Rule 16 asks for each set of items to stand on its own period
+and its own scope: other periods *and other scopes* get their own items, so
+an issue is not repeated only because another period or scope has it.
 The same four fields must contain no lower-case snake_case word
 (`field_identifiers()`, e.g. `small_sample`, `negative_share_pct`), so no
 field name or flag reaches the reader; the error names each one and asks
@@ -582,63 +684,102 @@ for plain words, and prompt rule 17 says the same.
 
 **Retry.** If validation fails, one retry: the same prompt plus "Your
 previous reply failed because: <the errors>". Each failure is logged as a
-WARNING naming the window, with the reason only. If the retry fails
-validation too, that window fails and nothing is saved for it. A provider
-error is not retried here.
+WARNING naming the window and its scope, with the reason only. If the retry
+fails validation too, that scope and window fails and nothing is saved for
+it. A provider error is not retried here.
 
 **Saving.** `ActionItemRepository.save()` applies `ensure_schema()` and
-inserts the window's 3 rows in one transaction (rolled back on any error),
-under a new `generation_id`, with `window_label` and `window_months`.
+inserts the generation's rows in one transaction (rolled back on any
+error), under a new `generation_id`, with `window_label`, `window_months`,
+`source_scope`, `review_type_scope` and `is_placeholder`
+(`INSERT_COLUMNS`). A generation is the 3 items of one scope and window, or
+the single placeholder row of a skipped one; `UNIQUE (generation_id,
+[rank])` holds for both, since each generation has its own id.
 
 **Table `dbo.sentiment_action_items`** (`SQL/tables/sentiment_action_items.sql`,
 and the `MIGRATIONS` entries `create_action_items_table`,
-`add_action_items_evidence_strength`, `add_action_items_window_label` and
-`add_action_items_window_months`): `item_id INT IDENTITY PK`,
-`generation_id UNIQUEIDENTIFIER` (the 3 rows of one window's generation),
+`add_action_items_evidence_strength`, `add_action_items_window_label`,
+`add_action_items_window_months`, `add_action_items_source_scope`,
+`add_action_items_review_type_scope` and `add_action_items_is_placeholder`):
+`item_id INT IDENTITY PK`,
+`generation_id UNIQUEIDENTIFIER` (the rows of one generation),
 `generated_at DATETIME2 DEFAULT SYSUTCDATETIME()`, `run_timestamp` (the
 run's `sentiment_analysis_runs.run_timestamp`; NULL for
 `--action-items-only`; not an enforced foreign key), `[rank] TINYINT`,
 `title NVARCHAR(200)`, `description`, `rationale`, `evidence`
 (`NVARCHAR(MAX)`), `related_area NVARCHAR(100)`,
 `evidence_strength NVARCHAR(20) NULL`, `window_label NVARCHAR(30) NULL`,
-`window_months TINYINT NULL`, `window_start`, `window_end` (`DATE`),
-`reviews_analysed INT`, `llm_provider`, `llm_model`;
+`window_months TINYINT NULL`, `source_scope NVARCHAR(20) NULL`,
+`review_type_scope NVARCHAR(20) NULL`, `is_placeholder BIT NOT NULL DEFAULT 0`
+(constraint `DF_sentiment_action_items_is_placeholder`), `window_start`,
+`window_end` (`DATE`), `reviews_analysed INT`, `llm_provider`, `llm_model`;
 `UNIQUE (generation_id, [rank])`. Insert-only: every generation is kept.
 The columns added after the table was first created each have their own
 guarded `ALTER TABLE ... ADD` (`IF NOT EXISTS` on `sys.columns`), appended
 after the create entry, which is left as it was first applied. The canonical
-SQL file has the final shape and the same guarded `ALTER`s.
+SQL file has the final shape and the same guarded `ALTER`s. Rows saved
+before the scope columns existed have NULL in `source_scope` and
+`review_type_scope` and are read as All / All (they covered every review);
+`is_placeholder` is added `NOT NULL` with a default, so those rows become 0.
+Nothing backfills the NULLs: the view reads them.
 
 **View `dbo.vw_latest_action_items`** (`SQL/views/vw_latest_action_items.sql`):
-for each `window_label` (NULL treated as one 'Custom window' group), the rows
-of its newest generation (latest `generated_at`, then highest `item_id`, via
-`ROW_NUMBER()`), with `window_label`, `window_months`, `item_rank` for
-sorting, `related_area` ("Overall"), `evidence_strength` capitalised ("Early
-signal"), the window dates and count, `generated_at`, and a `basis` column
-("Based on N reviews from <window_start> to <window_end>", followed by ". Newest
-review is from <window_end>, so this may be out of date." when `window_end` is
-more than `stale_after_days` = 45 days before the query date). The pipeline's
-login (`daylight_agents`) can create tables but not views, so an
-administrator applies this file in SSMS. In Power BI: a single-select slicer
-on `window_label` defaulting to "Last 6 months", the visual sorted by
-`item_rank`.
+for each `window_label` (NULL treated as one 'Custom window' group) and each
+stored scope (`source_scope`, `review_type_scope`; NULL read as 'All'), the
+rows of its newest generation (latest `generated_at`, then highest `item_id`,
+via `ROW_NUMBER()` partitioned by all three). Two slicer combinations hold
+exactly the same reviews as a stored scope, so a `UNION ALL` (the
+`shown_scope` CTE) also shows the newest Amazon / Product generation as
+Amazon / All and the newest Trustpilot / Service generation as All /
+Service: both slicers then work in every combination with no extra model
+calls. Amazon / Service doesn't exist and no row is made up for it, so that
+combination is empty in the report. Columns: `window_label`,
+`window_months`, `source_scope`, `review_type_scope` (the scope *shown*),
+`is_placeholder`, `item_rank` for sorting, `related_area` ("Overall"),
+`evidence_strength` capitalised ("Early signal"; NULL on a placeholder), the
+window dates and count, `generated_at`, `generation_id`, `run_timestamp`,
+`llm_provider`, `llm_model`, and a `basis` column: "Based on N reviews from
+<window_start> to <window_end>" for real items; "Too few reviews for to-do
+items: N from <window_start> to <window_end>" for a placeholder, so that it
+never reads as if items were based on those reviews; and "Too few reviews
+for to-do items: none with a review date in this selection" for a
+placeholder with `reviews_analysed = 0`, whose stored window is the fallback
+one and not the scope's own. ". Newest review is from <window_end>, so this
+may be out of date." follows when `window_end` is more than
+`stale_after_days` = 45 days before the query date, except on that last
+kind of placeholder. The pipeline's login (`daylight_agents`) can create
+tables but not views, so an administrator applies this file in SSMS, and no
+application code runs it. It needs the three scope columns, so on a database
+where the pipeline hasn't saved since they were introduced the table file is
+run first; and it should be applied before the first run that saves scoped
+items, because the previous version picks one generation per window
+whatever its scope. In Power BI: single-select slicers on `window_label`
+(default "Last 6 months"), `source_scope` and `review_type_scope` (default
+"All"), the visual sorted by `item_rank`.
 
 **Flags:** `--skip-action-items`, `--action-items-months 3,6,12`,
-`--action-items-only`, `--action-items-dry-run` (generate and print every
-window's items, write nothing; combinable with `--action-items-only`).
+`--action-items-scopes all,amazon`, `--action-items-min-reviews 50`,
+`--action-items-min-reviews-scoped 30`, `--action-items-only`,
+`--action-items-dry-run` (generate and print every scope and window's items
+under a heading that names both, e.g. "Last 3 months (Amazon product reviews
+only): top 3 to-do items -- ...", print one line for each skipped one, and
+write nothing; combinable with `--action-items-only`).
 
-**Failure behaviour.** In a normal run, each failed window logs one ERROR
-line, `Action items were not generated for Last N months: ...`, and the
-exit code stays what it would otherwise be: the reviews are already saved.
-A failure before any window runs (the view is missing, the database is
-unreachable) logs one ERROR line, `Action items were not generated: ...`.
-`--action-items-only` exits 1 if any window failed or the reviews couldn't be
-read, and 0 when every window was generated or skipped. A
-`FatalProviderError` is reported as everywhere else and exits 1.
+**Failure behaviour.** In a normal run, each failed scope and window logs
+one ERROR line, `Action items were not generated for Last N months
+(<scope label>): ...`, and the exit code stays what it would otherwise be:
+the reviews are already saved. A failure before anything runs (the view is
+missing, the database is unreachable) logs one ERROR line, `Action items
+were not generated: ...`. `--action-items-only` exits 1 if any scope and
+window failed or the reviews couldn't be read, and 0 when every one was
+generated or skipped (placeholders are not failures). A `FatalProviderError`
+is reported as everywhere else and exits 1.
 
 **Sizing.** When fewer than about 17 reviews a month arrive, the 3-month
-window falls under the default 50-review minimum and is skipped (an N-month
-window needs about minimum / N a month). If monthly review
+window of the `all` scope falls under the default 50-review minimum and is
+skipped (an N-month window needs about minimum / N a month); a narrower
+scope needs about 10 a month of its own reviews for its 3-month window at
+the default of 30. If monthly review
 volume grows well beyond about 150, shorter windows (for example
 `ACTION_ITEMS_WINDOWS_MONTHS=1,3,6`) give fresher advice.
 
@@ -670,8 +811,11 @@ refactor; keep them green.
 | `--keep-output-files` | Load the DB as normal, but don't delete the JSON afterward |
 | `--skip-action-items` | Don't generate the business to-do items (§8a) |
 | `--action-items-months 3,6,12` | The review windows, in months, to generate to-do items for (default `3,6,12`) |
-| `--action-items-only` | Skip sync, analysis and loading; generate every window's to-do items from the database and exit (1 if any window failed) |
-| `--action-items-dry-run` | Generate and print every window's to-do items without saving them |
+| `--action-items-scopes all,amazon` | The review scopes to generate to-do items for, by key (default all six: `all`, `product`, `amazon`, `trustpilot`, `trustpilot_product`, `trustpilot_service`) |
+| `--action-items-min-reviews 50` | For the `all` scope, skip a window with fewer analysed reviews (10 or more; default `50`) |
+| `--action-items-min-reviews-scoped 30` | The same for every other scope (10 or more; default `30`) |
+| `--action-items-only` | Skip sync, analysis and loading; generate every scope and window's to-do items from the database and exit (1 if any of them failed) |
+| `--action-items-dry-run` | Generate and print every scope and window's to-do items without saving them |
 
 ## 11. Known issues
 
