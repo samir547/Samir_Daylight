@@ -4,7 +4,7 @@ each generation's items to dbo.sentiment_action_items.
 
 Read-only on the review side, insert-only on the items side: older
 generations are kept as history and dbo.vw_latest_action_items shows the
-newest one for each review window.
+newest one for each review window and review scope.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
 from daylight_sentiment.config import DatabaseSettings
+from daylight_sentiment.domain.action_items import SCOPE_ALL
 from daylight_sentiment.infra.db.connection import ACTION_ITEMS_TABLE, connect, ensure_schema
 
 logger = logging.getLogger("multi_source_sentiment")
@@ -31,7 +32,8 @@ class ActionItemRepository:
     INSERT_COLUMNS = ("generation_id", "run_timestamp", "[rank]", "title", "description",
                       "rationale", "related_area", "evidence", "evidence_strength",
                       "window_label", "window_months", "window_start", "window_end",
-                      "reviews_analysed", "llm_provider", "llm_model")
+                      "reviews_analysed", "llm_provider", "llm_model",
+                      "source_scope", "review_type_scope", "is_placeholder")
 
     def __init__(self, settings: DatabaseSettings):
         self.settings = settings
@@ -71,12 +73,17 @@ WHERE sentiment IS NOT NULL
     def rows(cls, items: Sequence[Dict[str, Any]], generation_id: str,
              window_label: Optional[str], window_months: Optional[int], window_start,
              window_end, reviews_analysed: int, llm_provider: Optional[str],
-             llm_model: Optional[str], run_timestamp: Optional[str]) -> List[tuple]:
-        """One parameter tuple per item, in INSERT_COLUMNS order."""
+             llm_model: Optional[str], run_timestamp: Optional[str],
+             source_scope: str = SCOPE_ALL, review_type_scope: str = SCOPE_ALL,
+             is_placeholder: bool = False) -> List[tuple]:
+        """One parameter tuple per item, in INSERT_COLUMNS order. A
+        placeholder (``is_placeholder``) is one item with no evidence
+        strength."""
         return [(generation_id, run_timestamp, item["rank"], item["title"],
                  item["description"], item["rationale"], item["related_area"],
                  item["evidence"], item["evidence_strength"], window_label, window_months,
-                 window_start, window_end, reviews_analysed, llm_provider, llm_model)
+                 window_start, window_end, reviews_analysed, llm_provider, llm_model,
+                 source_scope, review_type_scope, bool(is_placeholder))
                 for item in items]
 
     @classmethod
@@ -95,18 +102,25 @@ WHERE sentiment IS NOT NULL
 
     def save(self, items: Sequence[Dict[str, Any]], window_label: str, window_months: int,
              window_start, window_end, reviews_analysed: int, llm_provider: Optional[str],
-             llm_model: Optional[str], run_timestamp: Optional[str] = None) -> str:
-        """Save one window's generation and return its generation_id. Applies
-        the schema migrations first, so the table exists on a fresh database."""
+             llm_model: Optional[str], run_timestamp: Optional[str] = None,
+             source_scope: str = SCOPE_ALL, review_type_scope: str = SCOPE_ALL,
+             is_placeholder: bool = False) -> str:
+        """Save one generation -- the items of one review window and one
+        review scope, or the single placeholder row of a window that was
+        skipped -- and return its generation_id. Applies the schema
+        migrations first, so the table and its newer columns exist."""
         generation_id = str(uuid.uuid4())
         rows = self.rows(items, generation_id, window_label, window_months, window_start,
-                         window_end, reviews_analysed, llm_provider, llm_model, run_timestamp)
+                         window_end, reviews_analysed, llm_provider, llm_model, run_timestamp,
+                         source_scope, review_type_scope, is_placeholder)
         conn = connect(self.settings)
         try:
             ensure_schema(conn)
             self.insert_on(conn, rows)
         finally:
             conn.close()
-        logger.info("Saved %d action items for %s (generation %s) into dbo.%s",
-                    len(rows), window_label, generation_id, ACTION_ITEMS_TABLE)
+        logger.info("Saved %d %s for %s, scope %s / %s (generation %s) into dbo.%s",
+                    len(rows), "placeholder row" if is_placeholder else "action items",
+                    window_label, source_scope, review_type_scope, generation_id,
+                    ACTION_ITEMS_TABLE)
         return generation_id
