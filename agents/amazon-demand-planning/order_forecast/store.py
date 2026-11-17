@@ -14,6 +14,19 @@ from .live import LiveForecast
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 SQL_FILES = ("001_order_forecast_tables.sql", "004_replenish_columns.sql", "002_views.sql")   # 004 before 002: the view reads its column
+# 005 and 006 are applied by hand only: application code does not run new DDL.
+VIEW_IS_NEWER_SQL = "SELECT COL_LENGTH('dbo.vw_amazon_order_forecast_sku', 'reason_code')"
+
+
+def _view_is_newer(cur) -> bool:
+    """True when sql/006 is applied (the view has reason_code). Read-only. If the check itself fails, False,
+    which keeps the old behaviour."""
+    try:
+        cur.execute(VIEW_IS_NEWER_SQL)
+        row = cur.fetchone()
+        return bool(row) and row[0] is not None
+    except Exception:
+        return False
 
 
 def split_batches(script: str) -> list[str]:
@@ -31,6 +44,9 @@ def init_db(conn=None) -> tuple[int, list[str]]:
     try:
         cur = conn.cursor()
         for name in SQL_FILES:
+            if name == "002_views.sql" and _view_is_newer(cur):
+                print("Skipped 002_views.sql: the view already has the sql/006 columns; re-applying 002 would remove them.")
+                continue
             for batch in split_batches((SQL_DIR / name).read_text(encoding="utf-8")):
                 try:
                     cur.execute(batch)
