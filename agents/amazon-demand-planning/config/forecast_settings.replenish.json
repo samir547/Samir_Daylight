@@ -3,6 +3,7 @@
   "target": "ordered_units",
   "horizon": 6,
   "min_history": 12,
+  "young_min_months": 3,
   "sanity_ratio_min": 0.5,
   "sanity_ratio_max": 1.6,
   "amazon_weight": 0.5,

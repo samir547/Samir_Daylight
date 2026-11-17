@@ -27,7 +27,10 @@ DEFAULTS = {"method": "seasonal_half", "open_po_tweak": True, "target": "ordered
             "min_history": 12, "sanity_ratio_min": 0.5, "sanity_ratio_max": 1.6,
             # used only by method "replenish" (see replenish.py)
             "amazon_weight": 0.5, "percentile_shrink": 1.0, "min_order_share": 0.25, "demand_method": "seasonal_half",
-            "adjustments_file": "config/order_adjustments.csv"}
+            "adjustments_file": "config/order_adjustments.csv",
+            # replenish: ASINs with at least this many months of sales but under min_history get the young-product
+            # backup (overridable per pool under "pools", e.g. {"ES": {"young_min_months": 2}})
+            "young_min_months": 3}
 
 
 def load_settings(path: Path | None = None) -> dict:
@@ -79,7 +82,7 @@ class LiveForecast:
     train_end: pd.Timestamp
     horizon: int
     skipped_short: int
-    sanity_ratio: float            # forecast total / (last 12 months actual scaled to the horizon)
+    sanity_ratio: float            # forecast total / (last 12 months actual scaled to the horizon); replenish: same ASINs only
     extras: dict = field(default_factory=dict)   # method-specific side outputs (replenish: habits, stats, unadjusted run)
 
 

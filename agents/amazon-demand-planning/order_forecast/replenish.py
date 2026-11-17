@@ -15,7 +15,12 @@ Plain-language version (the design is in the stakeholder PDF):
   4. Output per ASIN-month: likely order (mean scenario), P80 and high case (P90), and the share of
      scenarios that place an order that month.
   5. Client knowledge (adjustments.py) is applied on the way in, so every effect is explainable.
-  6. Every ASIN-month carries a reason_code (what decided the number), a reason_detail (every rule that
+  6. Young products (fewer than min_history months of sales, at least young_min_months) are not dropped:
+     their expected sales are Amazon's forecast where it has the month, otherwise the average of their last
+     3 months, and they go through the same habits, replay and adjustments. With no stock reading they follow
+     the 3-month average only: Amazon's forecast is a demand signal and is never copied into the order forecast.
+     Their rows are marked YOUNG_PRODUCT_BACKUP, confidence LOW.
+  7. Every ASIN-month carries a reason_code (what decided the number), a reason_detail (every rule that
      touched it) and a confidence (HIGH / MEDIUM / LOW). The codes are listed in REASON_CODES.
 
 Everything is deterministic and only reads the snapshot, so a run can be repeated exactly.
@@ -394,6 +399,23 @@ def _row_codes(basis: str, tot: list, explain: list, ad, pinned: np.ndarray, dem
     return out
 
 
+def sanity_ratios(sales_w: pd.DataFrame, forecast_asins: list, forecast_total: float, H: int) -> dict:
+    """The sanity check compares like with like: the forecast total against the recent pace of the SAME ASINs.
+
+    Pace per ASIN = its average monthly sales over the last 12 months it existed (a 6-month-old product counts
+    6 months, not 6 plus 6 empty ones), times the horizon. For ASINs with 12+ months that is exactly the old
+    "last 12 months scaled to the horizon". The old all-ASIN ratio (which also counts the sales of skipped ASINs)
+    and the share of recent sales that sits in skipped ASINs are returned for the log only."""
+    last12 = sales_w.iloc[:, -12:]
+    fc = last12.loc[list(forecast_asins)]
+    pace = float(np.nansum(np.nanmean(fc.to_numpy(float), axis=1))) * H if len(fc) else 0.0
+    all12 = float(last12.fillna(0.0).to_numpy().sum())
+    skipped12 = float(last12.drop(index=list(forecast_asins)).fillna(0.0).to_numpy().sum())
+    return {"ratio": forecast_total / pace if pace else float("nan"),
+            "ratio_all_asins": forecast_total / (all12 * H / 12) if all12 else float("nan"),
+            "skipped_sales_share": skipped12 / all12 if all12 else float("nan")}
+
+
 def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | None = None,
                              adjustments: pd.DataFrame | None = None) -> LiveForecast:
     target, H, mh = s["target"], int(s["horizon"]), int(s["min_history"])
@@ -434,11 +456,28 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
     po_default = not bool((np.isfinite(po_hist) & (po_hist > 0)).any())
     ratios_default = am is None or am.empty or not bool((am["am_mean"] > 0).any())
 
-    def demand_codes(asin: str, ad) -> list[set]:
+    # young products: under min_history months of sales (so no seasonal forecast of their own) but at least
+    # young_min_months and some sales. They are added to the loop below; nothing above changes for anyone.
+    young_min = int(s.get("young_min_months", 3))
+    S = sales_w.to_numpy(float)
+    history = pd.Series((~np.isnan(S)).sum(axis=1), index=sales_w.index)
+    sold = pd.Series(np.nansum(S, axis=1), index=sales_w.index)
+    short = [a for a in sales_w.index if a not in own_by]
+    young = [a for a in short if sold[a] > 0 and history[a] >= young_min]
+    recent3 = {a: float(np.nanmean(S[sales_w.index.get_loc(a), -3:])) for a in young}
+
+    def demand_codes(asin: str, ad, young_stock: bool | None = None) -> list[set]:
+        """young_stock is None for a standard ASIN; for a young one, whether its stock is known."""
         a_rows = am_rows.get(asin, {})
         out = []
         for h in range(H):
-            if a_rows.get(future[h]) is not None and w_amazon > 0:
+            has_am = a_rows.get(future[h]) is not None and w_amazon > 0
+            if young_stock is not None:
+                if has_am and young_stock:
+                    c = {"DEMAND_AMAZON_FORECAST"}
+                else:
+                    c = {"DEMAND_RECENT_AVERAGE"} | ({"AMAZON_RATIOS_DEFAULT"} if ratios_default else set())
+            elif has_am:
                 c = {"DEMAND_AMAZON_BLEND"}
             else:
                 c = {"DEMAND_OWN_NO_AMAZON" if w_amazon > 0 else "DEMAND_OWN_AMAZON_OFF"}
@@ -447,7 +486,7 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
                 c |= {"DEMAND_OVERRIDE"} | ({"AMAZON_RATIOS_DEFAULT"} if ratios_default else set())
             if ad.demand_mult[h] != 1.0:
                 c.add("DEMAND_MULTIPLIER")
-            if flat_season:
+            if flat_season and young_stock is None:
                 c.add("SEASONALITY_FLAT")
             out.append(c)
         return out
@@ -464,21 +503,36 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
             c.add("HABIT_OVERRIDE")
         return c
 
+    def adjust_demand(dem: np.ndarray, ad) -> np.ndarray:
+        for h in range(H):
+            if ad.demand_set[h] is not None:
+                dem[:, h] = (ad.demand_set[h], ad.demand_set[h] * ratios[0], ad.demand_set[h] * ratios[1])
+            dem[:, h] *= ad.demand_mult[h]
+        return dem
+
+    def position(asin: str, ad) -> tuple[float, float]:
+        stock0, po = _starting_position(stock_w.loc[asin].to_numpy(float), po_w.loc[asin].to_numpy(float), t)
+        stock0 = ad.stock if ad.stock is not None else stock0
+        po = ad.open_po if ad.open_po is not None else po
+        return stock0, po
+
     def run(adj_df: pd.DataFrame) -> pd.DataFrame:
         rows = []
-        for asin, o in own_by.items():
+        for asin in list(own_by) + young:
             ad = adjmod.for_asin(adj_df, asin, future)
-            dem = demand_scenarios(o, am_rows.get(asin, {}), future, w_amazon, ratios)
-            for h in range(H):
-                if ad.demand_set[h] is not None:
-                    dem[:, h] = (ad.demand_set[h], ad.demand_set[h] * ratios[0], ad.demand_set[h] * ratios[1])
-                dem[:, h] *= ad.demand_mult[h]
+            is_young = asin not in own_by
+            if not is_young:
+                dem = adjust_demand(demand_scenarios(own_by[asin], am_rows.get(asin, {}), future, w_amazon, ratios), ad)
+                stock0, po = position(asin, ad)
+            else:
+                # Amazon's forecast only where the stock replay turns it into orders; with stock unknown the orders
+                # would simply equal demand, so the young product follows its own recent sales instead
+                stock0, po = position(asin, ad)
+                am_young = am_rows.get(asin, {}) if (w_amazon > 0 and not np.isnan(stock0)) else {}
+                dem = adjust_demand(demand_scenarios(np.full(H, recent3[asin]), am_young, future, 1.0, ratios), ad)
             hab = habits[asin]
             cover = ad.cover if ad.cover is not None else hab.cover
             lot = ad.lot if ad.lot is not None else hab.lot
-            stock0, po = _starting_position(stock_w.loc[asin].to_numpy(float), po_w.loc[asin].to_numpy(float), t)
-            stock0 = ad.stock if ad.stock is not None else stock0
-            po = ad.open_po if ad.open_po is not None else po
             pinned = np.array(ad.pinned)
             explain: list = []
             if np.isnan(stock0):
@@ -497,10 +551,13 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
                         new = np.r_[np.zeros(min(ad.delay, H)), new[: max(H - ad.delay, 0)]]
                     tot.append(known + new)
             chance = np.mean([x > 1e-9 for x in tot], axis=0) if basis == "replay" else np.full(H, np.nan)
-            codes = _row_codes(basis, tot, explain, ad, pinned, demand_codes(asin, ad),
+            codes = _row_codes(basis, tot, explain, ad, pinned,
+                               demand_codes(asin, ad, (not np.isnan(stock0)) if is_young else None),
                                habit_codes(asin, ad) if basis == "replay" else set(), po_default)
             for h in range(H):
                 primary, rest = codes[h]
+                if is_young:
+                    primary, rest = "YOUNG_PRODUCT_BACKUP", rest | {primary}
                 rows.append((asin, future[h], float(tot[0][h]), float(tot[1][h]), float(tot[2][h]), float(chance[h]),
                              basis, "; ".join(ad.notes), primary, detail(primary, rest), confidence(rest | {primary})))
         return pd.DataFrame(rows, columns=["asin", "month_start", "units_forecast", "units_p80", "units_upper",
@@ -513,16 +570,17 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
     stats["replayed"] = int((per_asin == "replay").sum())
     stats["no_stock_reading"] = int((per_asin == "sales_only").sum())
     stats["with_adjustments"] = int(table.loc[table["adjustments"] != "", "asin"].nunique())
-    stats["amazon_months"] = int(sum(len(v) for a, v in am_rows.items() if a in own_by))
+    forecast_asins = list(own_by) + young
+    stats["amazon_months"] = int(sum(len(v) for a, v in am_rows.items() if a in set(forecast_asins)))
     for c in ("units_forecast", "units_p80", "units_upper"):
         table[c] = table[c].clip(lower=0.0).round(2)
     table["order_chance"] = table["order_chance"].round(2)
     table = table.sort_values(["asin", "month_start"]).reset_index(drop=True)
-    last12 = float(sales_w.iloc[:, -12:].fillna(0.0).to_numpy().sum())
-    ratio = float(table["units_forecast"].sum() / (last12 * H / 12)) if last12 else float("nan")
-    f = LiveForecast(table, "replenish", target, months[-1], H, int(len(sales_w) - len(own_by)), ratio)
-    f.extras = {"habits": habits_table({a: habits[a] for a in own_by}), "stats": stats,
-                "scenario_ratios": ratios, "amazon_used": am is not None, "po_share": po_share}
+    sanity = sanity_ratios(sales_w, forecast_asins, float(table["units_forecast"].sum()), H)
+    f = LiveForecast(table, "replenish", target, months[-1], H, int(len(sales_w) - len(forecast_asins)), sanity["ratio"])
+    f.extras = {"habits": habits_table({a: habits[a] for a in forecast_asins}), "stats": stats,
+                "scenario_ratios": ratios, "amazon_used": am is not None, "po_share": po_share, "sanity": sanity,
+                "young": list(young)}
     if unadjusted is not None:
         for c in ("units_forecast", "units_p80", "units_upper"):
             unadjusted[c] = unadjusted[c].clip(lower=0.0).round(2)
