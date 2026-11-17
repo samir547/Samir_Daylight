@@ -16,6 +16,7 @@ import pandas as pd
 
 from .backtest import forecast_series
 from .baselines import METHODS
+from .errors import ConfigError
 from .seasonal import VARIANTS, forecast_seasonal
 from .series import to_wide
 from .snapshot import Snapshot
@@ -30,21 +31,37 @@ DEFAULTS = {"method": "seasonal_half", "open_po_tweak": True, "target": "ordered
 
 
 def load_settings(path: Path | None = None) -> dict:
+    """Shared defaults, overridden by the settings file. A settings file that was named but is missing or is not
+    valid JSON is a configuration error (exit 2): running on the defaults instead would quietly use another method.
+    Without a path, the default file is used if it exists."""
     s = dict(DEFAULTS)
     p = Path(path) if path else SETTINGS_PATH
+    if path and not p.exists():
+        raise ConfigError(f"Settings file {path} not found.")
     if p.exists():
-        s.update(json.loads(p.read_text(encoding="utf-8")))
+        try:
+            s.update(json.loads(p.read_text(encoding="utf-8")))
+        except ValueError as e:
+            raise ConfigError(f"Settings file {p} is not valid JSON: {e}") from None
     _check_method(s["method"])
+    _check_demand_method(s.get("demand_method"))
     for pool, over in (s.get("pools") or {}).items():
         if "method" in over:
             _check_method(over["method"])
+        if "demand_method" in over:
+            _check_demand_method(over["demand_method"])
     return s
 
 
 def _check_method(name: str) -> None:
     known = set(METHODS) | set(VARIANTS) | {"replenish"}
     if name not in known:
-        raise SystemExit(f"Unknown method '{name}' in settings. Choose one of: {', '.join(sorted(known))}")
+        raise ConfigError(f"Unknown method '{name}' in settings. Choose one of: {', '.join(sorted(known))}")
+
+
+def _check_demand_method(name) -> None:
+    if name is not None and name not in VARIANTS:
+        raise ConfigError(f"Unknown demand_method '{name}' in settings. Choose one of: {', '.join(sorted(VARIANTS))}")
 
 
 def settings_for_pool(s: dict, pool: str) -> dict:

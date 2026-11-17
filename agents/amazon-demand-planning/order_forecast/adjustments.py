@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .errors import ConfigError
+
 TYPES = {"demand_multiplier", "demand_override", "pinned_order", "stock_override", "open_po_override",
          "cover_override", "lot_override", "discontinue", "delay_orders"}
 NEEDS_VALUE = TYPES - {"discontinue"}
@@ -71,7 +73,7 @@ def load_adjustments(path: Path | str | None, marketplace: str, first_forecast_m
         if t in ("demand_multiplier",) and (_num(r["value"]) or 0) < 0:
             problems.append(f"line {line}: demand_multiplier cannot be negative")
     if problems:
-        raise SystemExit(f"Adjustments file {path} has problems:\n  " + "\n  ".join(problems))
+        raise ConfigError(f"Adjustments file {path} has problems:\n  " + "\n  ".join(problems))
     df["asin"] = df["asin"].str.strip()
     df["type"] = df["type"].str.strip()
     df["value"] = df["value"].map(_num)

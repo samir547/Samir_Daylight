@@ -8,6 +8,7 @@ import pandas as pd
 
 from . import db
 from .accounts import accounts_for_pool
+from .errors import ConfigError
 from .invoices import aggregate_invoices
 from .snapshot import save_snapshot
 
@@ -39,7 +40,7 @@ def _frame(cols, rows) -> pd.DataFrame:
 
 def pull_snapshot(pool: str, out_root: Path, accounts_path=None, include_pending: bool = False) -> Path:
     if pool not in POOL_MARKETPLACES:
-        raise SystemExit(f"Pool {pool} is not supported yet (supported: {', '.join(POOL_MARKETPLACES)}).")
+        raise ConfigError(f"Pool {pool} is not supported (supported: {', '.join(POOL_MARKETPLACES)}).")
     marketplace = POOL_MARKETPLACES[pool][0]
     statuses = ("in", "pending") if include_pending else ("in",)
     kw = {"path": accounts_path} if accounts_path else {}

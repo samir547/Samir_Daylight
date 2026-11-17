@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .errors import EXIT_CANNOT_RUN, ConfigError
 from .pull import POOL_MARKETPLACES
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,10 +24,20 @@ def _load_default_env(explicit=None) -> None:
     if path.exists():
         load_env_file(path)
     elif explicit:
-        raise SystemExit(f"--env-file {explicit} not found")
+        raise ConfigError(f"--env-file {explicit} not found")
 
 
 def main(argv=None) -> int:
+    """Run one command. A configuration error (unsupported pool, unknown method, missing settings file, bad
+    adjustments file) prints CANNOT RUN and returns 2, which scripts/run_monthly.sh does not retry."""
+    try:
+        return _main(argv)
+    except ConfigError as e:
+        print(f"CANNOT RUN: {e}")
+        return EXIT_CANNOT_RUN
+
+
+def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="order_forecast")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pull", help="read-only pull of sales, inventory and invoices into a snapshot")
@@ -217,7 +228,7 @@ def main(argv=None) -> int:
     return 0
 
 
-EXIT_OK, EXIT_FAILED, EXIT_CANNOT_RUN, EXIT_DATA_NOT_READY, EXIT_SANITY = 0, 1, 2, 3, 4
+EXIT_OK, EXIT_FAILED, EXIT_DATA_NOT_READY, EXIT_SANITY = 0, 1, 3, 4      # EXIT_CANNOT_RUN = 2 (errors.py)
 
 
 def _write_live_csv(f, pool: str, out_root: str) -> Path:
@@ -281,7 +292,7 @@ def _forecast_and_maybe_load(a) -> int:
                 u = f.extras["unadjusted"]
                 print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
         return EXIT_OK
-    except SystemExit:
+    except SystemExit:            # ConfigError included: main() turns it into exit code 2
         raise
     except RuntimeError as e:        # missing settings or credentials
         print(f"CANNOT RUN: {e}")
