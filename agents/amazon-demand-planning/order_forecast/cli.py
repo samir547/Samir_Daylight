@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from .pull import POOL_MARKETPLACES
+
 ROOT = Path(__file__).resolve().parent.parent
+POOLS = sorted(POOL_MARKETPLACES)
 
 
 def _load_default_env(explicit=None) -> None:
@@ -27,7 +30,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="order_forecast")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pull", help="read-only pull of sales, inventory and invoices into a snapshot")
-    p.add_argument("--pool", required=True, choices=["US", "UK"])
+    p.add_argument("--pool", required=True, choices=POOLS)
     p.add_argument("--env-file")
     p.add_argument("--include-pending", action="store_true", help="also read accounts marked pending")
     p.add_argument("--out", default=str(ROOT / "snapshots"))
@@ -68,7 +71,7 @@ def main(argv=None) -> int:
     fc.add_argument("--settings", help="settings JSON (default config/forecast_settings.json)")
     fc.add_argument("--out", default=str(ROOT / "results" / "live"))
     rc = sub.add_parser("run-cycle", help="pull, forecast and load into the database: the monthly job")
-    rc.add_argument("--pool", required=True, choices=["US", "UK"])
+    rc.add_argument("--pool", required=True, choices=POOLS)
     rc.add_argument("--no-load", action="store_true", help="do everything except write to the database")
     rc.add_argument("--allow-stale", action="store_true", help="run even if the last closed month is not loaded yet")
     rc.add_argument("--force", action="store_true", help="load even if the sanity check fails")

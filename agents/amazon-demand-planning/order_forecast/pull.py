@@ -11,7 +11,10 @@ from .accounts import accounts_for_pool
 from .invoices import aggregate_invoices
 from .snapshot import save_snapshot
 
-POOL_MARKETPLACES = {"US": ["US"], "UK": ["UK"]}   # EU needs a (marketplace, asin) key: not built yet
+# One marketplace per pool: every EU country is forecast on its own (no pooling across countries).
+# FR and IT share stock with the other EU countries (docs/phase1-data-check.md); pooling is an open decision.
+# The CLI --pool choices are taken from these keys, so this is the one list to extend.
+POOL_MARKETPLACES = {"US": ["US"], "UK": ["UK"], "DE": ["DE"], "ES": ["ES"], "FR": ["FR"], "IT": ["IT"]}
 
 SALES_SQL = """SELECT asin, period_start, ordered_units, shipped_units
 FROM dbo.amazon_vendor_sales
@@ -45,8 +48,10 @@ def pull_snapshot(pool: str, out_root: Path, accounts_path=None, include_pending
     try:
         sales = _frame(*db.fetch(conn, SALES_SQL, (marketplace,)))
         inventory = _frame(*db.fetch(conn, INVENTORY_SQL, (marketplace,)))
-        ph = ",".join("?" * len(accounts))
-        _, raw = db.fetch(conn, INVOICE_SQL.format(placeholders=ph), tuple(accounts))
+        raw = []
+        if accounts:      # no accounts for the pool: no invoice answer key ("IN ()" would be invalid SQL)
+            ph = ",".join("?" * len(accounts))
+            _, raw = db.fetch(conn, INVOICE_SQL.format(placeholders=ph), tuple(accounts))
     finally:
         conn.close()
     invoices, stats = aggregate_invoices(raw, accounts)

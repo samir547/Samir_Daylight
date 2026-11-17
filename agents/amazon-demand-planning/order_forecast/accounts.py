@@ -8,6 +8,12 @@ status: in       used for modelling
         pending  waiting for a business decision; excluded unless asked for
         out      out of scope (AU, no Vendor Central data)
         excluded provisions, intercompany, or not Amazon
+
+pool: one modelling pool per marketplace (US, UK, DE, ES, FR, IT); each EU country is forecast on its own.
+The pool only chooses which invoices are read into a snapshot (the invoice answer key for back-tests);
+invoices are never a model input, so the pool does not change any forecast value.
+EU caveat: the French account (AMAZ92110) also invoices ES and IT shipments, and the German accounts
+cover PL/CZ shipments, so invoice back-tests per EU country are unreliable.
 """
 from __future__ import annotations
 
@@ -33,6 +39,6 @@ def load_accounts(path: Path | str = DEFAULT_PATH) -> list[dict]:
 
 
 def accounts_for_pool(pool: str, statuses=("in",), path: Path | str = DEFAULT_PATH) -> dict[str, str]:
-    """customer_no -> billing marketplace, for one modelling pool (US, UK, EU)."""
+    """customer_no -> billing marketplace, for one modelling pool (US, UK, DE, ES, FR, IT)."""
     return {r["customer_no"]: r["marketplace"]
             for r in load_accounts(path) if r["pool"] == pool and r["status"] in statuses}
