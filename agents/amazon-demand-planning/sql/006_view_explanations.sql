@@ -10,8 +10,10 @@
 -- Note: once this is applied, `init-db` skips 002 (it checks whether the view
 -- already has reason_code), so it no longer narrows the view back.
 -- Note: is_latest still picks the newest run per marketplace whatever the
--- method. When adjustments exist, the replenish_unadjusted run loads last and
--- takes the flag, so filter on method = 'replenish' in Power BI as well.
+-- method. When adjustments exist the loader stores replenish_unadjusted FIRST
+-- and the main replenish run last, so the main run holds the flag. A run of
+-- another method loaded later by hand would take it: then also filter on
+-- method = 'replenish'.
 -- ============================================================================
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;

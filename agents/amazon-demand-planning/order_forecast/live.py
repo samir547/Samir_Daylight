@@ -48,7 +48,10 @@ def load_settings(path: Path | None = None) -> dict:
             raise ConfigError(f"Settings file {p} is not valid JSON: {e}") from None
     _check_method(s["method"])
     _check_demand_method(s.get("demand_method"))
-    for pool, over in (s.get("pools") or {}).items():
+    pools = s.get("pools") or {}
+    if not isinstance(pools, dict) or not all(isinstance(v, dict) for v in pools.values()):
+        raise ConfigError(f'"pools" in {p} must look like {{"ES": {{"young_min_months": 2}}}}')
+    for pool, over in pools.items():
         if "method" in over:
             _check_method(over["method"])
         if "demand_method" in over:

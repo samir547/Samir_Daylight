@@ -7,8 +7,9 @@ Once a month, for each marketplace separately (US, UK, DE, ES, FR, IT; the EU co
 reads Amazon's sales, stock and weekly forecast from the database, forecasts the units Amazon will order over
 the next 6 months for each ASIN with the `replenish` method, and writes the result to
 `dbo.amazon_order_forecast`. Power BI reads the view `dbo.vw_amazon_order_forecast_sku` (filter
-`is_latest = 1` **and** `method = 'replenish'`: when client adjustments exist, a `replenish_unadjusted` run is
-loaded after the main one and would otherwise take the latest flag).
+`is_latest = 1`). When client adjustments exist, a `replenish_unadjusted` run is stored too; it is loaded before
+the main `replenish` run, so the main run is the newest and holds `is_latest`. A run of another method loaded
+later by hand (for example a seasonal test) would take the flag: then also filter `method = 'replenish'`.
 It never changes sales, inventory, invoices or the SKU map: it only reads them.
 
 ## One-time setup on the VM
@@ -25,7 +26,8 @@ It never changes sales, inventory, invoices or the SKU map: it only reads them.
 5. Test everything except the database write:
    `NO_LOAD=1 POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh`
    then read `logs/monthly_DE_<yyyymm>.log`.
-6. First real run: `./scripts/run_monthly.sh`. Check the log ends with `=== done`, then check Power BI or run
+6. First real run, one market: `POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh`.
+   Check the log ends with `=== done`, then check Power BI or run
    `SELECT TOP 20 * FROM dbo.vw_amazon_order_forecast_sku WHERE is_latest = 1`.
 
 ## Scheduling
@@ -52,11 +54,12 @@ the monthly data was not loaded in time: check the ingest) and run it by hand:
 |---|---|---|
 | 0 | Loaded, or already loaded this month | Nothing |
 | 1 | Failed twice (database or network), or another market held the lock | Read the log, fix, re-run by hand |
-| 2 | Could not run: a configuration error (unsupported `POOL`, `SETTINGS` file missing, unknown method, bad adjustments file), password, or no `.venv`. Never retried | Read the `CANNOT RUN:` line, fix, re-run |
+| 2 | Could not run: a configuration error (unsupported `POOL`, `SETTINGS` file missing, unknown method, bad or unreadable adjustments file, malformed `pools`), missing `DB_*` credentials, or no `.venv`. Never retried. A wrong password is exit 1 | Read the `CANNOT RUN:` line, fix, re-run |
 | 3 | Last closed month is not in the database yet | Nothing: it tries again tomorrow. If it persists, check the amazon-sp-api-ingest job |
 | 4 | Sanity check refused to load (forecast far from the recent pace of the same ASINs) | Read the `Explain:` lines first. Only then override by hand with `.venv/bin/python -m order_forecast run-cycle --pool DE --settings config/forecast_settings.replenish.json --force` |
 
-To re-run a month that already loaded: `FORCE_RERUN=1 ./scripts/run_monthly.sh`. A re-run replaces that month's
+To re-run a month that already loaded:
+`FORCE_RERUN=1 POOL=<POOL> SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh`. A re-run replaces that month's
 forecast; it never leaves two.
 
 ## Reading a run

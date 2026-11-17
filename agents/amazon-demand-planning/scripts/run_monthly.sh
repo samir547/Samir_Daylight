@@ -25,8 +25,6 @@ LOG="logs/monthly_${POOL}_${MONTH}.log"
 DONE="logs/.done_${POOL}_${MONTH}"
 EXTRA=""
 [ "${NO_LOAD:-0}" = "1" ] && EXTRA="--no-load"
-SETTINGS_ARG=""
-[ -n "${SETTINGS:-}" ] && SETTINGS_ARG="--settings $SETTINGS"
 
 log() { echo "$(date -u -Is) $*" >> "$LOG"; }
 
@@ -43,7 +41,7 @@ fi
 
 for attempt in 1 2; do
   log "=== attempt $attempt of 2 (pool $POOL, settings ${SETTINGS:-default})"
-  timeout 2h "$PY" -m order_forecast run-cycle --pool "$POOL" $SETTINGS_ARG $EXTRA >> "$LOG" 2>&1
+  timeout 2h "$PY" -m order_forecast run-cycle --pool "$POOL" ${SETTINGS:+--settings "$SETTINGS"} $EXTRA >> "$LOG" 2>&1
   rc=$?
   log "run-cycle exit code $rc"
   case "$rc" in

@@ -49,7 +49,13 @@ def load_adjustments(path: Path | str | None, marketplace: str, first_forecast_m
     A bad row stops the run with a message naming the row, so a typo is never silently ignored."""
     if not path or not Path(path).exists():
         return empty()
-    raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+    try:
+        raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except (UnicodeDecodeError, ValueError, pd.errors.ParserError) as e:     # EmptyDataError is a ValueError
+        raise ConfigError(f"Adjustments file {path} cannot be read: {type(e).__name__}: {e}") from None
+    missing = [c for c in ("asin", "type") if c not in raw.columns]
+    if missing:                       # a broken header would otherwise drop every row without a word
+        raise ConfigError(f"Adjustments file {path} has no {' or '.join(missing)} column; header is {list(raw.columns)}")
     for c in COLUMNS:
         if c not in raw.columns:
             raw[c] = ""

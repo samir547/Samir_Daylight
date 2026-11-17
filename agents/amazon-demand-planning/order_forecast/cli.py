@@ -321,11 +321,11 @@ def _forecast_and_maybe_load(a) -> int:
         if a.cmd == "run-cycle" and not a.no_load:
             from .store import load_forecast
             marketplace = snap.manifest.get("marketplace", snap.pool)
+            if "unadjusted" in f.extras:      # keep the no-adjustments forecast beside it, so the effect of the notes is visible
+                u = f.extras["unadjusted"]      # loaded FIRST: the view's is_latest takes the newest run per marketplace
+                print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
             run_id = load_forecast(f, marketplace, snapshot_ref=snap_dir.name)
             print(f"Loaded run {run_id} into dbo.amazon_order_forecast ({len(f.table)} rows).")
-            if "unadjusted" in f.extras:      # keep the no-adjustments forecast beside it, so the effect of the notes is visible
-                u = f.extras["unadjusted"]
-                print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
         return EXIT_OK
     except SystemExit:            # ConfigError included: main() turns it into exit code 2
         raise
