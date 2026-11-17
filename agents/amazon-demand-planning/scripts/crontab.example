@@ -1,13 +1,21 @@
 # Lines to add to the VM's crontab (crontab -e). Do NOT replace the existing entries: the amazon-sp-api-ingest
 # weekly jobs (Thursday 06:00 and 07:00 UTC) live in the same crontab.
 #
-# The VM runs in UTC. These run at 10:00 UTC on days 6 to 12 of each month. The first Thursday ingest
-# (day 1 to 7) loads the previous month, so by day 6 the month is normally there. The script does nothing
-# more once the month has loaded, and exits quietly if the month is not in the database yet, so a late month
-# just means it tries again the next day. If nothing has loaded by day 12 there is no retry until next month:
-# check logs/.done_US_<yyyymm> exists on day 13, or look at "forecast as of" in Power BI.
+# The VM runs in UTC. Each market runs on days 6 to 12 of each month. The ingest asks Amazon for the previous
+# month only after day 5, so the closed month normally arrives with the first Thursday ingest that falls on days
+# 6 to 12. Until it is in the database the script exits quietly (code 3) and the next day tries again; once the
+# month has loaded it does nothing more for that market. If a market has not loaded by day 12 there is no retry
+# until next month: on day 13 check that logs/.done_<POOL>_<yyyymm> exists for every market (docs/runbook.md).
+#
+# One market per line, one hour apart, because run_monthly.sh holds a single lock for all markets: a market that
+# finds the lock held exits 1 and only tries again the next day.
+# Every line passes SETTINGS so the scheduled job runs the replenish method (without it the script would use
+# config/forecast_settings.json, the older seasonal method).
 #
 # Adjust the folder if the repository is cloned somewhere else.
-0 10 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && ./scripts/run_monthly.sh >> logs/cron.log 2>&1
-# UK runs an hour later because the script holds one lock for both pools.
-0 11 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=UK ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 10 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=US SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 11 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=UK SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 12 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 13 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=ES SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 14 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=FR SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+0 15 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=IT SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1

@@ -93,3 +93,14 @@ def test_script_success_marks_the_pool_month_done(tmp_path):
     rc, log, root = _run(tmp_path, 0, {"SETTINGS": "config/s.json"})
     assert rc == 0 and "settings config/s.json" in log
     assert len(list((root / "logs").glob(".done_DE_*"))) == 1
+
+
+def test_crontab_example_runs_every_pool_with_replenish_settings_an_hour_apart():
+    lines = [ln for ln in (SCRIPT.parent / "crontab.example").read_text().splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    pools = [ln.split("POOL=")[1].split()[0] for ln in lines]
+    assert sorted(pools) == sorted(pull.POOL_MARKETPLACES)
+    assert all("SETTINGS=config/forecast_settings.replenish.json" in ln for ln in lines)
+    hours = [int(ln.split()[1]) for ln in lines]
+    assert len(set(hours)) == len(hours) and all(ln.split()[2] == "6-12" for ln in lines)
+    assert (SCRIPT.parent.parent / "config" / "forecast_settings.replenish.json").exists()
