@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+from .errors import EXIT_CANNOT_RUN, ConfigError
+from .pull import POOL_MARKETPLACES
+
 ROOT = Path(__file__).resolve().parent.parent
+POOLS = sorted(POOL_MARKETPLACES)
 
 
 def _load_default_env(explicit=None) -> None:
@@ -20,14 +25,24 @@ def _load_default_env(explicit=None) -> None:
     if path.exists():
         load_env_file(path)
     elif explicit:
-        raise SystemExit(f"--env-file {explicit} not found")
+        raise ConfigError(f"--env-file {explicit} not found")
 
 
 def main(argv=None) -> int:
+    """Run one command. A configuration error (unsupported pool, unknown method, missing settings file, bad
+    adjustments file) prints CANNOT RUN and returns 2, which scripts/run_monthly.sh does not retry."""
+    try:
+        return _main(argv)
+    except ConfigError as e:
+        print(f"CANNOT RUN: {e}")
+        return EXIT_CANNOT_RUN
+
+
+def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="order_forecast")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pull", help="read-only pull of sales, inventory and invoices into a snapshot")
-    p.add_argument("--pool", required=True, choices=["US", "UK"])
+    p.add_argument("--pool", required=True, choices=POOLS)
     p.add_argument("--env-file")
     p.add_argument("--include-pending", action="store_true", help="also read accounts marked pending")
     p.add_argument("--out", default=str(ROOT / "snapshots"))
@@ -68,7 +83,7 @@ def main(argv=None) -> int:
     fc.add_argument("--settings", help="settings JSON (default config/forecast_settings.json)")
     fc.add_argument("--out", default=str(ROOT / "results" / "live"))
     rc = sub.add_parser("run-cycle", help="pull, forecast and load into the database: the monthly job")
-    rc.add_argument("--pool", required=True, choices=["US", "UK"])
+    rc.add_argument("--pool", required=True, choices=POOLS)
     rc.add_argument("--no-load", action="store_true", help="do everything except write to the database")
     rc.add_argument("--allow-stale", action="store_true", help="run even if the last closed month is not loaded yet")
     rc.add_argument("--force", action="store_true", help="load even if the sanity check fails")
@@ -214,10 +229,10 @@ def main(argv=None) -> int:
     return 0
 
 
-EXIT_OK, EXIT_FAILED, EXIT_CANNOT_RUN, EXIT_DATA_NOT_READY, EXIT_SANITY = 0, 1, 2, 3, 4
+EXIT_OK, EXIT_FAILED, EXIT_DATA_NOT_READY, EXIT_SANITY = 0, 1, 3, 4      # EXIT_CANNOT_RUN = 2 (errors.py)
 
 
-def _write_live_csv(f, pool: str, out_root: str) -> Path:
+def _write_live_csv(f, pool: str, out_root: str, snapshot_ref: str = "") -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     d = Path(out_root) / pool / stamp
     d.mkdir(parents=True, exist_ok=True)
@@ -228,7 +243,38 @@ def _write_live_csv(f, pool: str, out_root: str) -> Path:
     if "unadjusted" in f.extras:          # replenish: the same forecast without the client adjustments
         u = f.extras["unadjusted"]
         u.table.assign(method=u.method, target=u.target, train_end=u.train_end.date()).to_csv(d / "forecast_unadjusted.csv", index=False)
+    if "decisions" in f.extras:           # replenish: every ASIN seen, forecast or not, and why
+        f.extras["decisions"].to_csv(d / "asin_decisions.csv", index=False)
+    if "summary" in f.extras:             # replenish: the run in numbers
+        summary = {"pool": pool, "snapshot_ref": snapshot_ref or None, "written_at_utc": stamp, **f.extras["summary"]}
+        if "unadjusted" in f.extras and "summary" in f.extras["unadjusted"].extras:
+            summary["unadjusted"] = f.extras["unadjusted"].extras["summary"]
+        (d / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return path
+
+
+def _print_explanation(f, settings: dict) -> None:
+    """The key lines of the run summary, for the cron log."""
+    s = f.extras.get("summary")
+    if not s:
+        return
+    print(f"Explain: sales ASINs {s['asins_in_sales']}, forecast {s['asins_forecast']} "
+          f"({s['asins_forecast_standard']} standard + {s['young_product_backups']} young-product backups), "
+          f"skipped {s['skipped_short_history']} (under {s['young_min_months']} months) + {s['skipped_no_sales']} (no sales); "
+          f"without Amazon forecast {s['asins_without_amazon_forecast']}, sales-only (stock unknown) {s['sales_only_asins']}, "
+          f"default habits {s['default_habit_asins']}; not forecast: {s['amazon_only_dropped']} only in Amazon's forecast, "
+          f"{s['inventory_only_dropped']} only in inventory")
+    pct = lambda x: "n/a" if x is None else f"{x:.1%}"
+    num = lambda x: "n/a" if x is None else f"{x:.2f}"
+    print(f"Explain: seasonality {s['seasonality_mode']} ({s['market_months']} months of history); "
+          f"Amazon forecast {s['amazon_generation_date'] or 'none'}; sanity ratio {num(s['sanity_ratio'])} on the forecast "
+          f"ASINs (all ASINs {num(s['sanity_ratio_all_asins'])}; skipped ASINs' share of last-12-month sales "
+          f"{pct(s['skipped_sales_share'])}); adjustments file {'found' if s['adjustments_file_found'] else 'not found'}, "
+          f"{s['adjustment_rows']} rows for this market")
+    defaults = [n for n, k in (("cover", "habit_market_default_cover"), ("order size", "habit_market_default_lot"),
+                               ("open-PO share", "po_share_default"), ("P80/P90 uplift", "scenario_ratios_default")) if s[k]]
+    print(f"Explain: market-level defaults used: {', '.join(defaults) if defaults else 'none'}; "
+          f"reason codes {s['reason_codes']}; confidence {s['confidence_rows']}")
 
 
 def _forecast_and_maybe_load(a) -> int:
@@ -255,30 +301,33 @@ def _forecast_and_maybe_load(a) -> int:
             return EXIT_DATA_NOT_READY
         settings = settings_for_pool(settings, snap.pool)
         f = build_live_forecast(snap, settings)
+        skipped_rule = (f"under {settings.get('young_min_months', 3)} months of sales or no sales"
+                        if "summary" in f.extras else f"under {settings['min_history']} months")
         print(f"{snap.pool}: method {f.method}, target {f.target}, data to {f.train_end.date()}, "
-              f"{f.table['asin'].nunique()} ASINs forecast ({f.skipped_short} skipped: under {settings['min_history']} months), "
+              f"{f.table['asin'].nunique()} ASINs forecast ({f.skipped_short} skipped: {skipped_rule}), "
               f"{f.horizon} months, total {f.table['units_forecast'].sum():,.0f} units, sanity ratio {f.sanity_ratio:.2f}")
         if f.extras.get("stats"):
             print(f"Replenish: {f.extras['stats']}; Amazon forecast used: {f.extras['amazon_used']}; "
                   f"P80/P90 uplift when Amazon is missing: {f.extras['scenario_ratios'][0]:.2f}/{f.extras['scenario_ratios'][1]:.2f}; "
                   f"open orders received next month: {f.extras['po_share']:.0%}")
+        _print_explanation(f, settings)
         reason = sanity_check(f, settings)
         if reason and not getattr(a, "force", False):
             print(f"SANITY CHECK FAILED: {reason}. Nothing was written. Use --force only after checking the data.")
             return EXIT_SANITY
         out = _write_live_csv(f, snap.pool, getattr(a, "out", str(ROOT / "results" / "live")) if a.cmd == "forecast"
-                              else str(ROOT / "results" / "live"))
+                              else str(ROOT / "results" / "live"), snapshot_ref=snap_dir.name)
         print(f"Forecast CSV: {out}")
         if a.cmd == "run-cycle" and not a.no_load:
             from .store import load_forecast
             marketplace = snap.manifest.get("marketplace", snap.pool)
+            if "unadjusted" in f.extras:      # keep the no-adjustments forecast beside it, so the effect of the notes is visible
+                u = f.extras["unadjusted"]      # loaded FIRST: the view's is_latest takes the newest run per marketplace
+                print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
             run_id = load_forecast(f, marketplace, snapshot_ref=snap_dir.name)
             print(f"Loaded run {run_id} into dbo.amazon_order_forecast ({len(f.table)} rows).")
-            if "unadjusted" in f.extras:      # keep the no-adjustments forecast beside it, so the effect of the notes is visible
-                u = f.extras["unadjusted"]
-                print(f"Loaded run {load_forecast(u, marketplace, snapshot_ref=snap_dir.name)} ({u.method}).")
         return EXIT_OK
-    except SystemExit:
+    except SystemExit:            # ConfigError included: main() turns it into exit code 2
         raise
     except RuntimeError as e:        # missing settings or credentials
         print(f"CANNOT RUN: {e}")

@@ -30,24 +30,24 @@ AMAZCV5,UK,UK,in,"Tiny, 2019-2021; missing from CUSTOMERS so channel is NULL the
 30003,US,US,in,AMAZON (US)
 AMAZFB13,US,US,pending,US FBA; sits under the EU buyer; ~12 net units (decision 1)
 30115,CA,US,pending,Amazon Canada; ~56 net units to 2024-11; FTD counts it in the US bucket (decision 2)
-AMAZ81000,DE,EU,in,"Amazon EU SARL DE; ships to DE, PL, CZ (decision 3)"
-AMAZ44145,DE,EU,in,Small DE-billed account
-AMAZ55040,DE,EU,in,Small DE-billed account; ships to Poland only (decision 3)
-AMAZ47495,DE,EU,in,Small DE-billed account
-AMAZ66340,DE,EU,in,Small DE-billed account; ships to Poland only (decision 3)
-AMAZ75177,DE,EU,in,Small DE-billed account
-AMAZ92110,FR,EU,in,"Amazon EU SARL France; ships to FR, ES, IT (decision 4)"
-AMAZ20124,IT,EU,in,Amazon EU SARL Italy
-AMAZ13100,IT,EU,in,Small IT account
-AMAZ29015,IT,EU,in,Small IT account
-AMAZ27050,IT,EU,in,Small IT account; category 'Other' not 'AMAZ'
-AMAZ00034,IT,EU,in,Small IT account
-AMAZ10037,IT,EU,in,Small IT account
-AMAZ20074,IT,EU,in,Small IT account
-AMAZ45020,IT,EU,in,Small IT account
-AMAZ02032,IT,EU,in,Small IT account
-AMAZ24050,IT,EU,in,Small IT account
-AMAZ2804,ES,EU,in,Amazon EU S.a r.l Spain; first invoice 2026-01
+AMAZ81000,DE,DE,in,"Amazon EU SARL DE; ships to DE, PL, CZ (decision 3): DE invoices include PL/CZ, so a DE invoice back-test is unreliable"
+AMAZ44145,DE,DE,in,Small DE-billed account
+AMAZ55040,DE,DE,in,Small DE-billed account; ships to Poland only (decision 3)
+AMAZ47495,DE,DE,in,Small DE-billed account
+AMAZ66340,DE,DE,in,Small DE-billed account; ships to Poland only (decision 3)
+AMAZ75177,DE,DE,in,Small DE-billed account
+AMAZ92110,FR,FR,in,"Amazon EU SARL France; ships to FR, ES, IT (decision 4): FR invoices include ES/IT shipments, so FR/ES/IT invoice back-tests are unreliable"
+AMAZ20124,IT,IT,in,Amazon EU SARL Italy
+AMAZ13100,IT,IT,in,Small IT account
+AMAZ29015,IT,IT,in,Small IT account
+AMAZ27050,IT,IT,in,Small IT account; category 'Other' not 'AMAZ'
+AMAZ00034,IT,IT,in,Small IT account
+AMAZ10037,IT,IT,in,Small IT account
+AMAZ20074,IT,IT,in,Small IT account
+AMAZ45020,IT,IT,in,Small IT account
+AMAZ02032,IT,IT,in,Small IT account
+AMAZ24050,IT,IT,in,Small IT account
+AMAZ2804,ES,ES,in,Amazon EU S.a r.l Spain; first invoice 2026-01
 AMAZ2000,AU,AU,out,Australia: no Vendor Central data (decision 6)
 AMAZ2178_BWU2,AU,AU,out,Australia: no Vendor Central data (decision 6)
 AMAZ6105_PER4,AU,AU,out,Australia: no Vendor Central data (decision 6)

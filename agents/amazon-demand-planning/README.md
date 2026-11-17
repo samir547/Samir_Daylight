@@ -5,9 +5,26 @@ own data (sales, inventory, Amazon's forecast). Separate from the non-Amazon
 `demand-planning` agent. Out of scope: Daylight's stock, lead times, MOQs.
 Power BI is the interface for the plan.
 
-Status: **back-test harness for US and UK (baseline forecasters). Azure AutoML arm,
-storage and Power BI views are next.** Background and data findings:
+Status: **monthly forecast for six marketplaces, one at a time: US, UK, DE, ES, FR, IT**
+(method `replenish`, scheduled by `scripts/crontab.example`). Back-test harness, Azure AutoML arm and
+Power BI view as described below. Background and data findings:
 [docs/phase1-data-check.md](docs/phase1-data-check.md).
+
+## Markets: one forecast per country, no pooling
+
+Every marketplace is its own pool and its own run: `--pool US|UK|DE|ES|FR|IT`, one marketplace each
+(`order_forecast/pull.py`, `POOL_MARKETPLACES`, the one list the CLI choices come from). The EU countries
+are **not** pooled. Caveats:
+
+- **FR and IT share stock with the other EU countries.** The data check found FR receives about 0.51x what
+  it sells and IT about 2.76x ([docs/phase1-data-check.md](docs/phase1-data-check.md), finding 7). A
+  per-country stock replay cannot see stock moved between countries, so FR orders may read low and IT
+  orders high. **Whether to pool the EU is an open decision with the client.**
+- The invoice accounts per country (`config/amazon_accounts.csv`) only feed back-tests, never the forecast.
+  The French account also invoices ES and IT shipments and the German accounts cover PL/CZ, so invoice
+  back-tests per EU country are unreliable.
+- FR and IT have no SKU-map rows yet. The forecast does not need them (it never reads the map); Power BI
+  shows those rows as unmapped.
 
 ## Design: three layers that do not know about each other
 
@@ -34,8 +51,13 @@ since 2024 and the large earlier ones are bulk returns, not reversed orders).
 
 `replenish` predicts Amazon's orders by replaying its stock, open purchase orders and its own weekly forecast
 (mean, P80, P90), with client notes applied from `config/order_adjustments.csv`. Design, settings, back-test
-results and limits: [docs/replenish.md](docs/replenish.md). The live job still uses the method in
-`config/forecast_settings.json`.
+results and limits: [docs/replenish.md](docs/replenish.md). The schedule runs it for every market with
+`SETTINGS=config/forecast_settings.replenish.json`.
+
+Every run explains itself: each ASIN-month has a `reason_code`, `reason_detail` and `confidence`, and next
+to `forecast.csv` the run writes `asin_decisions.csv` (every ASIN seen, forecast or not, and why) and
+`run_summary.json` (the counts). Products with 3 to 11 months of sales get a low-confidence young-product
+backup instead of no forecast. See [docs/replenish.md](docs/replenish.md).
 
 ## Run it (PowerShell, from this folder)
 
@@ -44,7 +66,7 @@ python -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt pytest
 python -m pytest                                    # offline, no database
 
-# 1. read-only pull (SELECT only; use a read-only login if you have one)
+# 1. read-only pull (SELECT only; use a read-only login if you have one). Pools: US UK DE ES FR IT
 python -m order_forecast pull --pool US --env-file ..\amazon-sp-api-ingest\.env
 
 # 2. offline back-test on the snapshot it prints
@@ -58,9 +80,11 @@ Defaults: horizon 6, at least 24 months of training, non-overlapping windows
 
 ## Known limits
 
-- Only US and UK. The EU needs a (marketplace, ASIN) key and pooling; not built.
+- The EU countries are forecast separately, although FR and IT share stock with the rest of the EU
+  (see Markets above). Pooling is an open decision.
 - Two windows is a thin test. Treat differences of a few WAPE points as noise.
 - Marketplace-month results compare scored series with totals for all series, so bias reads low by the uncovered share (printed).
 - `pending` accounts (`AMAZFB13`, Canada `30115`) are excluded unless `--include-pending`.
 - Amazon's own forecast has one version only, so it cannot be back-tested yet.
-- The SQL in `sql/` has not been run.
+- `sql/005` and `sql/006` (explanation columns, ASIN status, run summary, view) are applied by hand;
+  until then the loader stores the forecast without them and logs a WARNING.
