@@ -54,7 +54,7 @@ Next to `forecast.csv` (and `habits.csv`) every run also writes:
 | `PINNED_ORDER` | a client-confirmed order arrives; no new order needed |
 | `OPEN_PO_DELIVERY` | open purchase orders arrive; no new order needed |
 | `NO_ORDER_DELAYED` | zero: the order due this month was moved later (`delay_orders`) |
-| `NO_ORDER_DISCONTINUED` | zero: an order was needed but `discontinue` blocks it |
+| `NO_ORDER_DISCONTINUED` | zero: an order was needed but `discontinue` blocks it (also a stock-unknown ASIN's month zeroed by `discontinue`; `SALES_ONLY_NO_STOCK` then moves to the detail) |
 | `NO_ORDER_STOCK_COVERS` | zero: stock and open orders cover expected sales |
 
 `reason_detail` adds any of: `DEMAND_AMAZON_BLEND` (Amazon's forecast blended with ours),
@@ -64,6 +64,7 @@ products), `DEMAND_OVERRIDE`, `DEMAND_MULTIPLIER`, `HABIT_OWN` / `HABIT_BLENDED`
 habits: the ASIN has no past orders), `HABIT_MARKET_DEFAULT` (the market itself has too little history, so the
 hard-coded cover 1 month / order size 3 months of sales), `HABIT_OVERRIDE`, `STOCK_OVERRIDE`,
 `OPEN_PO_OVERRIDE`, `OPEN_PO_DELIVERY` / `PINNED_ORDER` (also arriving in a reorder month), `ORDERS_DELAYED`,
+`DELAY_NOT_APPLIED_NO_STOCK` (`delay_orders` has no effect on a stock-unknown ASIN: only replayed orders move),
 `DISCONTINUED`, `CLIENT_ADJUSTED`, `HIGH_CASE_ORDER_ONLY` (no order in the likely case, but in P80/P90),
 `SEASONALITY_FLAT`, `PO_SHARE_DEFAULT` (no open orders in the history, so all are assumed to arrive next
 month), `AMAZON_RATIOS_DEFAULT` (no Amazon forecast at all, so the P80/P90 uplift is 1.25/1.6).

@@ -52,7 +52,8 @@ def scenarios(tmp_path_factory):
         "UK,R1,,cover_override,1.0,agreed,x,\n"
         "UK,R2,2026-12-01,discontinue,,delisted,x,\n"
         "UK,S1,2026-11-01,demand_override,50,promo ends,x,\n"
-        "UK,S1,2026-12-01,demand_multiplier,1.5,deal,x,\n")).table
+        "UK,S1,2026-12-01,demand_multiplier,1.5,deal,x,\n"
+        "UK,S1,,delay_orders,1,late,x,\n")).table
     out["delay"] = build_replenish_forecast(make_snap(), SETTINGS, weekly=None,
                                             adjustments=_adj(tmp, "UK,R1,,delay_orders,2,late,x,\n")).table
     out["amazon_off"] = build_replenish_forecast(make_snap(), {**SETTINGS, "amazon_weight": 0.0}, weekly=weekly("R1"),
@@ -145,3 +146,27 @@ def test_adjustments_with_eu_codes_and_blank_marketplace(tmp_path):
     assert sorted(de["note"]) == ["DE deal", "everywhere"]                 # its own row plus the blank-market row
     es = adj.load_adjustments(p, "ES", FUTURE[0])
     assert list(es["note"]) == ["everywhere"]                              # a blank marketplace applies to every market
+
+
+def test_stock_unknown_discontinue_and_delay_are_labelled_honestly(tmp_path):
+    a = _adj(tmp_path, "UK,S1,2026-10-01,delay_orders,2,late,x,\nUK,S1,2026-12-01,discontinue,,delisted,x,\n")
+    t = build_replenish_forecast(make_snap(), SETTINGS, weekly=None, adjustments=a).table
+    s1 = t[t.asin == "S1"].reset_index(drop=True)
+    assert list(s1.units_forecast) == [100.0, 100.0, 0.0, 0.0, 0.0, 0.0]       # delay ignored with stock unknown
+    assert list(s1.reason_code) == ["SALES_ONLY_NO_STOCK"] * 2 + ["NO_ORDER_DISCONTINUED"] * 4
+    assert s1.reason_detail[2:].str.contains("SALES_ONLY_NO_STOCK").all() and (s1.confidence == "LOW").all()
+    assert s1.reason_detail.str.contains("DELAY_NOT_APPLIED_NO_STOCK").all()
+    assert not s1.reason_detail.str.contains("ORDERS_DELAYED").any()
+
+
+def test_high_case_only_counts_a_p80_order_too():
+    from order_forecast.replenish import _row_codes, replay
+    ex = []
+    replay(np.full(6, 110.0), 250, 0, 1.0, 1000, min_order_share=0.25, explain=ex)
+    zeros = np.zeros(6)
+    p80 = np.array([0, 250.0, 0, 0, 0, 0])                                   # only the P80 replay orders in month 2
+    ad = adj.for_asin(adj.empty(), "X", FUTURE)
+    codes = _row_codes("replay", [zeros, p80, zeros], ex, ad, zeros, [set()] * 6, {"HABIT_OWN"}, False)
+    primary, rest = codes[1]
+    assert primary == "NO_ORDER_STOCK_COVERS" and "HIGH_CASE_ORDER_ONLY" in rest
+    assert "HIGH_CASE_ORDER_ONLY" not in codes[0][1]

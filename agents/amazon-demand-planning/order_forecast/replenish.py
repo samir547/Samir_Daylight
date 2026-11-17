@@ -52,7 +52,8 @@ SEASONAL_MIN_MONTHS = 24      # seasonal.seasonal_factors: under this many month
 
 # ---------------------------------------------------------------- reason codes
 # reason_code = the first of PRIMARY_CODES that applies to the ASIN-month (judged on the likely case, after
-# rounding). reason_detail = every code that applies, primary first, then in the order of REASON_CODES.
+# rounding), with one exception: a stock-unknown month set to zero by a discontinue is NO_ORDER_DISCONTINUED
+# (SALES_ONLY_NO_STOCK then moves to the detail, so the confidence stays LOW). reason_detail = every code that applies, primary first, then in the order of REASON_CODES.
 # The codes are a stable interface (CSV, database, Power BI): add new ones, never rename.
 
 REASON_CODES = {
@@ -66,7 +67,8 @@ REASON_CODES = {
     "PINNED_ORDER": "a client-confirmed order arrives this month (adjustment pinned_order); no new order needed",
     "OPEN_PO_DELIVERY": "open purchase orders arrive this month; no new order needed",
     "NO_ORDER_DELAYED": "zero: an order that was due this month was moved later (adjustment delay_orders)",
-    "NO_ORDER_DISCONTINUED": "zero: an order was needed but a discontinue adjustment blocks new orders",
+    "NO_ORDER_DISCONTINUED": "zero: an order was needed but a discontinue adjustment blocks new orders (also used for "
+                             "a stock-unknown ASIN, whose orders would otherwise follow expected sales)",
     "NO_ORDER_STOCK_COVERS": "zero: stock and open purchase orders cover expected sales",
     # detail only
     "DEMAND_AMAZON_BLEND": "expected sales: Amazon's forecast blended with ours (amazon_weight)",
@@ -86,6 +88,8 @@ REASON_CODES = {
     "STOCK_OVERRIDE": "starting stock set by a client adjustment",
     "OPEN_PO_OVERRIDE": "open purchase orders set by a client adjustment",
     "ORDERS_DELAYED": "this ASIN's orders are moved later by a client adjustment (delay_orders)",
+    "DELAY_NOT_APPLIED_NO_STOCK": "a delay_orders adjustment exists but has no effect: with stock unknown the orders "
+                                  "follow expected sales, and only replayed orders can be moved",
     "DISCONTINUED": "a client adjustment blocks new orders from this month",
     "CLIENT_ADJUSTED": "at least one client adjustment applies to this ASIN (see the adjustments column)",
     "HIGH_CASE_ORDER_ONLY": "no order in the likely case, but the high case (P80/P90) orders",
@@ -116,11 +120,12 @@ def detail(primary: str, codes) -> str:
     return "|".join([primary] + rest)
 
 
-def replay_month_codes(units: np.ndarray, upper: np.ndarray, explain: list, delay: int) -> list:
+def replay_month_codes(units: np.ndarray, high: np.ndarray, explain: list, delay: int) -> list:
     """(primary code, other codes) per month of a replayed ASIN, from the likely-case replay's `explain` records.
 
-    units/upper are the stored (rounded) likely and high case. New orders were shifted `delay` months later after
-    the replay, so the order that lands in month h was decided in month h - delay."""
+    units is the stored (rounded) likely case; high is the larger of the stored P80 and P90 cases (they are
+    replayed separately, so P80 can order in a month where P90 does not). New orders were shifted `delay` months
+    later after the replay, so the order that lands in month h was decided in month h - delay."""
     out = []
     for h, ex in enumerate(explain):
         src = h - delay
@@ -137,7 +142,7 @@ def replay_month_codes(units: np.ndarray, upper: np.ndarray, explain: list, dela
                 primary = "NO_ORDER_DISCONTINUED"
             else:
                 primary = "NO_ORDER_STOCK_COVERS"
-            if upper[h] > 0:
+            if high[h] > 0:
                 extra.add("HIGH_CASE_ORDER_ONLY")
         elif lands:
             primary = "REORDER_MIN_ORDER_SIZE" if explain[src]["floored"] else "REORDER_TRIGGERED"
@@ -369,7 +374,7 @@ def _row_codes(basis: str, tot: list, explain: list, ad, pinned: np.ndarray, dem
                po_default: bool) -> list:
     """(primary, all other codes) per month for one ASIN."""
     H = len(dem_codes)
-    units, upper = _stored(tot[0]), _stored(tot[2])
+    units, high = _stored(tot[0]), np.maximum(_stored(tot[1]), _stored(tot[2]))
     asin_codes = set()
     if ad.notes:
         asin_codes.add("CLIENT_ADJUSTED")
@@ -378,16 +383,21 @@ def _row_codes(basis: str, tot: list, explain: list, ad, pinned: np.ndarray, dem
     if ad.open_po is not None:
         asin_codes.add("OPEN_PO_OVERRIDE")
     if basis == "replay":
-        month = replay_month_codes(units, upper, explain, ad.delay)
+        month = replay_month_codes(units, high, explain, ad.delay)
         if ad.delay > 0:
             asin_codes.add("ORDERS_DELAYED")
     else:
+        if ad.delay > 0:
+            asin_codes.add("DELAY_NOT_APPLIED_NO_STOCK")
         month = []
         for h in range(H):
             extra = {"PINNED_ORDER"} if pinned[h] > 1e-9 else set()
-            if units[h] <= 0 and upper[h] > 0:
+            if units[h] <= 0 and high[h] > 0:
                 extra.add("HIGH_CASE_ORDER_ONLY")
-            month.append(("SALES_ONLY_NO_STOCK", extra))
+            if ad.stop_from is not None and h >= ad.stop_from and units[h] <= 0:
+                month.append(("NO_ORDER_DISCONTINUED", extra | {"SALES_ONLY_NO_STOCK"}))
+            else:
+                month.append(("SALES_ONLY_NO_STOCK", extra))
     out = []
     for h in range(H):
         primary, extra = month[h]
