@@ -399,6 +399,32 @@ def _row_codes(basis: str, tot: list, explain: list, ad, pinned: np.ndarray, dem
     return out
 
 
+DECISION_COLUMNS = ["asin", "status", "reason_code", "confidence", "basis", "habit_source", "months_of_history",
+                    "has_amazon_forecast", "has_stock_data", "amazon_months", "first_sales_month", "last12_units",
+                    "forecast_units"]
+ASIN_STATUSES = ("FORECAST", "SHORT_HISTORY", "NO_SALES", "AMAZON_FORECAST_ONLY", "INVENTORY_ONLY")
+CONFIDENCE_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+SUMMARY_SETTINGS = ("target", "horizon", "min_history", "young_min_months", "sanity_ratio_min", "sanity_ratio_max",
+                    "amazon_weight", "percentile_shrink", "min_order_share", "demand_method", "adjustments_file")
+
+
+def json_ready(x):
+    """Plain JSON values: numpy numbers to Python, NaN to None, dates to ISO strings."""
+    if isinstance(x, dict):
+        return {k: json_ready(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [json_ready(v) for v in x]
+    if isinstance(x, (pd.Timestamp,)):
+        return x.date().isoformat()
+    if isinstance(x, (np.bool_, bool)):
+        return bool(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (float, np.floating)):
+        return None if not np.isfinite(x) else round(float(x), 4)
+    return x
+
+
 def sanity_ratios(sales_w: pd.DataFrame, forecast_asins: list, forecast_total: float, H: int) -> dict:
     """The sanity check compares like with like: the forecast total against the recent pace of the SAME ASINs.
 
@@ -433,9 +459,11 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
             am_rows.setdefault(r.asin, {})[r.month_start] = (r.am_mean, r.am_p80, r.am_p90)
     ratios = pooled_ratios(am)
 
+    adj_found = False                    # for the run summary: was the adjustments file there
     if adjustments is None:
         path = s.get("adjustments_file")
         path = (ROOT_DIR / path) if path and not Path(path).is_absolute() else path
+        adj_found = bool(path and Path(path).exists())
         adjustments = adjmod.load_adjustments(path, marketplace, future[0])
 
     ext = sales_w.reindex(columns=months.append(future))
@@ -578,15 +606,90 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
     table = table.sort_values(["asin", "month_start"]).reset_index(drop=True)
     sanity = sanity_ratios(sales_w, forecast_asins, float(table["units_forecast"].sum()), H)
     f = LiveForecast(table, "replenish", target, months[-1], H, int(len(sales_w) - len(forecast_asins)), sanity["ratio"])
+
+    # ---- what the run did and did not do, per ASIN and in total (for asin_decisions.csv / run_summary.json)
+    gen = None
+    am_universe: set = set()
+    if weekly is not None and len(weekly):
+        g = pd.to_datetime(weekly["forecast_generation_date"])
+        gen = g.max()
+        am_universe = set(weekly.loc[g == gen, "asin"].astype(str).str.strip())
+    inv_universe = set(snap.inventory["asin"].astype(str).str.strip()) - {"ALL"}
+    stock_all = _wide_keep_empty(snap.inventory, "sellable_units", months)
+    has_stock = {a: not np.isnan(_last_known(stock_all.loc[a].to_numpy(float), t)) for a in stock_all.index}
+    am_months = {a: sum(1 for m in future if m in v) for a, v in am_rows.items()}
+    last12 = sales_w.iloc[:, -12:].fillna(0.0).sum(axis=1)
+    first_month = sales_w.apply(lambda r: r.first_valid_index(), axis=1)
+    young_set = set(young)
+    facts = dict(marketplace=marketplace, method="replenish", target=target, train_end=months[-1], horizon=H,
+                 first_forecast_month=future[0], market_months=len(months), min_history=mh, young_min_months=young_min,
+                 seasonality_mode="flat" if flat_season else "learned", po_share=po_share, po_share_default=po_default,
+                 scenario_ratios=list(ratios), scenario_ratios_default=ratios_default,
+                 habit_market_default_cover=hinfo["default_cover"], habit_market_default_lot=hinfo["default_lot"],
+                 amazon_forecast_used=bool(am is not None and not am.empty), amazon_generation_date=gen,
+                 adjustments_file=s.get("adjustments_file"), adjustments_file_found=adj_found,
+                 settings={k: s.get(k) for k in SUMMARY_SETTINGS})
+
+    def explain_run(tab: pd.DataFrame, adj_rows: int, san: dict) -> tuple[pd.DataFrame, dict]:
+        per = tab.groupby("asin").agg(basis=("basis", "first"), forecast_units=("units_forecast", "sum"),
+                                      confidence=("confidence", lambda c: min(c, key=CONFIDENCE_RANK.__getitem__)),
+                                      adjusted=("adjustments", lambda x: bool((x != "").any())))
+        rows = []
+        for a in sorted(set(sales_w.index) | am_universe | inv_universe):
+            in_sales = a in sales_w.index
+            r = dict(asin=a, months_of_history=int(history[a]) if in_sales else 0,
+                     has_amazon_forecast=am_months.get(a, 0) > 0, has_stock_data=bool(has_stock.get(a, False)),
+                     amazon_months=int(am_months.get(a, 0)),
+                     first_sales_month=first_month[a].date().isoformat() if in_sales and first_month[a] is not None else None,
+                     last12_units=round(float(last12[a]), 2) if in_sales else 0.0,
+                     basis=None, habit_source=None, confidence=None, forecast_units=None)
+            if a in per.index:
+                p_ = per.loc[a]
+                r.update(status="FORECAST", basis=p_["basis"], habit_source=habits[a].source, confidence=p_["confidence"],
+                         forecast_units=round(float(p_["forecast_units"]), 2),
+                         reason_code="YOUNG_PRODUCT_BACKUP" if a in young_set else
+                         ("SALES_ONLY_NO_STOCK" if p_["basis"] == "sales_only" else "REPLAY"))
+            elif in_sales:
+                r.update(status="NO_SALES" if sold[a] <= 0 else "SHORT_HISTORY")
+            else:
+                r.update(status="AMAZON_FORECAST_ONLY" if a in am_universe else "INVENTORY_ONLY")
+            r.setdefault("reason_code", r["status"])
+            rows.append(r)
+        dec = pd.DataFrame(rows, columns=DECISION_COLUMNS)
+        fc = dec[dec.status == "FORECAST"]
+        n = lambda mask: int(mask.sum())
+        summary = {**facts,
+                   "asins_in_sales": int(len(sales_w)), "asins_forecast": int(len(fc)),
+                   "asins_forecast_standard": n(fc.reason_code != "YOUNG_PRODUCT_BACKUP"),
+                   "young_product_backups": n(fc.reason_code == "YOUNG_PRODUCT_BACKUP"),
+                   "skipped_short_history": n(dec.status == "SHORT_HISTORY"), "skipped_no_sales": n(dec.status == "NO_SALES"),
+                   "asins_without_amazon_forecast": n(~fc.has_amazon_forecast),
+                   "amazon_only_dropped": n(dec.status == "AMAZON_FORECAST_ONLY"),
+                   "inventory_only_dropped": n(dec.status == "INVENTORY_ONLY"),
+                   "sales_only_asins": n(fc.basis == "sales_only"),
+                   "default_habit_asins": n((fc.basis == "replay") & (fc.habit_source == "pooled")),
+                   "asins_with_adjustments": int(per["adjusted"].sum()), "adjustment_rows": int(adj_rows),
+                   "sanity_ratio": san["ratio"], "sanity_ratio_all_asins": san["ratio_all_asins"],
+                   "skipped_sales_share": san["skipped_sales_share"],
+                   "units_forecast_total": round(float(tab["units_forecast"].sum()), 2),
+                   "reason_codes": {k: int(v) for k, v in tab["reason_code"].value_counts().items()},
+                   "confidence_rows": {k: int(v) for k, v in tab["confidence"].value_counts().items()}}
+        return dec, json_ready(summary)
+
+    dec, summary = explain_run(table, len(adjustments), sanity)
     f.extras = {"habits": habits_table({a: habits[a] for a in forecast_asins}), "stats": stats,
                 "scenario_ratios": ratios, "amazon_used": am is not None, "po_share": po_share, "sanity": sanity,
-                "young": list(young)}
+                "young": list(young), "decisions": dec, "summary": summary}
     if unadjusted is not None:
         for c in ("units_forecast", "units_p80", "units_upper"):
             unadjusted[c] = unadjusted[c].clip(lower=0.0).round(2)
         unadjusted["order_chance"] = unadjusted["order_chance"].round(2)
-        f.extras["unadjusted"] = replace(f, table=unadjusted.sort_values(["asin", "month_start"]).reset_index(drop=True),
-                                         method="replenish_unadjusted", extras={})
+        unadjusted = unadjusted.sort_values(["asin", "month_start"]).reset_index(drop=True)
+        u_san = sanity_ratios(sales_w, forecast_asins, float(unadjusted["units_forecast"].sum()), H)
+        u_dec, u_sum = explain_run(unadjusted, 0, u_san)
+        u_sum["method"] = "replenish_unadjusted"
+        f.extras["unadjusted"] = replace(f, table=unadjusted, method="replenish_unadjusted", sanity_ratio=u_san["ratio"],
+                                         extras={"decisions": u_dec, "summary": u_sum})
     return f
 
 

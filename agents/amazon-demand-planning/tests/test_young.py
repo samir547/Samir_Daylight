@@ -135,3 +135,67 @@ def test_sanity_ratio_uses_the_forecast_asins_on_both_sides():
     # on a market where every ASIN is forecast and mature, the matched ratio equals the old one
     g = build_replenish_forecast(make_snap(), SETTINGS, weekly=None, adjustments=adj.empty())
     assert g.extras["sanity"]["ratio"] == pytest.approx(g.extras["sanity"]["ratio_all_asins"])
+
+
+# ---- per-ASIN decisions and the run summary ------------------------------------------------------
+
+def explained():
+    s = young_snap()
+    inv = pd.concat([s.inventory, pd.DataFrame([dict(asin="I1", month_start=MONTHS[-1], net_received_units=0.0,
+                                                     sellable_units=5.0, open_po_units=0.0)])], ignore_index=True)
+    s = Snapshot(s.pool, s.sales, inv, s.invoices, s.manifest)
+    return build_replenish_forecast(s, SETTINGS, weekly=am_for("R1", "Y1", "AM"), adjustments=adj.empty())
+
+
+def test_every_asin_seen_gets_a_status_and_reason():
+    from order_forecast.replenish import ASIN_STATUSES, DECISION_COLUMNS
+    f = explained()
+    d = f.extras["decisions"].set_index("asin")
+    assert list(f.extras["decisions"].columns) == DECISION_COLUMNS
+    assert d["status"].isin(ASIN_STATUSES).all()
+    assert d.loc[["R1", "R2", "S1", "Y1", "Y2"], "status"].eq("FORECAST").all()
+    assert d.loc["Y1", "reason_code"] == "YOUNG_PRODUCT_BACKUP" and d.loc["Y1", "confidence"] == "LOW"
+    assert d.loc["S1", "reason_code"] == "SALES_ONLY_NO_STOCK" and d.loc["R1", "reason_code"] == "REPLAY"
+    assert d.loc["T2", "status"] == "SHORT_HISTORY" and d.loc["T2", "months_of_history"] == 2
+    assert d.loc["Z0", "status"] == "NO_SALES"
+    assert d.loc["AM", "status"] == "AMAZON_FORECAST_ONLY" and d.loc["AM", "has_amazon_forecast"]
+    assert d.loc["I1", "status"] == "INVENTORY_ONLY" and d.loc["I1", "has_stock_data"]
+    assert d.loc["R1", "has_amazon_forecast"] and not d.loc["R2", "has_amazon_forecast"]
+    assert not d.loc["S1", "has_stock_data"] and d.loc["R1", "has_stock_data"]
+    assert d.loc["R1", "months_of_history"] == 36 and d.loc["Y1", "months_of_history"] == 6
+    assert d.loc["R1", "forecast_units"] == pytest.approx(f.table[f.table.asin == "R1"].units_forecast.sum())
+
+
+def test_run_summary_counts_add_up_and_are_json_ready():
+    import json
+    s = explained().extras["summary"]
+    json.dumps(s)                                                         # plain JSON, no NaN
+    assert s["asins_in_sales"] == 7 and s["asins_forecast"] == 5 and s["young_product_backups"] == 2
+    assert s["asins_forecast_standard"] + s["young_product_backups"] == s["asins_forecast"]
+    assert s["asins_forecast"] + s["skipped_short_history"] + s["skipped_no_sales"] == s["asins_in_sales"]
+    assert (s["skipped_short_history"], s["skipped_no_sales"]) == (1, 1)
+    assert (s["amazon_only_dropped"], s["inventory_only_dropped"]) == (1, 1)
+    assert s["asins_without_amazon_forecast"] == 3                         # R2, S1, Y2
+    assert s["sales_only_asins"] == 2                                      # S1, Y2
+    assert s["seasonality_mode"] == "learned" and s["market_months"] == 36
+    assert s["sanity_ratio"] > 0 and s["sanity_ratio_all_asins"] > 0 and s["skipped_sales_share"] > 0
+    assert sum(s["reason_codes"].values()) == 5 * 6
+
+
+def test_forecast_command_writes_decisions_and_summary(tmp_path, capsys):
+    import json
+    from order_forecast.cli import main
+    from order_forecast.snapshot import save_snapshot
+    s = young_snap()
+    d = save_snapshot(tmp_path / "snap", "UK", s.sales, s.inventory, s.invoices, {"marketplace": "UK"})
+    cfg = tmp_path / "s.json"
+    cfg.write_text(json.dumps({"method": "replenish", "adjustments_file": None}))
+    assert main(["forecast", "--snapshot", str(d), "--settings", str(cfg), "--out", str(tmp_path / "out")]) == 0
+    out = capsys.readouterr().out
+    assert "Explain: sales ASINs 7, forecast 5 (3 standard + 2 young-product backups)" in out
+    run = next((tmp_path / "out" / "UK").iterdir())
+    assert {p.name for p in run.iterdir()} >= {"forecast.csv", "habits.csv", "asin_decisions.csv", "run_summary.json"}
+    summ = json.loads((run / "run_summary.json").read_text())
+    assert summ["pool"] == "UK" and summ["snapshot_ref"] == "snap" and summ["young_product_backups"] == 2
+    fc = pd.read_csv(run / "forecast.csv")
+    assert {"reason_code", "reason_detail", "confidence", "basis"} <= set(fc.columns)
