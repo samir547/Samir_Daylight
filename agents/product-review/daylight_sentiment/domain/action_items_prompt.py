@@ -9,23 +9,28 @@ import json
 from typing import Any, Dict, Sequence
 
 from daylight_sentiment.domain.action_items import (
+    ALL_SCOPE,
     BANNED_WORDS,
     EARLY_SIGNAL_VERBS,
     MIN_TREND_COUNT,
     STRONG_ACTION_VERBS,
+    ReviewScope,
 )
 
 ACTION_ITEMS_PROMPT = """You are writing a short briefing for the Financial Director of Daylight
 Company. The Financial Director is not technical and will read it in a
-Power BI report. It is based on customer reviews from Trustpilot and Amazon
+Power BI report. It is based on customer reviews from {websites}
 that have already been classified as positive, negative or neutral.
 
 The summary below is ALL the information you have. It covers {review_count}
 reviews dated {window_start} to {window_end} ({window_label}).
+{scope_sentence}
 
 How to read the summary:
 - "window": the period ("label"), its review dates and the number of
   reviews covered.
+- "scope": which reviews the summary covers. A section below that is an
+  empty list has no reviews in this scope: write nothing about it.
 - "sentiment": how many reviews were positive, negative and neutral.
 - "negative_reviews_total": how many negative reviews there are in total.
 - Every group below gives "reviews" (how many reviews), "negatives" (how
@@ -90,20 +95,7 @@ Rules:
    out new figures (no differences, ratios, totals or averages).
 4. Every rationale must cite the numbers from the summary that support it
    (counts and percentages).
-5. Compare like with like. Never compare regions, review websites or any
-   other groups whose reviews come from the review websites in different
-   proportions, except within the same website (use
-   "product_by_region_and_source"). Amazon and Trustpilot reviewers are
-   different groups of customers: most Trustpilot reviews are invited by
-   the company and tend to be more positive, while Amazon reviews are
-   unprompted. A difference between Amazon and Trustpilot is background
-   only, never evidence of a problem by itself. The same applies to sector
-   groups, service aspects and products: compare them only within the same
-   review website (use "product_by_sector_group_and_source",
-   "service_by_aspect_and_source" and "reviews_by_source"), or say plainly
-   that their mix of review websites differs and treat the gap as
-   background only. A gap between groups whose mix of review websites
-   differs must never be the main reason for an item.
+{rule_5}
 6. Small samples. An item based mainly on a group marked
    "small_sample": true must ask the business to monitor or investigate,
    never to overhaul or fix, and its rationale must say plainly that the
@@ -157,9 +149,10 @@ Rules:
     prove that. For a row marked "small_sample": true or "few_mentions":
     true, never say that it is rising, worsening, improving, increased or
     decreased; say that there are too few reviews to tell.
-16. This period alone. Write the items for this period only. Other periods
-    get their own items, so do not repeat an issue only because it appears
-    in another period.
+16. This period and this scope alone. Write the items for this period and
+    this scope only. Other periods and other scopes get their own items, so
+    do not repeat an issue only because it appears in another period or
+    another scope.
 17. Never copy field names, flags or true/false values from the data into
     an item. Say "small sample" or "too few reviews to tell" in plain words.
 
@@ -190,9 +183,71 @@ def build_retry_prompt(prompt: str, errors: str) -> str:
     return RETRY_PROMPT.format(prompt=prompt, errors=errors)
 
 
-def build_action_items_prompt(summary: Dict[str, Any], areas: Sequence[str]) -> str:
+# Rule 5 when the scope holds reviews from both websites...
+RULE_5_BOTH_WEBSITES = """5. Compare like with like. Never compare regions, review websites or any
+   other groups whose reviews come from the review websites in different
+   proportions, except within the same website (use
+   "product_by_region_and_source"). Amazon and Trustpilot reviewers are
+   different groups of customers: most Trustpilot reviews are invited by
+   the company and tend to be more positive, while Amazon reviews are
+   unprompted. A difference between Amazon and Trustpilot is background
+   only, never evidence of a problem by itself. The same applies to sector
+   groups, service aspects and products: compare them only within the same
+   review website (use "product_by_sector_group_and_source",
+   "service_by_aspect_and_source" and "reviews_by_source"), or say plainly
+   that their mix of review websites differs and treat the gap as
+   background only. A gap between groups whose mix of review websites
+   differs must never be the main reason for an item."""
+
+# ...and when every review in it comes from one website: there is nothing to
+# compare between websites, and groups can be compared directly.
+RULE_5_ONE_WEBSITE = """5. One review website. All the reviews in this summary come from one
+   website, {website}: there are no reviews from any other website here.
+   Never compare them with, or mention, reviews from another website.
+   Regions, sector groups, service aspects and products may be compared
+   with each other directly: their reviews all come from the same website,
+   so the warnings above about mixing review websites do not apply."""
+
+WEBSITE_NAMES = {"amazon": "Amazon", "trustpilot": "Trustpilot"}
+BOTH_WEBSITES = "Trustpilot and Amazon"
+
+SCOPE_SENTENCE_EVERYTHING = ("The briefing covers every review of that period: product and "
+                             "service reviews,\nfrom both review websites.")
+SCOPE_SENTENCE = ("The briefing covers ONLY this scope: {label}.\n"
+                  "Reviews outside the scope are not in the summary, so say nothing about "
+                  "them.")
+
+
+def website_name(scope: ReviewScope) -> str:
+    """The website(s) a scope's reviews come from, as the prompt names them."""
+    if not scope.single_source:
+        return BOTH_WEBSITES
+    return WEBSITE_NAMES.get(scope.review_source, scope.review_source.capitalize())
+
+
+def scope_sentence(scope: ReviewScope) -> str:
+    if scope.review_source is None and scope.review_type is None:
+        return SCOPE_SENTENCE_EVERYTHING
+    return SCOPE_SENTENCE.format(label=scope.label)
+
+
+def rule_5(scope: ReviewScope) -> str:
+    """The comparison rule: like with like between the two websites, or,
+    for a scope with one website, a plain statement that there is only one."""
+    if scope.single_source:
+        return RULE_5_ONE_WEBSITE.format(website=website_name(scope))
+    return RULE_5_BOTH_WEBSITES
+
+
+def build_action_items_prompt(summary: Dict[str, Any], areas: Sequence[str],
+                              scope: ReviewScope = ALL_SCOPE) -> str:
+    """The prompt for one window of one ``scope`` (the scope ``summary`` was
+    built from)."""
     window = summary["window"]
     return ACTION_ITEMS_PROMPT.format(
+        websites=website_name(scope),
+        scope_sentence=scope_sentence(scope),
+        rule_5=rule_5(scope),
         review_count=window["reviews"],
         window_start=window["start"],
         window_end=window["end"],

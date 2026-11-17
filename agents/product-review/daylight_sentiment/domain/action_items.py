@@ -1,4 +1,5 @@
-"""Business to-do items from the stored sentiment results: review-window
+"""Business to-do items from the stored sentiment results: the review scopes
+(which website and which kind of review a set of items covers), review-window
 selection, the compact summary the model is shown, and validation of the
 model's reply. Pure logic -- no I/O; every limit is passed in by the caller
 (see ActionItemSettings in config.py).
@@ -12,9 +13,9 @@ import calendar
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 ITEM_COUNT = 3
 OVERALL_AREA = "overall"
@@ -22,8 +23,11 @@ OVERALL_AREA = "overall"
 # A review window with fewer analysed reviews than this is skipped: too few
 # to base three items on. It is never widened, so its label stays true. The
 # default for callers that pass nothing; a run's value comes from
-# ActionItemSettings.min_reviews (ACTION_ITEMS_MIN_REVIEWS).
+# ActionItemSettings.min_reviews (ACTION_ITEMS_MIN_REVIEWS). It applies to
+# the "all" scope; every narrower scope has its own, lower minimum
+# (ActionItemSettings.min_reviews_scoped, ACTION_ITEMS_MIN_REVIEWS_SCOPED).
 MIN_WINDOW_REVIEWS = 50
+MIN_SCOPED_WINDOW_REVIEWS = 30
 
 # A group (sector group, aspect, region, source, product...) with fewer
 # reviews than this is flagged small_sample in the summary: too few to
@@ -117,10 +121,67 @@ class ActionItemsValidationError(ValueError):
     """The model's reply isn't a complete, well-formed set of items."""
 
 
+SCOPE_ALL = "All"
+
+
+@dataclass(frozen=True)
+class ReviewScope:
+    """Which reviews one set of to-do items covers: one review website or
+    both, one review type or both. ``review_source`` / ``review_type`` are
+    the values a row must have (None = any). ``source_scope`` /
+    ``review_type_scope`` are what is stored with the items and shown in the
+    Power BI slicers; ``label`` is how the scope reads to a person and to
+    the model."""
+    key: str
+    review_source: Optional[str]
+    review_type: Optional[str]
+    source_scope: str
+    review_type_scope: str
+    label: str
+
+    @property
+    def single_source(self) -> bool:
+        """True when every review in the scope comes from one website."""
+        return self.review_source is not None
+
+    def matches(self, row: Dict[str, Any]) -> bool:
+        return ((self.review_source is None
+                 or row.get("review_source") == self.review_source)
+                and (self.review_type is None
+                     or row.get("review_type") == self.review_type))
+
+
+# Amazon reviews are always product reviews, so "amazon" is stored as
+# Amazon / Product; there is no Amazon service scope. The stored pairs are
+# all different, and none is (Amazon, All) or (All, Service): the view
+# dbo.vw_latest_action_items shows those two as copies of Amazon / Product
+# and Trustpilot / Service.
+REVIEW_SCOPES: Tuple[ReviewScope, ...] = (
+    ReviewScope("all", None, None, SCOPE_ALL, SCOPE_ALL, "All reviews"),
+    ReviewScope("product", None, "product", SCOPE_ALL, "Product", "Product reviews only"),
+    ReviewScope("amazon", "amazon", "product", "Amazon", "Product",
+                "Amazon product reviews only"),
+    ReviewScope("trustpilot", "trustpilot", None, "Trustpilot", SCOPE_ALL,
+                "Trustpilot reviews only"),
+    ReviewScope("trustpilot_product", "trustpilot", "product", "Trustpilot", "Product",
+                "Trustpilot product reviews only"),
+    ReviewScope("trustpilot_service", "trustpilot", "service", "Trustpilot", "Service",
+                "Trustpilot service reviews only"),
+)
+SCOPES_BY_KEY: Dict[str, ReviewScope] = {s.key: s for s in REVIEW_SCOPES}
+DEFAULT_SCOPE_KEYS: Tuple[str, ...] = tuple(s.key for s in REVIEW_SCOPES)
+ALL_SCOPE = SCOPES_BY_KEY["all"]
+
+
+def scope_rows(rows: Iterable[Dict[str, Any]], scope: ReviewScope) -> List[Dict[str, Any]]:
+    """The rows that belong to ``scope``."""
+    return [r for r in rows if scope.matches(r)]
+
+
 @dataclass
 class ReviewWindow:
-    """The reviews one generation is based on: the last ``months`` months,
-    and the period they cover."""
+    """The reviews one generation is based on: the last ``months`` months
+    of one review scope, and the period they cover."""
     months: int
     rows: List[Dict[str, Any]]
     start: Optional[date]
@@ -131,10 +192,19 @@ class ReviewWindow:
     # ended today instead; future_dated counts the reviews dated after today.
     capped_from: Optional[date] = None
     future_dated: int = 0
+    scope: ReviewScope = ALL_SCOPE
+    # The minimum number of reviews the window was checked against.
+    min_reviews: int = MIN_WINDOW_REVIEWS
 
     @property
     def label(self) -> str:
         return window_label(self.months)
+
+    @property
+    def name(self) -> str:
+        """The window and its scope, for logs and headings:
+        "Last 3 months (Amazon product reviews only)"."""
+        return f"{self.label} ({self.scope.label})"
 
     @property
     def skipped(self) -> bool:
@@ -198,18 +268,28 @@ def months_before(end: date, months: int) -> date:
     return date(year, month, min(end.day, calendar.monthrange(year, month)[1]))
 
 
+def window_start(end: date, months: int) -> date:
+    """First day of the ``months``-month window that ends on ``end``."""
+    return months_before(end, months) + timedelta(days=1)
+
+
 def select_windows(rows: Iterable[Dict[str, Any]], windows_months: Sequence[int],
                    today: Optional[date] = None,
-                   min_reviews: int = MIN_WINDOW_REVIEWS) -> List[ReviewWindow]:
+                   min_reviews: int = MIN_WINDOW_REVIEWS,
+                   scope: ReviewScope = ALL_SCOPE) -> List[ReviewWindow]:
     """One window of analysed reviews per entry of ``windows_months``.
 
-    Every window ends on the NEWEST review date in the data, so it doesn't
-    shrink while no new files arrive -- or on ``today`` (default: the
-    current date) if that is earlier, so a wrongly parsed future date can't
-    push the windows forward. Reviews dated after today stay in them. A
-    window with fewer than ``min_reviews`` reviews is returned skipped (with
-    a skip_reason), never widened, so its label always describes it. Rows
-    with no sentiment or no parsed review date are left out.
+    ``rows`` are the reviews of one scope (see scope_rows()); ``scope`` only
+    names them on the windows returned. Every window ends on the NEWEST
+    review date in ``rows`` -- that scope's own newest date, not the newest
+    in the whole database -- so it doesn't shrink while no new files
+    arrive, or on ``today`` (default: the current date) if that is earlier,
+    so a wrongly parsed future date can't push the windows forward. Reviews
+    dated after today stay in them. A window with fewer than ``min_reviews``
+    reviews is returned skipped (with a skip_reason), never widened, so its
+    label always describes it. Rows with no sentiment or no parsed review
+    date are left out; with no dated rows at all, every window is returned
+    skipped and without dates.
     """
     today = today or date.today()
     analysed = [r for r in rows if r.get("sentiment")]
@@ -222,7 +302,8 @@ def select_windows(rows: Iterable[Dict[str, Any]], windows_months: Sequence[int]
 
     if not dated:
         return [ReviewWindow(m, [], None, None, undated_excluded=undated,
-                             skip_reason="no analysed reviews with a review date")
+                             skip_reason="no analysed reviews with a review date",
+                             scope=scope, min_reviews=min_reviews)
                 for m in windows_months]
 
     newest = max(r["review_date_parsed"] for r in dated)
@@ -231,15 +312,59 @@ def select_windows(rows: Iterable[Dict[str, Any]], windows_months: Sequence[int]
               "future_dated": sum(1 for r in dated if r["review_date_parsed"] > today)}
     windows = []
     for months in windows_months:
-        start = months_before(end, months) + timedelta(days=1)
+        start = window_start(end, months)
         in_window = [r for r in dated if r["review_date_parsed"] >= start]
         skip_reason = None
         if len(in_window) < min_reviews:
             skip_reason = (f"only {len(in_window)} analysed reviews from {start.isoformat()} "
                            f"to {end.isoformat()} (minimum {min_reviews})")
         windows.append(ReviewWindow(months, in_window, start, end, undated_excluded=undated,
-                                    skip_reason=skip_reason, **capped))
+                                    skip_reason=skip_reason, scope=scope,
+                                    min_reviews=min_reviews, **capped))
     return windows
+
+
+def with_period(window: ReviewWindow, fallback_end: date) -> ReviewWindow:
+    """``window`` with a start and an end date. A window that has its own
+    dates is returned as it is; one without (its scope has no dated reviews
+    at all) gets the ``months`` months ending on ``fallback_end``, so that
+    its placeholder row can be saved under a period."""
+    if window.start is not None and window.end is not None:
+        return window
+    return replace(window, start=window_start(fallback_end, window.months), end=fallback_end)
+
+
+PLACEHOLDER_AREA = "overall"
+
+
+def placeholder_item(window: ReviewWindow) -> Dict[str, Any]:
+    """The single row saved for a skipped window (one with dates, see
+    with_period()), so that the report shows why there are no items rather
+    than nothing, or older items that no longer apply. It says in plain
+    words that no items were generated and why; it has no evidence strength
+    and is flagged is_placeholder."""
+    count, minimum = window.review_count, window.min_reviews
+    period = f"{window.start.isoformat()} to {window.end.isoformat()}"
+    reviews = "review" if count == 1 else "reviews"
+    if count:
+        found = (f"Only {count} analysed {reviews} dated {period} "
+                 f"{'falls' if count == 1 else 'fall'} in this selection")
+    else:
+        found = ("There are no analysed reviews with a review date in this selection "
+                 f"for {period}")
+    return {
+        "rank": 1,
+        "title": f"Not enough reviews yet ({count} of {minimum} needed)",
+        "description": ("No to-do items were generated for this selection "
+                        f"({window.scope.label}, {window.label.lower()}), because it has "
+                        "too few reviews to base them on."),
+        "rationale": (f"{found}, and at least {minimum} are needed. To-do items will "
+                      "appear here once enough reviews have arrived."),
+        "related_area": PLACEHOLDER_AREA,
+        "evidence": f"{count} analysed {reviews} from {period}; the minimum is {minimum}.",
+        "evidence_strength": None,
+        "is_placeholder": True,
+    }
 
 
 def parse_themes(raw: Any) -> List[str]:
@@ -565,7 +690,10 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
                   excerpt_chars: int,
                   small_sample_reviews: int = SMALL_SAMPLE_REVIEWS) -> Dict[str, Any]:
     """Compact, JSON-serialisable summary of the window's reviews -- the only
-    thing the model is shown. Every grouped section gives reviews,
+    thing the model is shown. "scope" names the reviews it covers; a section
+    with no reviews in that scope is an empty list (a service-only scope has
+    no product sections, and the other way round). Every grouped section
+    gives reviews,
     negatives, the negative share and small_sample (fewer than
     ``small_sample_reviews`` reviews); "trend" splits the main groups
     between the window's most recent third and its earlier two thirds."""
@@ -594,6 +722,7 @@ def build_summary(window: ReviewWindow, top_themes: int, max_excerpts: int,
             "end": window.end.isoformat(),
             "reviews": window.review_count,
         },
+        "scope": window.scope.label,
         "small_sample_threshold_reviews": n,
         "sentiment": {
             "reviews": overall.reviews,
@@ -646,7 +775,9 @@ AREA_SECTIONS = ("product_by_sector_group", "service_by_aspect", "product_by_reg
 def summary_areas(summary: Dict[str, Any]) -> List[str]:
     """Values a to-do item's related_area may take: "overall" plus every
     sector group, service aspect (readable name) and region named in the
-    summary."""
+    summary. A section that is empty for the summary's scope adds nothing,
+    so a scope with no product (or no service) reviews offers none of those
+    groups."""
     areas = [OVERALL_AREA]
     for key in AREA_SECTIONS:
         for entry in summary.get(key, []):
@@ -855,8 +986,9 @@ def validate_action_items(reply: Any, summary: Dict[str, Any]) -> List[Dict[str,
 
 
 def format_action_items(items: Sequence[Dict[str, Any]], window: ReviewWindow) -> str:
-    """Plain-text rendering for the console (dry runs)."""
-    lines = [f"{window.label}: top {len(items)} to-do items -- {window.basis()}", ""]
+    """Plain-text rendering for the console (dry runs), headed by the
+    window and its scope."""
+    lines = [f"{window.name}: top {len(items)} to-do items -- {window.basis()}", ""]
     for item in items:
         lines += [
             f"{item['rank']}. {item['title']}  [{item['related_area']}]",

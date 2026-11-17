@@ -6,12 +6,17 @@
 -- after each run that loads new reviews, or on demand with
 -- `python -m daylight_sentiment.cli --action-items-only`.
 --
--- Each run generates one set per review window ("Last 3 months", "Last 6
--- months", "Last 12 months" by default). One generation = the 3 rows of one
+-- Each run generates one set per review scope and review window. The scopes
+-- are All / All, All / Product, Amazon / Product, Trustpilot / All,
+-- Trustpilot / Product and Trustpilot / Service (source_scope /
+-- review_type_scope); the windows are "Last 3 months", "Last 6 months" and
+-- "Last 12 months" by default. One generation = the rows of one scope and
 -- window sharing a generation_id, inserted in a single transaction (never a
--- partial set). Older generations are kept as history;
--- dbo.vw_latest_action_items (../views/vw_latest_action_items.sql) shows the
--- newest one for each window for Power BI.
+-- partial set): 3 items, or ONE placeholder row (rank 1, is_placeholder = 1)
+-- when that scope and window had too few reviews for items. Older
+-- generations are kept as history; dbo.vw_latest_action_items
+-- (../views/vw_latest_action_items.sql) shows the newest one for each scope
+-- and window for Power BI.
 --
 --   run_timestamp     the dbo.sentiment_analysis_runs.run_timestamp of the
 --                     run that generated it; NULL for an on-demand generation.
@@ -20,29 +25,46 @@
 --                     NULL only on rows saved before the column existed.
 --   window_months     the window's length in months (6 for 'Last 6 months').
 --                     NULL only on rows saved before the column existed.
+--   source_scope      the review website the items cover: 'All', 'Amazon' or
+--                     'Trustpilot'. NULL only on rows saved before the column
+--                     existed, which cover every review: read as 'All'.
+--   review_type_scope the kind of review the items cover: 'All', 'Product' or
+--                     'Service'. NULL only on rows saved before the column
+--                     existed: read as 'All'.
+--   is_placeholder    1 on the single row saved when a scope and window had
+--                     too few reviews: its title and text say that no items
+--                     were generated and why. 0 on every real item, and on
+--                     every row saved before the column existed.
 --   window_start/end  the review dates the items are based on. window_end is
---                     the newest review date in the data (or the day they
---                     were generated, if that is earlier).
---   reviews_analysed  how many analysed reviews fall in that window.
+--                     the newest review date of that scope (or the day they
+--                     were generated, if that is earlier). On a placeholder
+--                     for a scope with no dated reviews at all, the window
+--                     ending on the newest review date of all the data.
+--   reviews_analysed  how many analysed reviews of that scope fall in that
+--                     window (on a placeholder: the count that was too low).
 --   evidence_strength 'strong', 'moderate' or 'early signal' ('early signal'
 --                     whenever the item rests on groups with too few reviews
---                     to be sure). NULL only on rows saved before the column
---                     existed.
+--                     to be sure). NULL on a placeholder, and on rows saved
+--                     before the column existed.
+--   llm_provider/model NULL on a placeholder: no model wrote it.
 --
 -- The pipeline creates this table itself (the "create_action_items_table"
 -- entry in daylight_sentiment/infra/db/connection.py's MIGRATIONS) and adds
 -- the later columns with the guarded ALTERs that follow it there
 -- ("add_action_items_evidence_strength", "add_action_items_window_label",
--- "add_action_items_window_months"). This file is the canonical definition
--- and is safe to re-run, including on a table created before those columns
--- existed.
+-- "add_action_items_window_months", "add_action_items_source_scope",
+-- "add_action_items_review_type_scope", "add_action_items_is_placeholder").
+-- This file is the canonical definition and is safe to re-run, including on
+-- a table created before those columns existed. Run it BEFORE
+-- ../views/vw_latest_action_items.sql when the view is being updated ahead
+-- of the pipeline's first save: the view needs the three scope columns.
 -- ============================================================================
 
 IF OBJECT_ID('dbo.sentiment_action_items', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.sentiment_action_items (
         item_id            INT IDENTITY PRIMARY KEY,
-        generation_id      UNIQUEIDENTIFIER NOT NULL,   -- groups the 3 rows of one generation
+        generation_id      UNIQUEIDENTIFIER NOT NULL,   -- groups the rows of one generation
         generated_at       DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
         run_timestamp      DATETIME2        NULL,
         [rank]             TINYINT          NOT NULL,   -- 1 = highest business impact
@@ -54,6 +76,10 @@ BEGIN
         evidence_strength  NVARCHAR(20)     NULL,       -- strong / moderate / early signal
         window_label       NVARCHAR(30)     NULL,       -- e.g. 'Last 6 months'
         window_months      TINYINT          NULL,       -- e.g. 6
+        source_scope       NVARCHAR(20)     NULL,       -- All / Amazon / Trustpilot
+        review_type_scope  NVARCHAR(20)     NULL,       -- All / Product / Service
+        is_placeholder     BIT              NOT NULL    -- 1 = "not enough reviews" row
+            CONSTRAINT DF_sentiment_action_items_is_placeholder DEFAULT 0,
         window_start       DATE             NOT NULL,
         window_end         DATE             NOT NULL,
         reviews_analysed   INT              NOT NULL,
@@ -80,4 +106,23 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns
                WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
                  AND name = 'window_months')
     ALTER TABLE dbo.sentiment_action_items ADD window_months TINYINT NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'source_scope')
+    ALTER TABLE dbo.sentiment_action_items ADD source_scope NVARCHAR(20) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'review_type_scope')
+    ALTER TABLE dbo.sentiment_action_items ADD review_type_scope NVARCHAR(20) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.sentiment_action_items')
+                 AND name = 'is_placeholder')
+    ALTER TABLE dbo.sentiment_action_items ADD is_placeholder BIT NOT NULL
+        CONSTRAINT DF_sentiment_action_items_is_placeholder DEFAULT 0;
 GO

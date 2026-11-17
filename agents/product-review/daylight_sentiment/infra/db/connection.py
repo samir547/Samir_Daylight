@@ -146,6 +146,29 @@ IF NOT EXISTS (SELECT 1 FROM sys.columns
                  AND name = 'window_months')
     ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD window_months TINYINT NULL;
 """),
+    # The review scope a generation covers. NULL on rows saved before the
+    # columns existed, which are read as All / All.
+    ("add_action_items_source_scope", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'source_scope')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD source_scope NVARCHAR(20) NULL;
+"""),
+    ("add_action_items_review_type_scope", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'review_type_scope')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD review_type_scope NVARCHAR(20) NULL;
+"""),
+    # 1 on the single row saved for a window with too few reviews. NOT NULL
+    # with a default, so the rows already in the table become 0.
+    ("add_action_items_is_placeholder", f"""
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('dbo.{ACTION_ITEMS_TABLE}')
+                 AND name = 'is_placeholder')
+    ALTER TABLE dbo.{ACTION_ITEMS_TABLE} ADD is_placeholder BIT NOT NULL
+        CONSTRAINT DF_{ACTION_ITEMS_TABLE}_is_placeholder DEFAULT 0;
+"""),
 ]
 
 

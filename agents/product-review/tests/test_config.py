@@ -8,8 +8,13 @@ from daylight_sentiment.config import (
     LLMProvider,
     SharePointSettings,
     parse_min_reviews,
+    parse_min_reviews_scoped,
+    parse_scopes,
     parse_window_months,
 )
+
+ALL_SIX_SCOPES = ("all", "product", "amazon", "trustpilot", "trustpilot_product",
+                  "trustpilot_service")
 
 ENV_KEYS = {
     "ANTHROPIC_API_KEY": "ak",
@@ -113,6 +118,103 @@ def test_action_item_defaults():
     assert settings.windows_months == (3, 6, 12)
     assert (settings.top_themes, settings.max_excerpts, settings.excerpt_chars) == (15, 10, 300)
     assert not hasattr(settings, "window_months")
+    assert settings.scopes == ALL_SIX_SCOPES
+    assert (settings.min_reviews, settings.min_reviews_scoped) == (50, 30)
+
+
+def test_minimum_per_scope_is_50_for_all_and_30_for_the_rest():
+    settings = Config().action_items
+    assert {key: settings.min_reviews_for(key) for key in ALL_SIX_SCOPES} == {
+        "all": 50, "product": 30, "amazon": 30, "trustpilot": 30,
+        "trustpilot_product": 30, "trustpilot_service": 30}
+    settings.min_reviews, settings.min_reviews_scoped = 80, 20
+    assert settings.min_reviews_for("all") == 80
+    assert settings.min_reviews_for("amazon") == 20
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("all,product,amazon,trustpilot,trustpilot_product,trustpilot_service", ALL_SIX_SCOPES),
+    ("all", ("all",)),
+    ("amazon,all", ("all", "amazon")),                      # the defined order
+    (" Trustpilot_Service , AMAZON ", ("amazon", "trustpilot_service")),
+    ("amazon,amazon", ("amazon",)),
+])
+def test_parse_scopes(raw, expected):
+    assert parse_scopes(raw) == expected
+
+
+@pytest.mark.parametrize("raw, unknown", [
+    ("amazn", "'amazn'"), ("all,ebay", "'ebay'"), ("all;amazon", "'all;amazon'"),
+    ("all,,amazon", "''"), (",", "''"), ("Amazon / Product", "'amazon / product'"),
+    ("service", "'service'"),
+])
+def test_parse_scopes_rejects_unknown_keys_and_names_the_valid_ones(raw, unknown):
+    with pytest.raises(ValueError) as exc:
+        parse_scopes(raw)
+    message = str(exc.value)
+    assert message.startswith(
+        "ACTION_ITEMS_SCOPES must be one or more of all, product, amazon, trustpilot, "
+        "trustpilot_product, trustpilot_service, separated by commas (e.g. all,amazon); "
+        f"unknown: {unknown} in ")
+    assert message.endswith(repr(raw))
+
+
+def test_parse_scopes_names_the_setting():
+    with pytest.raises(ValueError, match="^--x must be one or more of all, product"):
+        parse_scopes("nope", name="--x")
+
+
+def test_action_items_scopes_from_env(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_SCOPES", raising=False)
+    assert Config.from_env(dotenv=False).action_items.scopes == ALL_SIX_SCOPES
+    monkeypatch.setenv("ACTION_ITEMS_SCOPES", "trustpilot_service,all")
+    assert Config.from_env(dotenv=False).action_items.scopes == ("all", "trustpilot_service")
+    monkeypatch.setenv("ACTION_ITEMS_SCOPES", "")  # set but empty -> still the default
+    assert Config.from_env(dotenv=False).action_items.scopes == ALL_SIX_SCOPES
+    assert Config().action_items.scopes == ALL_SIX_SCOPES  # plain Config ignores env
+
+
+def test_action_items_scopes_env_rejects_unknown_keys(monkeypatch):
+    monkeypatch.setenv("ACTION_ITEMS_SCOPES", "all,amazon_service")
+    with pytest.raises(ValueError, match="ACTION_ITEMS_SCOPES must be one or more of .*"
+                                         "unknown: 'amazon_service'"):
+        Config.from_env(dotenv=False)
+
+
+def test_action_items_min_reviews_scoped_defaults_to_30(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", raising=False)
+    assert Config.from_env(dotenv=False).action_items.min_reviews_scoped == 30
+    assert Config().action_items.min_reviews_scoped == 30
+
+
+def test_action_items_min_reviews_scoped_from_env(monkeypatch):
+    monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS", raising=False)
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", "45")
+    settings = Config.from_env(dotenv=False).action_items
+    # The two minimums are separate settings.
+    assert (settings.min_reviews, settings.min_reviews_scoped) == (50, 45)
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", " 10 ")
+    assert Config.from_env(dotenv=False).action_items.min_reviews_scoped == 10
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", "")
+    assert Config.from_env(dotenv=False).action_items.min_reviews_scoped == 30
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS", "120")
+    settings = Config.from_env(dotenv=False).action_items
+    assert (settings.min_reviews, settings.min_reviews_scoped) == (120, 30)
+    assert Config().action_items.min_reviews_scoped == 30  # plain Config ignores env
+
+
+@pytest.mark.parametrize("raw", ["9", "0", "-10", "thirty", "30.5", "5,0"])
+def test_action_items_min_reviews_scoped_rejects_bad_values(monkeypatch, raw):
+    monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", raw)
+    with pytest.raises(ValueError, match="ACTION_ITEMS_MIN_REVIEWS_SCOPED must be a whole "
+                                         r"number of reviews, 10 or more \(e.g. 30\)"):
+        Config.from_env(dotenv=False)
+
+
+def test_parse_min_reviews_scoped_names_the_setting():
+    assert parse_min_reviews_scoped("30") == 30 and parse_min_reviews_scoped("10") == 10
+    with pytest.raises(ValueError, match="^--x must be"):
+        parse_min_reviews_scoped("9", name="--x")
 
 
 @pytest.mark.parametrize("raw, expected", [

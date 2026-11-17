@@ -535,6 +535,77 @@ class TestActionItemsWiring:
         out = " ".join(capsys.readouterr().out.split())
         assert "--action-items-min-reviews N" in out and "default 50" in out
 
+    def test_existing_flags_work_alongside_the_scope_flags(self):
+        args = parse_args(["--skip-action-items", "--action-items-only",
+                           "--action-items-dry-run", "--action-items-months", "6,3",
+                           "--action-items-min-reviews", "60",
+                           "--action-items-scopes", "amazon,all",
+                           "--action-items-min-reviews-scoped", "25"])
+        assert args.skip_action_items and args.action_items_only
+        assert args.action_items_dry_run and args.action_items_months == (3, 6)
+        assert args.action_items_min_reviews == 60
+        assert args.action_items_scopes == ("all", "amazon")
+        assert args.action_items_min_reviews_scoped == 25
+
+    def test_scopes_default_to_all_six(self, monkeypatch):
+        monkeypatch.delenv("ACTION_ITEMS_SCOPES", raising=False)
+        assert parse_args([]).action_items_scopes is None
+        assert build_config(parse_args([])).action_items.scopes == (
+            "all", "product", "amazon", "trustpilot", "trustpilot_product",
+            "trustpilot_service")
+
+    def test_scopes_flag_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("ACTION_ITEMS_SCOPES", "all,product")
+        assert build_config(parse_args([])).action_items.scopes == ("all", "product")
+        config = build_config(parse_args(["--action-items-scopes",
+                                          "trustpilot_service,amazon"]))
+        assert config.action_items.scopes == ("amazon", "trustpilot_service")
+        assert parse_args(["--action-items-scopes", "ALL"]).action_items_scopes == ("all",)
+
+    @pytest.mark.parametrize("value, unknown", [("amazn", "'amazn'"), ("all,ebay", "'ebay'"),
+                                                ("", "''"), ("all,,amazon", "''"),
+                                                ("amazon_service", "'amazon_service'")])
+    def test_unknown_scope_key_is_rejected(self, value, unknown, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--action-items-scopes", value])
+        err = " ".join(capsys.readouterr().err.split())
+        assert ("--action-items-scopes must be one or more of all, product, amazon, "
+                "trustpilot, trustpilot_product, trustpilot_service, separated by commas"
+                ) in err
+        assert f"unknown: {unknown}" in err
+
+    def test_min_reviews_scoped_defaults_to_30(self, monkeypatch):
+        monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", raising=False)
+        assert parse_args([]).action_items_min_reviews_scoped is None
+        assert build_config(parse_args([])).action_items.min_reviews_scoped == 30
+
+    def test_min_reviews_scoped_flag_overrides_config(self, monkeypatch):
+        monkeypatch.delenv("ACTION_ITEMS_MIN_REVIEWS", raising=False)
+        monkeypatch.setenv("ACTION_ITEMS_MIN_REVIEWS_SCOPED", "40")
+        assert build_config(parse_args([])).action_items.min_reviews_scoped == 40
+        config = build_config(parse_args(["--action-items-min-reviews-scoped", "10"]))
+        assert config.action_items.min_reviews_scoped == 10
+        assert config.action_items.min_reviews == 50  # the "all" minimum is separate
+        config = build_config(parse_args(["--action-items-min-reviews", "70"]))
+        assert (config.action_items.min_reviews,
+                config.action_items.min_reviews_scoped) == (70, 40)
+
+    @pytest.mark.parametrize("value", ["9", "0", "-30", "thirty", "30.5", ""])
+    def test_min_reviews_scoped_below_10_is_rejected(self, value, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--action-items-min-reviews-scoped", value])
+        assert ("--action-items-min-reviews-scoped must be a whole number of reviews, 10 or "
+                "more") in capsys.readouterr().err
+
+    def test_help_shows_the_scope_flags(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        out = " ".join(capsys.readouterr().out.split())
+        assert "--action-items-scopes KEY[,KEY...]" in out
+        assert ("Keys: all, product, amazon, trustpilot, trustpilot_product, "
+                "trustpilot_service") in out
+        assert "--action-items-min-reviews-scoped N" in out and "default 30" in out
+
     def test_help_shows_the_windows_flag(self, capsys):
         with pytest.raises(SystemExit):
             parse_args(["--help"])
@@ -661,7 +732,15 @@ class TestActionItemsEndToEndOffline:
          "evidence": "38 negative reviews mention glare.", "evidence_strength": "strong"}
         for r in (1, 2, 3)]}
 
-    def _setup(self, monkeypatch, *replies):
+    ALL_SIX = ("all", "product", "amazon", "trustpilot", "trustpilot_product",
+               "trustpilot_service")
+
+    def _setup(self, monkeypatch, *replies, scopes=("all",)):
+        """150 Amazon product reviews in the fake database. ``saved`` gets
+        every set of real items as (items, positional args); ``self.scopes``
+        the scope each was saved under; ``self.placeholders`` every
+        placeholder row as (item, positional args, keyword args). One scope
+        ("all") unless ``scopes`` says otherwise."""
         from datetime import date
         from enum import Enum
         from types import SimpleNamespace
@@ -692,7 +771,7 @@ class TestActionItemsEndToEndOffline:
                  "review_date_parsed": date(2026, 7, 1), "review_text_en": None,
                  "review_text": "too much glare" if i % 4 == 0 else None}
                 for i in range(150)]
-        saved, prompts = [], []
+        saved, prompts, saved_scopes, placeholders = [], [], [], []
 
         class FakeRepository:
             def __init__(self, settings):
@@ -701,8 +780,14 @@ class TestActionItemsEndToEndOffline:
             def fetch_analysed_rows(self):
                 return rows
 
-            def save(self, items, *args):
-                saved.append((items, args))
+            def save(self, items, *args, source_scope, review_type_scope, is_placeholder):
+                if is_placeholder:
+                    [item] = items
+                    placeholders.append((item, args, dict(
+                        source_scope=source_scope, review_type_scope=review_type_scope)))
+                else:
+                    saved.append((items, args))
+                    saved_scopes.append((source_scope, review_type_scope))
                 return "gid"
 
         monkeypatch.setitem(factory._ANALYZERS, OtherProvider.FAKE, FakeProviderAnalyzer)
@@ -710,7 +795,10 @@ class TestActionItemsEndToEndOffline:
         config = Config(llm_provider=OtherProvider.FAKE,
                         db=DatabaseSettings(server="s", name="n", user="u", password="p"))
         object.__setattr__(config, "fake", SimpleNamespace(model="fake-model"))
+        config.action_items.scopes = scopes
         self.prompts = prompts
+        self.scopes = saved_scopes
+        self.placeholders = placeholders
         return config, saved
 
     def test_second_provider_generates_and_saves_every_window(self, monkeypatch):
@@ -722,17 +810,65 @@ class TestActionItemsEndToEndOffline:
             assert [i["rank"] for i in items] == [1, 2, 3]
             assert args[4:7] == (150, "fake", "fake-model")
         assert len(self.prompts) == 3
+        assert self.scopes == [("All", "All")] * 3 and self.placeholders == []
+
+    def test_all_six_scopes_generate_items_or_leave_a_placeholder(self, monkeypatch, caplog):
+        # Only Amazon product reviews exist: "all", "product" and "amazon"
+        # get items; the three Trustpilot scopes get placeholder rows.
+        config, saved = self._setup(monkeypatch, self.REPLY, scopes=self.ALL_SIX)
+        with caplog.at_level("INFO", logger="multi_source_sentiment"):
+            assert cli.action_items_only(config, dry_run=False) == 0
+        windows = [("Last 3 months", 3), ("Last 6 months", 6), ("Last 12 months", 12)]
+        assert [args[:2] for _, args in saved] == windows * 3
+        assert self.scopes == ([("All", "All")] * 3 + [("All", "Product")] * 3
+                               + [("Amazon", "Product")] * 3)
+        assert len(self.prompts) == 9  # no model call for a placeholder
+        assert [(kw["source_scope"], kw["review_type_scope"], args[0])
+                for _, args, kw in self.placeholders] == [
+            (source, review_type, label)
+            for source, review_type in [("Trustpilot", "All"), ("Trustpilot", "Product"),
+                                        ("Trustpilot", "Service")]
+            for label, _ in windows]
+        for item, args, _ in self.placeholders:
+            assert item["title"] == "Not enough reviews yet (0 of 30 needed)"
+            assert args[4:7] == (0, None, None)  # count, and no provider or model
+        assert ("for the review windows 3, 6, 12 and the review scopes all, product, "
+                "amazon, trustpilot, trustpilot_product, trustpilot_service") in caplog.text
+        assert ("Placeholder saved for Last 6 months (Trustpilot service reviews only): Not "
+                "enough reviews yet (0 of 30 needed)") in caplog.text
+        assert "ERROR" not in [r.levelname for r in caplog.records]
 
     def test_dry_run_prints_every_window_and_writes_nothing(self, monkeypatch, capsys):
         config, saved = self._setup(monkeypatch, self.REPLY)
         assert cli.action_items_only(config, dry_run=True) == 0
-        assert saved == []
+        assert saved == [] and self.placeholders == []
         out = capsys.readouterr().out
-        assert "Last 3 months: top 3 to-do items -- Based on 150 reviews from 2026-04-02" in out
-        assert "Last 6 months: top 3 to-do items -- Based on 150 reviews from 2026-01-02" in out
-        assert ("Last 12 months: top 3 to-do items -- Based on 150 reviews from 2025-07-02 "
-                "to 2026-07-01") in out
+        assert ("Last 3 months (All reviews): top 3 to-do items -- Based on 150 reviews from "
+                "2026-04-02") in out
+        assert ("Last 6 months (All reviews): top 3 to-do items -- Based on 150 reviews from "
+                "2026-01-02") in out
+        assert ("Last 12 months (All reviews): top 3 to-do items -- Based on 150 reviews from "
+                "2025-07-02 to 2026-07-01") in out
         assert out.count("1. Reduce glare 1  [Beauty]") == 3
+
+    def test_dry_run_shows_the_scope_in_every_heading(self, monkeypatch, capsys):
+        config, saved = self._setup(monkeypatch, self.REPLY, scopes=self.ALL_SIX)
+        assert cli.action_items_only(config, dry_run=True) == 0
+        assert saved == [] and self.placeholders == []
+        out = capsys.readouterr().out
+        headings = [line for line in out.splitlines() if line.startswith("Last ")]
+        assert len(headings) == 18
+        for label in ("All reviews", "Product reviews only", "Amazon product reviews only"):
+            for months, start in ((3, "2026-04-02"), (6, "2026-01-02"), (12, "2025-07-02")):
+                assert (f"Last {months} months ({label}): top 3 to-do items -- Based on 150 "
+                        f"reviews from {start} to 2026-07-01") in headings
+        for label in ("Trustpilot reviews only", "Trustpilot product reviews only",
+                      "Trustpilot service reviews only"):
+            for months in (3, 6, 12):
+                assert (f"Last {months} months ({label}): no to-do items -- Not enough "
+                        "reviews yet (0 of 30 needed). Outside a dry run, one placeholder "
+                        "row saying so is saved.") in headings
+        assert out.count("1. Reduce glare 1  [Beauty]") == 9
 
     def test_invalid_reply_saves_nothing_and_exits_1(self, monkeypatch, caplog):
         config, saved = self._setup(monkeypatch, {"items": self.REPLY["items"][:2]})
@@ -741,9 +877,34 @@ class TestActionItemsEndToEndOffline:
         assert len(self.prompts) == 6  # each window: the first try and one retry
         errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
         assert errors == [
-            f"Action items were not generated for {label}: ActionItemsValidationError: "
-            "expected 3 items, got 2"
+            f"Action items were not generated for {label} (All reviews): "
+            "ActionItemsValidationError: expected 3 items, got 2"
             for label in ("Last 3 months", "Last 6 months", "Last 12 months")]
+
+    def test_one_failed_scope_exits_1_and_the_other_scopes_are_saved(self, monkeypatch,
+                                                                    caplog):
+        bad = {"items": []}
+        # Calls go scope by scope: "all" succeeds, "product" fails twice,
+        # "amazon" succeeds.
+        config, saved = self._setup(monkeypatch, self.REPLY, bad, bad, self.REPLY,
+                                    scopes=self.ALL_SIX)
+        config.action_items.windows_months = (3,)
+        assert cli.action_items_only(config, dry_run=False) == 1
+        assert self.scopes == [("All", "All"), ("Amazon", "Product")]
+        assert len(self.placeholders) == 3  # the Trustpilot scopes still got theirs
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert errors == ["Action items were not generated for Last 3 months (Product "
+                          "reviews only): ActionItemsValidationError: expected 3 items, "
+                          "got 0"]
+
+    def test_placeholders_alone_are_not_a_failure(self, monkeypatch, caplog):
+        config, saved = self._setup(monkeypatch, self.REPLY,
+                                    scopes=("trustpilot", "trustpilot_service"))
+        with caplog.at_level("WARNING", logger="multi_source_sentiment"):
+            assert cli.action_items_only(config, dry_run=False) == 0
+        assert saved == [] and self.prompts == [] and len(self.placeholders) == 6
+        assert caplog.text.count("skipped -- no analysed reviews with a review date") == 6
+        assert "ERROR" not in [r.levelname for r in caplog.records]
 
     def test_one_failed_window_exits_1_and_the_others_are_saved(self, monkeypatch):
         bad = {"items": []}
@@ -757,18 +918,26 @@ class TestActionItemsEndToEndOffline:
         assert len(saved) == 3 and len(self.prompts) == 4
         assert "Your previous reply failed because: expected 3 items, got 0" in self.prompts[1]
 
-    def test_every_window_skipped_exits_0_and_saves_nothing(self, monkeypatch, caplog):
+    def test_every_window_skipped_exits_0_and_saves_only_a_placeholder(self, monkeypatch,
+                                                                      caplog):
+        from datetime import date
         config, saved = self._setup(monkeypatch, self.REPLY)
         config.action_items.windows_months = (3,)
         from daylight_sentiment.application import action_items as app
         monkeypatch.setattr(app, "select_windows",
-                            lambda rows, months, today=None, min_reviews=None: [
-                                app.ReviewWindow(3, rows[:10], None, None,
+                            lambda rows, months, today=None, min_reviews=None, scope=None: [
+                                app.ReviewWindow(3, rows[:10], date(2026, 4, 2),
+                                                 date(2026, 7, 1),
                                                  skip_reason="only 10 analysed reviews")])
         with caplog.at_level("WARNING", logger="multi_source_sentiment"):
             assert cli.action_items_only(config, dry_run=False) == 0
         assert saved == [] and self.prompts == []
-        assert "Action items for Last 3 months: skipped -- only 10 analysed reviews" in caplog.text
+        [(item, args, scope)] = self.placeholders
+        assert item["title"] == "Not enough reviews yet (10 of 50 needed)"
+        assert args[:5] == ("Last 3 months", 3, date(2026, 4, 2), date(2026, 7, 1), 10)
+        assert scope == {"source_scope": "All", "review_type_scope": "All"}
+        assert ("Action items for Last 3 months (All reviews): skipped -- only 10 analysed "
+                "reviews") in caplog.text
         assert "ERROR" not in [r.levelname for r in caplog.records]
 
     run = TestMainPhases.run
@@ -785,7 +954,7 @@ class TestActionItemsEndToEndOffline:
         assert saved == [] and len(self.prompts) == 6
         levels = [r.levelname for r in caplog.records]
         assert levels.count("WARNING") == 6 and levels.count("ERROR") == 3
-        assert ("Action items were not generated for Last 6 months: "
+        assert ("Action items were not generated for Last 6 months (All reviews): "
                 "ActionItemsValidationError") in caplog.text
 
     def test_one_failed_window_in_a_normal_run_keeps_exit_0(self, run, monkeypatch, caplog):
