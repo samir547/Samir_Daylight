@@ -36,7 +36,7 @@ import pandas as pd
 from . import adjustments as adjmod
 from .live import ROOT_DIR, LiveForecast
 from .order_step import _last_known
-from .seasonal import VARIANTS, forecast_seasonal, seasonal_factors
+from .seasonal import VARIANTS, forecast_seasonal
 from .series import to_wide
 from .snapshot import Snapshot
 
@@ -47,6 +47,7 @@ FULL_TRUST_EVENTS = 4         # an ASIN with this many past orders uses only its
 DEFAULT_COVER, DEFAULT_LOT_MONTHS = 1.0, 3.0
 DEFAULT_RATIOS = (1.25, 1.6)  # P80 and P90 over mean, used only when Amazon's forecast is absent altogether
 AMAZON_FILE = "amazon_forecast.csv"
+SEASONAL_MIN_MONTHS = 24      # seasonal.seasonal_factors: under this many months of market history, no seasonal shape
 
 
 # ---------------------------------------------------------------- reason codes
@@ -478,8 +479,7 @@ def build_replenish_forecast(snap: Snapshot, s: dict, weekly: pd.DataFrame | Non
     stats = {"replayed": 0, "no_stock_reading": 0, "with_adjustments": 0, "amazon_months": 0}
 
     # market-level facts, for the explanations only (none of these feeds a number)
-    factors = seasonal_factors(pd.Series(np.nansum(sales_w.to_numpy(float), axis=0), index=months), shrink)
-    flat_season = bool(np.allclose(factors, 1.0))
+    flat_season = len(months) < SEASONAL_MIN_MONTHS          # seasonal_factors returns no shape below this
     po_hist = po_w.to_numpy(float)[:, :t]
     po_default = not bool((np.isfinite(po_hist) & (po_hist > 0)).any())
     ratios_default = am is None or am.empty or not bool((am["am_mean"] > 0).any())
