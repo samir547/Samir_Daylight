@@ -81,6 +81,8 @@ WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME IN ('amazon_order_forecast', 'amazon_o
 REASON_DETAIL_WIDTH = 500       # VARCHAR(500) in sql/005
 STATUS_COLUMNS = ("asin", "status", "reason_code", "confidence", "basis", "habit_source", "months_of_history",
                   "has_amazon_forecast", "has_stock_data", "last12_units", "forecast_units")
+SANITY_COLUMNS = ("sanity_status", "sanity_warning")       # sql/007: only written when both exist
+SANITY_WARNING_WIDTH = 500                                 # VARCHAR(500) in sql/007
 SUMMARY_COLUMNS = ("asins_in_sales", "asins_forecast", "young_product_backups", "skipped_short_history", "skipped_no_sales",
                    "asins_without_amazon_forecast", "amazon_only_dropped", "inventory_only_dropped", "sales_only_asins",
                    "default_habit_asins", "seasonality_mode", "market_months", "sanity_ratio", "sanity_ratio_all_asins",
@@ -92,6 +94,7 @@ class ExplanationSchema:
     columns: bool = False           # the four sql/005 columns on dbo.amazon_order_forecast
     status: bool = False            # dbo.amazon_order_forecast_asin_status
     summary: bool = False           # dbo.amazon_order_forecast_run_summary
+    sanity_flags: bool = False      # the two sql/007 columns on that table
     missing: list = field(default_factory=list)
 
 
@@ -104,7 +107,8 @@ def explanation_schema(cur) -> ExplanationSchema:
         return ExplanationSchema(missing=[f"(could not read INFORMATION_SCHEMA: {type(e).__name__})"])
     tables = {tb for tb, _ in found}
     s = ExplanationSchema(columns=all(("amazon_order_forecast", c) in found for c in NEW_COLUMNS),
-                          status=STATUS_TABLE in tables, summary=SUMMARY_TABLE in tables)
+                          status=STATUS_TABLE in tables, summary=SUMMARY_TABLE in tables,
+                          sanity_flags=all((SUMMARY_TABLE, c) in found for c in SANITY_COLUMNS))
     if not s.columns:
         s.missing.append("columns " + ", ".join(c for c in NEW_COLUMNS if ("amazon_order_forecast", c) not in found)
                          + " on dbo.amazon_order_forecast")
@@ -147,12 +151,14 @@ def _status_rows(run_id: int, decisions) -> tuple[list, list]:
     return rows, bad
 
 
-def _summary_row(run_id: int, s: dict) -> tuple:
+def _summary_row(run_id: int, s: dict, columns: tuple = SUMMARY_COLUMNS) -> tuple:
     vals = []
-    for c in SUMMARY_COLUMNS:
+    for c in columns:
         v = s.get(c)
         if c in ("sanity_ratio", "sanity_ratio_all_asins"):
             v = _ratio(v)
+        elif c == "sanity_warning" and v:
+            v = str(v)[:SANITY_WARNING_WIDTH]
         elif c == "amazon_generation_date" and v:
             v = date.fromisoformat(str(v)[:10])
         vals.append(_plain(v))
@@ -219,8 +225,12 @@ def load_forecast(f: LiveForecast, marketplace: str, snapshot_ref: str = "", con
                     cur.executemany(f"""INSERT INTO dbo.{STATUS_TABLE} (order_forecast_run_id, {', '.join(STATUS_COLUMNS)})
                                         VALUES ({', '.join('?' * (len(STATUS_COLUMNS) + 1))})""", srows)
             if schema.summary and summary:
-                cur.execute(f"""INSERT INTO dbo.{SUMMARY_TABLE} (order_forecast_run_id, {', '.join(SUMMARY_COLUMNS)}, summary_json)
-                                VALUES ({', '.join('?' * (len(SUMMARY_COLUMNS) + 2))})""", _summary_row(run_id, summary))
+                cols = SUMMARY_COLUMNS + (SANITY_COLUMNS if schema.sanity_flags else ())
+                if summary.get("sanity_status") in ("warn", "forced") and not schema.sanity_flags:
+                    print("WARNING: the sanity warning is not stored with this run (columns sanity_status, sanity_warning "
+                          f"missing on dbo.{SUMMARY_TABLE}). The forecast itself loads. Apply sql/007 by hand.")
+                cur.execute(f"""INSERT INTO dbo.{SUMMARY_TABLE} (order_forecast_run_id, {', '.join(cols)}, summary_json)
+                                VALUES ({', '.join('?' * (len(cols) + 2))})""", _summary_row(run_id, summary, cols))
         else:
             rows = [(run_id, a, m.date(), float(u)) for a, m, u in
                     zip(f.table["asin"], f.table["month_start"], f.table["units_forecast"])]

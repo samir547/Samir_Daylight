@@ -18,7 +18,7 @@ STATUS = {"order_forecast_run_id", "asin", "status", "reason_code", "confidence"
 SUMMARY = {"order_forecast_run_id", "asins_in_sales", "summary_json"}   # enough for the probe
 
 
-def schema(new_columns=False, status=False, summary=False, order_chance=True) -> dict:
+def schema(new_columns=False, status=False, summary=False, order_chance=True, sanity_flags=False) -> dict:
     s = {k: set(v) for k, v in LEGACY.items()}
     if not order_chance:
         s["amazon_order_forecast"].discard("order_chance")
@@ -27,7 +27,7 @@ def schema(new_columns=False, status=False, summary=False, order_chance=True) ->
     if status:
         s["amazon_order_forecast_asin_status"] = set(STATUS)
     if summary:
-        s["amazon_order_forecast_run_summary"] = set(SUMMARY)
+        s["amazon_order_forecast_run_summary"] = set(SUMMARY) | ({"sanity_status", "sanity_warning"} if sanity_flags else set())
     return s
 
 

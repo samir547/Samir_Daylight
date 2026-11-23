@@ -25,12 +25,24 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = ROOT_DIR / "config" / "forecast_settings.json"
 DEFAULTS = {"method": "seasonal_half", "open_po_tweak": True, "target": "ordered_units", "horizon": 6,
             "min_history": 12, "sanity_ratio_min": 0.5, "sanity_ratio_max": 1.6,
+            # "block" refuses to load a forecast outside the usual range (the original behaviour). "warn" loads it,
+            # logs a warning and stores it with the run, and still refuses outside the wider hard limits
+            # (almost always missing data or a bug, not a real market).
+            "sanity_action": "block", "sanity_hard_min": 0.25, "sanity_hard_max": 5.0,
             # used only by method "replenish" (see replenish.py)
             "amazon_weight": 0.5, "percentile_shrink": 1.0, "min_order_share": 0.25, "demand_method": "seasonal_half",
             "adjustments_file": "config/order_adjustments.csv",
             # replenish: ASINs with at least this many months of sales but under min_history get the young-product
             # backup (overridable per pool under "pools", e.g. {"ES": {"young_min_months": 2}})
             "young_min_months": 3}
+
+
+def _check_sanity_settings(s: dict, p: Path) -> None:
+    if s["sanity_action"] not in ("block", "warn"):
+        raise ConfigError(f'"sanity_action" in {p} must be "block" or "warn", not {s["sanity_action"]!r}')
+    if not (s["sanity_hard_min"] <= s["sanity_ratio_min"] <= s["sanity_ratio_max"] <= s["sanity_hard_max"]):
+        raise ConfigError(f"Sanity limits in {p} must satisfy sanity_hard_min <= sanity_ratio_min <= "
+                          f"sanity_ratio_max <= sanity_hard_max.")
 
 
 def load_settings(path: Path | None = None) -> dict:
@@ -48,6 +60,7 @@ def load_settings(path: Path | None = None) -> dict:
             raise ConfigError(f"Settings file {p} is not valid JSON: {e}") from None
     _check_method(s["method"])
     _check_demand_method(s.get("demand_method"))
+    _check_sanity_settings(s, p)
     pools = s.get("pools") or {}
     if not isinstance(pools, dict) or not all(isinstance(v, dict) for v in pools.values()):
         raise ConfigError(f'"pools" in {p} must look like {{"ES": {{"young_min_months": 2}}}}')
@@ -124,11 +137,27 @@ def build_live_forecast(snap: Snapshot, settings: dict | None = None) -> LiveFor
                         int(len(wide) - table["asin"].nunique()), ratio)
 
 
+def sanity_verdict(f: LiveForecast, s: dict) -> tuple[str, str | None]:
+    """('ok' | 'warn' | 'block', message). The forecast total is compared with the recent pace of the same ASINs.
+    Inside sanity_ratio_min..max: ok. Outside it: with sanity_action "block" the run is refused (the original
+    behaviour); with "warn" it loads with a warning, unless the ratio is also outside the hard limits, or is not a
+    number, or the forecast is empty. Those almost always mean missing data or a bug, so they still refuse."""
+    if f.table.empty:
+        return "block", "the forecast is empty"
+    r, lo, hi = f.sanity_ratio, s["sanity_ratio_min"], s["sanity_ratio_max"]
+    if np.isfinite(r) and lo <= r <= hi:
+        return "ok", None
+    usual = f"forecast total is {r:.2f}x the last 12 months' pace (allowed {lo} to {hi})"
+    if not np.isfinite(r) or s.get("sanity_action", "block") != "warn":
+        return "block", usual
+    hlo, hhi = s["sanity_hard_min"], s["sanity_hard_max"]
+    if not (hlo <= r <= hhi):
+        return "block", f"forecast total is {r:.2f}x the last 12 months' pace (hard limits {hlo} to {hhi})"
+    return "warn", (f"Forecast is {r:.2f}x the last 12 months' pace of the same products "
+                    f"(usual range {lo} to {hi}). It was loaded; please review it.")
+
+
 def sanity_check(f: LiveForecast, s: dict) -> str | None:
     """Return a reason not to load the forecast, or None. Guards an unattended run against nonsense."""
-    if f.table.empty:
-        return "the forecast is empty"
-    if not np.isfinite(f.sanity_ratio) or not (s["sanity_ratio_min"] <= f.sanity_ratio <= s["sanity_ratio_max"]):
-        return (f"forecast total is {f.sanity_ratio:.2f}x the last 12 months' pace "
-                f"(allowed {s['sanity_ratio_min']} to {s['sanity_ratio_max']})")
-    return None
+    verdict, message = sanity_verdict(f, s)
+    return message if verdict == "block" else None

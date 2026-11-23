@@ -416,6 +416,7 @@ DECISION_COLUMNS = ["asin", "status", "reason_code", "confidence", "basis", "hab
 ASIN_STATUSES = ("FORECAST", "SHORT_HISTORY", "NO_SALES", "AMAZON_FORECAST_ONLY", "INVENTORY_ONLY")
 CONFIDENCE_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 SUMMARY_SETTINGS = ("target", "horizon", "min_history", "young_min_months", "sanity_ratio_min", "sanity_ratio_max",
+                    "sanity_action", "sanity_hard_min", "sanity_hard_max",
                     "amazon_weight", "percentile_shrink", "min_order_share", "demand_method", "adjustments_file")
 
 
