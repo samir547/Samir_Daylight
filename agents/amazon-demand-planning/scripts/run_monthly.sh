@@ -9,7 +9,8 @@
 # Exit code: 0 loaded (or already done this month); 1 failed after the retry, or another pool held the lock;
 # 2 could not run: a configuration error such as an unsupported POOL, a missing SETTINGS file, an unknown method,
 # a bad adjustments file, missing credentials or no virtual environment (never retried: fix it first);
-# 3 data not ready yet; 4 sanity check refused to load.
+# 3 data not ready yet; 4 sanity check refused to load (with the replenish settings only outside the hard limits;
+# a ratio between the usual range and the hard limits loads with a warning, exit 0).
 # Pools: US, UK, DE, ES, FR, IT (one marketplace each; the list lives in order_forecast/pull.py).
 # Manual run:   POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh
 # Dry run (no database write): NO_LOAD=1 POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh

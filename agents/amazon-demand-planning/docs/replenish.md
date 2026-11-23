@@ -95,6 +95,17 @@ the old "last 12 months scaled to the horizon"). It must be between `sanity_rati
 markets with many young products towards the floor, and the skipped ASINs' share of sales are logged for
 information only.
 
+What happens outside the usual range depends on `sanity_action` in the settings file:
+
+| `sanity_action` | Ratio inside 0.5 to 1.6 | Outside it, but inside `sanity_hard_min` to `sanity_hard_max` (0.25 to 5) | Outside the hard limits, not a number, or an empty forecast |
+|---|---|---|---|
+| `block` (the shared default; the seasonal runs) | loads | refused, exit 4 | refused, exit 4 |
+| `warn` (`forecast_settings.replenish.json`) | loads, `sanity_status` = `ok` | **loads** with `SANITY WARNING:` in the log; `sanity_status` = `warn` and the text in `sanity_warning` | refused, exit 4 (almost always missing data or a bug) |
+
+`--force` still overrides a refusal; the run is then stored with `sanity_status` = `forced`. The status and text
+are stored on the run summary (needs `sql/007`) and shown to Power BI users by
+`dbo.vw_amazon_order_forecast_run_status` (column `review_flag`). See `docs/powerbi-review-flags.md`.
+
 ## Client knowledge (adjustments)
 Facts the data cannot show (promotions, launches, confirmed orders...) go in `config/order_adjustments.csv`
 (copy `config/order_adjustments.example.csv`; the real file is git-ignored because it holds business

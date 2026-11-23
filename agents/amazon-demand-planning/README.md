@@ -88,3 +88,5 @@ Defaults: horizon 6, at least 24 months of training, non-overlapping windows
 - Amazon's own forecast has one version only, so it cannot be back-tested yet.
 - `sql/005` and `sql/006` (explanation columns, ASIN status, run summary, view) are applied by hand;
   until then the loader stores the forecast without them and logs a WARNING.
+- `sql/007` (sanity warning on the run summary, and the run-status and ASIN-status views for Power BI) is also
+  applied by hand; until then the loader logs a WARNING when a run carries a sanity warning.
