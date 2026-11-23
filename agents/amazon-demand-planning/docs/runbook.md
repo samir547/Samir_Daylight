@@ -22,7 +22,9 @@ It never changes sales, inventory, invoices or the SKU map: it only reads them.
    `sql/006_view_explanations.sql` (the explanation columns, the ASIN status and run summary tables, and the
    view with the new columns). Until they are applied the forecast still loads and the log says
    `WARNING: not stored for this run: ...`. Once 006 is applied, `init-db` skips `sql/002` so it cannot
-   remove the new view columns.
+   remove the new view columns. Then apply `sql/007_sanity_warning_and_views.sql` the same way: it stores the
+   sanity warning with each run and adds the two Power BI views. Without it the forecast still loads and the log
+   says `the sanity warning is not stored`.
 5. Test everything except the database write:
    `NO_LOAD=1 POOL=DE SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh`
    then read `logs/monthly_DE_<yyyymm>.log`.
@@ -56,7 +58,7 @@ the monthly data was not loaded in time: check the ingest) and run it by hand:
 | 1 | Failed twice (database or network), or another market held the lock | Read the log, fix, re-run by hand |
 | 2 | Could not run: a configuration error (unsupported `POOL`, `SETTINGS` file missing, unknown method, bad or unreadable adjustments file, malformed `pools`), missing `DB_*` credentials, or no `.venv`. Never retried. A wrong password is exit 1 | Read the `CANNOT RUN:` line, fix, re-run |
 | 3 | Last closed month is not in the database yet | Nothing: it tries again tomorrow. If it persists, check the amazon-sp-api-ingest job |
-| 4 | Sanity check refused to load (forecast far from the recent pace of the same ASINs) | Read the `Explain:` lines first. Only then override by hand with `.venv/bin/python -m order_forecast run-cycle --pool DE --settings config/forecast_settings.replenish.json --force` |
+| 4 | Sanity check refused to load. With the replenish settings this means the forecast is outside the **hard** limits (below 0.25 or above 5 times the recent pace, or not a number): almost always missing data or a bug. A ratio between the usual range and the hard limits loads with a `SANITY WARNING:` line (exit 0) and is flagged `Review` in Power BI | Read the `Explain:` lines first. Only then override by hand with `.venv/bin/python -m order_forecast run-cycle --pool DE --settings config/forecast_settings.replenish.json --force` |
 
 To re-run a month that already loaded:
 `FORCE_RERUN=1 POOL=<POOL> SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh`. A re-run replaces that month's
@@ -82,7 +84,7 @@ Single ASINs in a single month are indicative only (Amazon orders in lumps).
 ## The `replenish` method (scheduled for every market)
 It replays Amazon's stock, open orders and its own weekly forecast to predict when and how much Amazon will
 order; `run-cycle` pulls Amazon's forecast into the snapshot itself. Needs `sql/004` (`init-db` applies it);
-`sql/005`/`006` add the explanations. Client notes go in `config/order_adjustments.csv`. Details:
+`sql/005`/`006` add the explanations; `sql/007` the sanity warning and two Power BI views. Client notes go in `config/order_adjustments.csv`. Details:
 `docs/replenish.md`.
 
 ## The EU markets

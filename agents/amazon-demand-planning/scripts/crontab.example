@@ -19,3 +19,7 @@
 0 13 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=ES SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
 0 14 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=FR SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
 0 15 6-12 * * cd /home/agentuser/Samir_Daylight/agents/amazon-demand-planning && mkdir -p logs && POOL=IT SETTINGS=config/forecast_settings.replenish.json ./scripts/run_monthly.sh >> logs/cron.log 2>&1
+#
+# A forecast outside the usual range (0.5 to 1.6 times the recent pace) is loaded with a SANITY WARNING in the
+# log and flagged "Review" in Power BI (forecast_settings.replenish.json: "sanity_action": "warn"). It is refused
+# (exit 4, nothing loaded) only outside 0.25 to 5 times the pace, or when the ratio is not a number.

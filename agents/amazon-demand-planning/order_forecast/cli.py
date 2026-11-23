@@ -278,7 +278,7 @@ def _print_explanation(f, settings: dict) -> None:
 
 
 def _forecast_and_maybe_load(a) -> int:
-    from .live import build_live_forecast, data_is_current, load_settings, sanity_check, settings_for_pool
+    from .live import build_live_forecast, data_is_current, load_settings, sanity_verdict, settings_for_pool
     from .snapshot import load_snapshot
     settings = load_settings(a.settings)
     try:
@@ -311,10 +311,19 @@ def _forecast_and_maybe_load(a) -> int:
                   f"P80/P90 uplift when Amazon is missing: {f.extras['scenario_ratios'][0]:.2f}/{f.extras['scenario_ratios'][1]:.2f}; "
                   f"open orders received next month: {f.extras['po_share']:.0%}")
         _print_explanation(f, settings)
-        reason = sanity_check(f, settings)
-        if reason and not getattr(a, "force", False):
+        verdict, reason = sanity_verdict(f, settings)
+        forced = verdict == "block" and getattr(a, "force", False)
+        if verdict == "block" and not forced:
             print(f"SANITY CHECK FAILED: {reason}. Nothing was written. Use --force only after checking the data.")
             return EXIT_SANITY
+        status = "forced" if forced else verdict         # ok | warn | forced: stored with the run (sql/007)
+        if status == "warn":
+            print(f"SANITY WARNING: {reason}")
+        elif forced:
+            print(f"SANITY CHECK OVERRIDDEN with --force: {reason}")
+        if "summary" in f.extras:
+            f.extras["summary"]["sanity_status"] = status
+            f.extras["summary"]["sanity_warning"] = reason
         out = _write_live_csv(f, snap.pool, getattr(a, "out", str(ROOT / "results" / "live")) if a.cmd == "forecast"
                               else str(ROOT / "results" / "live"), snapshot_ref=snap_dir.name)
         print(f"Forecast CSV: {out}")
