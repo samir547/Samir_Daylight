@@ -39,6 +39,9 @@ class ClaudeSettings:
         )
 
 
+SHAREPOINT_AUTH_MODES = ("user", "managed_identity")
+
+
 @dataclass
 class SharePointSettings:
     """SharePoint source for the review exports. When configured (and sync
@@ -50,10 +53,36 @@ class SharePointSettings:
     password: Optional[str] = None
     client_id: str = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # MS Graph PowerShell public client
     tenant: str = "organizations"
+    # How the pipeline proves who it is to SharePoint:
+    #   "user"             -- signs in as a person (saved sign-in, password,
+    #                         then device code). The original behaviour, and
+    #                         the right choice on a person's own computer.
+    #   "managed_identity" -- an Azure managed identity attached to the VM
+    #                         (no password, no sign-in prompt). Only works on
+    #                         that Azure VM; anywhere else it stops at once
+    #                         with a clear message.
+    auth: str = "user"
+    # SharePoint site (e.g. https://tenant.sharepoint.com/sites/NAME) and the
+    # folder in its default document library that holds the review exports.
+    # When site_url is set the files are read from there; when it is not, the
+    # sharing link in share_url is used, as before.
+    site_url: Optional[str] = None
+    root_folder: str = "Reviews"
+    # Client ID of a USER-assigned managed identity (not needed for a
+    # system-assigned one).
+    managed_identity_client_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.auth not in SHAREPOINT_AUTH_MODES:
+            raise ValueError(
+                f"SP_AUTH must be one of {', '.join(SHAREPOINT_AUTH_MODES)}; "
+                f"got {self.auth!r}")
 
     @property
     def configured(self) -> bool:
-        return bool(self.share_url and self.username and self.password)
+        if self.auth == "managed_identity":
+            return bool(self.site_url)
+        return bool((self.share_url or self.site_url) and self.username and self.password)
 
     @classmethod
     def from_env(cls) -> "SharePointSettings":
@@ -63,6 +92,10 @@ class SharePointSettings:
             password=os.getenv("SP_PASSWORD"),
             client_id=os.getenv("SP_CLIENT_ID", cls.client_id),
             tenant=os.getenv("SP_TENANT_ID", cls.tenant),
+            auth=(os.getenv("SP_AUTH") or cls.auth).strip().lower(),
+            site_url=os.getenv("SP_SITE_URL") or None,
+            root_folder=(os.getenv("SP_ROOT_FOLDER") or cls.root_folder).strip().strip("/"),
+            managed_identity_client_id=os.getenv("SP_MI_CLIENT_ID") or None,
         )
 
 
@@ -325,6 +358,10 @@ _FLAT_ALIASES = {
     "sp_password": ("sharepoint", "password"),
     "sp_client_id": ("sharepoint", "client_id"),
     "sp_tenant": ("sharepoint", "tenant"),
+    "sp_auth": ("sharepoint", "auth"),
+    "sp_site_url": ("sharepoint", "site_url"),
+    "sp_root_folder": ("sharepoint", "root_folder"),
+    "sp_mi_client_id": ("sharepoint", "managed_identity_client_id"),
     "db_server": ("db", "server"),
     "db_name": ("db", "name"),
     "db_user": ("db", "user"),

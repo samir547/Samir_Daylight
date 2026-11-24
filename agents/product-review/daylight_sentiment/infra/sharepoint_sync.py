@@ -20,16 +20,24 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from daylight_sentiment.config import FilePattern
 
 logger = logging.getLogger("multi_source_sentiment")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# Where an Azure VM asks for a managed identity's token. Only reachable from
+# inside Azure; the short connect timeout makes a run anywhere else fail in
+# seconds instead of hanging.
+IMDS_TOKEN_URL = "http://169.254.169.254/metadata/identity/oauth2/token"
+IMDS_API_VERSION = "2018-02-01"
+IMDS_CONNECT_TIMEOUT_SECONDS = 3
 
 # Kept next to the module that uses it -- process-external (a file next to
 # the repo) so a completed device-code sign-in survives across runs via its
@@ -46,6 +54,13 @@ class SharePointSignInRequiredError(RuntimeError):
     """The saved sign-in is missing or expired and the session is not
     interactive (e.g. cron), so a device-code sign-in could never be
     completed. Raised instead of starting the device flow and waiting for it."""
+
+
+class ManagedIdentityUnavailableError(SharePointSignInRequiredError):
+    """SP_AUTH=managed_identity, but this machine could not get a token from
+    an Azure managed identity (it is not the Azure VM, or the identity is not
+    attached to it). Subclasses SharePointSignInRequiredError so the run exits
+    with the same code 2 as a missing sign-in, before anything is analysed."""
 
 
 def _stdin_is_interactive() -> bool:
@@ -171,7 +186,10 @@ class SharePointSync:
 
     def __init__(self, share_url: str, username: str, password: Optional[str],
                 client_id: str, tenant: str = "organizations",
-                interactive: Optional[bool] = None):
+                interactive: Optional[bool] = None, *,
+                auth: str = "user", site_url: Optional[str] = None,
+                root_folder: str = "Reviews",
+                managed_identity_client_id: Optional[str] = None):
         self.share_url = share_url
         self.username = username
         self.password = password
@@ -180,6 +198,12 @@ class SharePointSync:
         # None = decide from stdin when a sign-in is actually needed.
         self.interactive = interactive
         self._token: Optional[str] = None
+        self._token_expires_at = 0.0  # managed-identity tokens only
+        self.auth = auth
+        self.site_url = site_url
+        self.root_folder = root_folder.strip("/")
+        self.managed_identity_client_id = managed_identity_client_id
+        self._root_item: Optional[Dict[str, Any]] = None  # site mode, resolved once
 
     def _is_interactive(self) -> bool:
         if self.interactive is not None:
@@ -192,7 +216,41 @@ class SharePointSync:
             self.client_id, authority=f"https://login.microsoftonline.com/{self.tenant}",
             token_cache=cache)
 
+    def _get_managed_identity_token(self) -> str:
+        """A Microsoft Graph token for the VM's managed identity. No password,
+        no sign-in prompt, nothing saved on disk. Refreshed shortly before it
+        expires, so a long run keeps working."""
+        if self._token and time.time() < self._token_expires_at - 300:
+            return self._token
+        import requests
+        params = {"api-version": IMDS_API_VERSION,
+                  "resource": "https://graph.microsoft.com/"}
+        if self.managed_identity_client_id:
+            params["client_id"] = self.managed_identity_client_id
+        try:
+            resp = requests.get(IMDS_TOKEN_URL, params=params,
+                                headers={"Metadata": "true"},
+                                timeout=(IMDS_CONNECT_TIMEOUT_SECONDS, 10))
+        except requests.RequestException as exc:
+            raise ManagedIdentityUnavailableError(
+                "SP_AUTH=managed_identity, but this machine can't reach the Azure "
+                "managed identity service. That only works on the Azure VM the "
+                "identity is attached to. On any other machine set SP_AUTH=user "
+                "(or leave it unset) in .env, or run with --skip-sharepoint-sync "
+                "and put the review files in Reviews/ yourself.") from exc
+        if resp.status_code != 200:
+            raise ManagedIdentityUnavailableError(
+                f"The Azure managed identity service refused to give a token "
+                f"(HTTP {resp.status_code}). Check that the identity is attached to "
+                f"this VM and that SP_MI_CLIENT_ID is the identity's client ID.")
+        body = resp.json()
+        self._token = body["access_token"]
+        self._token_expires_at = float(body.get("expires_on") or time.time() + 3000)
+        return self._token
+
     def _get_token(self) -> str:
+        if self.auth == "managed_identity":
+            return self._get_managed_identity_token()
         if self._token:
             return self._token
         import msal
@@ -266,7 +324,31 @@ class SharePointSync:
         resp.raise_for_status()
         return resp
 
+    def _resolve_site_root(self) -> Dict[str, Any]:
+        """The review root folder in the SharePoint site's default document
+        library, addressed by site URL + folder path instead of a sharing
+        link. Same shape as the sharing-link root (id, parentReference.driveId),
+        so everything built on _resolve_root() works unchanged. Read-only;
+        resolved once per run."""
+        if self._root_item is None:
+            parsed = urlparse(self.site_url)
+            site = self._get(f"{GRAPH_BASE}/sites/{parsed.netloc}:{parsed.path.rstrip('/')}").json()
+            encoded = quote(self.root_folder, safe="/")
+            root = self._get(f"{GRAPH_BASE}/sites/{site['id']}/drive/root:/{encoded}").json()
+            if "parentReference" not in root or "driveId" not in root["parentReference"]:
+                raise RuntimeError(
+                    f"SharePoint did not return the drive for folder {self.root_folder!r} "
+                    f"in {self.site_url}")
+            self._root_item = root
+        return self._root_item
+
     def _list_items(self) -> List[Dict[str, Any]]:
+        if self.site_url:
+            root = self._resolve_site_root()
+            drive_id = root["parentReference"]["driveId"]
+            return self._get(
+                f"{GRAPH_BASE}/drives/{drive_id}/items/{root['id']}/children"
+            ).json().get("value", [])
         share_id = self._encode_share_url(self.share_url)
         root = self._get(f"{GRAPH_BASE}/shares/{share_id}/driveItem").json()
         if "folder" in root:
@@ -277,6 +359,8 @@ class SharePointSync:
         return [root]  # the share link points straight at one file
 
     def _resolve_root(self) -> Dict[str, Any]:
+        if self.site_url:
+            return self._resolve_site_root()
         share_id = self._encode_share_url(self.share_url)
         return self._get(f"{GRAPH_BASE}/shares/{share_id}/driveItem").json()
 
