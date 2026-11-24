@@ -469,3 +469,149 @@ class TestTokenCachePermissions:
         sharepoint_sync._write_private(path, "new")
         assert path.read_text(encoding="utf-8") == "new"
         assert path.stat().st_mode & 0o777 == 0o600
+
+
+class TestManagedIdentityToken:
+    """SP_AUTH=managed_identity: the token comes from the Azure VM's identity
+    service. Offline -- requests.get is replaced, no network is touched."""
+
+    def _syncer(self, **kw):
+        return SharePointSync(None, None, None, "client", auth="managed_identity",
+                              site_url="https://x.sharepoint.com/sites/SITE", **kw)
+
+    def test_requests_a_graph_token_for_the_user_assigned_identity(self, monkeypatch):
+        seen = {}
+
+        def fake_get(url, params=None, headers=None, timeout=None, **kw):
+            seen.update(url=url, params=params, headers=headers)
+            return _Resp({"access_token": "MI-TOKEN", "expires_on": "9999999999"})
+
+        monkeypatch.setattr("requests.get", fake_get)
+        s = self._syncer(managed_identity_client_id="CID")
+
+        assert s._get_token() == "MI-TOKEN"
+        assert seen["url"] == sharepoint_sync.IMDS_TOKEN_URL
+        assert seen["headers"] == {"Metadata": "true"}
+        assert seen["params"]["client_id"] == "CID"
+        assert seen["params"]["resource"] == "https://graph.microsoft.com/"
+
+    def test_never_uses_msal_or_the_token_cache(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(SharePointSync, "TOKEN_CACHE_PATH", tmp_path / ".sp_token_cache.json")
+        monkeypatch.setattr(
+            "requests.get", lambda *a, **k: _Resp({"access_token": "T", "expires_on": "9999999999"}))
+        monkeypatch.setitem(sys.modules, "msal", None)  # an import would now fail
+        assert self._syncer()._get_token() == "T"
+        assert not (tmp_path / ".sp_token_cache.json").exists()
+
+    def test_token_is_reused_until_close_to_expiry(self, monkeypatch):
+        calls = []
+
+        def fake_get(*a, **k):
+            calls.append(1)
+            return _Resp({"access_token": f"T{len(calls)}", "expires_on": "9999999999"})
+
+        monkeypatch.setattr("requests.get", fake_get)
+        s = self._syncer()
+        assert s._get_token() == s._get_token() == "T1"
+        assert len(calls) == 1
+
+        s._token_expires_at = 0  # about to expire
+        assert s._get_token() == "T2"
+
+    def test_machine_without_the_identity_fails_fast_and_clearly(self, monkeypatch):
+        import requests
+
+        def fake_get(*a, **k):
+            raise requests.ConnectTimeout("no route to 169.254.169.254")
+
+        monkeypatch.setattr("requests.get", fake_get)
+        with pytest.raises(sharepoint_sync.ManagedIdentityUnavailableError) as exc:
+            self._syncer()._get_token()
+        text = str(exc.value)
+        assert "SP_AUTH=user" in text and "--skip-sharepoint-sync" in text
+
+    def test_unavailable_error_exits_like_a_missing_sign_in(self):
+        # cli.main catches SharePointSignInRequiredError and returns 2, so the
+        # subclass takes the same path: nothing analysed, loaded or moved.
+        assert issubclass(sharepoint_sync.ManagedIdentityUnavailableError,
+                          SharePointSignInRequiredError)
+
+    def test_refused_token_request_is_reported_without_echoing_the_body(self, monkeypatch):
+        monkeypatch.setattr("requests.get", lambda *a, **k: _Resp({"error": "secret"}, 400))
+        with pytest.raises(sharepoint_sync.ManagedIdentityUnavailableError) as exc:
+            self._syncer()._get_token()
+        assert "HTTP 400" in str(exc.value) and "secret" not in str(exc.value)
+
+
+class TestSiteRoot:
+    """With SP_SITE_URL the review root is the site's folder (no sharing
+    link); everything built on _resolve_root keeps working."""
+
+    SITE = {"id": "host,siteguid,webguid"}
+    ROOT = {"id": "ROOTFOLDER", "folder": {}, "parentReference": {"driveId": "DRIVE"}}
+
+    def _syncer(self, monkeypatch, calls):
+        s = SharePointSync(None, None, None, "client", auth="managed_identity",
+                           site_url="https://x.sharepoint.com/sites/SITE/", root_folder="/Reviews/")
+        monkeypatch.setattr(s, "_get_token", lambda: "TOKEN")
+
+        def fake_get(url, headers=None, timeout=None, **kw):
+            calls.append(url)
+            assert "/shares/" not in url  # never the sharing link in site mode
+            if url == f"{GRAPH_BASE}/sites/x.sharepoint.com:/sites/SITE":
+                return _Resp(self.SITE)
+            if url == f"{GRAPH_BASE}/sites/host,siteguid,webguid/drive/root:/Reviews":
+                return _Resp(self.ROOT)
+            if url.endswith(":/children"):
+                return _Resp({"value": [{"name": "a.xlsx"}]})
+            return _Resp({"id": "SUB", "name": "Processed", "folder": {}})
+
+        monkeypatch.setattr("requests.get", fake_get)
+        return s
+
+    def test_resolves_site_then_folder_once(self, monkeypatch):
+        calls = []
+        s = self._syncer(monkeypatch, calls)
+        assert s._resolve_root()["id"] == "ROOTFOLDER"
+        assert s._resolve_root()["id"] == "ROOTFOLDER"
+        assert len(calls) == 2  # site + folder, then cached
+
+    def test_subfolders_are_addressed_under_that_root(self, monkeypatch):
+        calls = []
+        s = self._syncer(monkeypatch, calls)
+        items = s._list_items_in("TrustPilot/Service/In Progress")
+        assert items == [{"name": "a.xlsx"}]
+        assert calls[-1] == (f"{GRAPH_BASE}/drives/DRIVE/items/ROOTFOLDER:"
+                             "/TrustPilot/Service/In%20Progress:/children")
+        folder = s._resolve_subfolder("Amazon/Processed")
+        assert folder["parentReference"]["driveId"] == "DRIVE"
+
+
+class TestSharePointSettingsAuth:
+    def test_default_is_the_original_user_sign_in(self):
+        from daylight_sentiment.config import SharePointSettings
+        s = SharePointSettings(share_url="u", username="a@b", password="p")
+        assert s.auth == "user" and s.configured
+        assert not SharePointSettings(share_url="u", username="a@b").configured
+
+    def test_managed_identity_needs_only_the_site(self):
+        from daylight_sentiment.config import SharePointSettings
+        assert SharePointSettings(auth="managed_identity",
+                                  site_url="https://x.sharepoint.com/sites/S").configured
+        assert not SharePointSettings(auth="managed_identity").configured
+
+    def test_unknown_auth_mode_is_rejected(self):
+        from daylight_sentiment.config import SharePointSettings
+        with pytest.raises(ValueError, match="SP_AUTH"):
+            SharePointSettings(auth="magic")
+
+    def test_from_env_reads_the_new_settings(self, monkeypatch):
+        from daylight_sentiment.config import SharePointSettings
+        monkeypatch.setenv("SP_AUTH", " Managed_Identity ")
+        monkeypatch.setenv("SP_SITE_URL", "https://x.sharepoint.com/sites/S")
+        monkeypatch.setenv("SP_ROOT_FOLDER", "/Reviews/")
+        monkeypatch.setenv("SP_MI_CLIENT_ID", "CID")
+        s = SharePointSettings.from_env()
+        assert (s.auth, s.root_folder, s.managed_identity_client_id) == (
+            "managed_identity", "Reviews", "CID")
+        assert s.configured

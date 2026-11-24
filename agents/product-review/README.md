@@ -629,6 +629,31 @@ file. The next scheduled run then signs in silently. To process the files
 straight away instead of waiting, run the pipeline once by hand
 (`python -m daylight_sentiment.cli`).
 
+### 7.5a Signing in with the VM's managed identity (no sign-in prompt)
+
+On the Azure VM the pipeline can use the VM's managed identity instead of a
+person's account, so there is nothing to renew and no sign-in to complete. In
+the VM's `.env`:
+
+```
+SP_AUTH=managed_identity
+SP_SITE_URL=https://<tenant>.sharepoint.com/sites/<site>
+SP_ROOT_FOLDER=Reviews
+SP_MI_CLIENT_ID=<client ID of the user-assigned identity>
+```
+
+`SP_SHARE_URL`, `SP_USERNAME` and `SP_PASSWORD` are not needed in this mode.
+The files are read from `Reviews/Amazon`, `Reviews/TrustPilot/Product` and
+`Reviews/TrustPilot/Service` (the same `In Progress` and `Processed` folders).
+The identity needs the Microsoft Graph `Sites.Selected` role and `write`
+access to that one site.
+
+**On any other machine** (for example a laptop) the managed identity does not
+exist, so a run with `SP_AUTH=managed_identity` stops within a few seconds,
+exit code `2`, with a message saying so. There, leave `SP_AUTH` unset (the
+person sign-in above) or run with `--skip-sharepoint-sync` and put the review
+files in `Reviews/` yourself.
+
 ### 7.6 Action items for the business
 
 After a run that analysed and loaded new reviews, the pipeline writes the

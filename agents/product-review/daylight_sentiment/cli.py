@@ -209,8 +209,10 @@ def configure_logging() -> None:
 
 
 def _build_syncer(config: Config) -> SharePointSync:
-    return SharePointSync(config.sp_share_url, config.sp_username, config.sp_password,
-                          config.sp_client_id, config.sp_tenant)
+    sp = config.sharepoint
+    return SharePointSync(sp.share_url, sp.username, sp.password, sp.client_id, sp.tenant,
+                          auth=sp.auth, site_url=sp.site_url, root_folder=sp.root_folder,
+                          managed_identity_client_id=sp.managed_identity_client_id)
 
 
 def sharepoint_source_specs(config: Config) -> List[SourceSpec]:
@@ -252,9 +254,14 @@ def sync_sharepoint(config: Config, skip: bool) -> Optional[Dict[str, SourceSync
         logger.info("--skip-sharepoint-sync set; using local Reviews/ files as-is")
         return None
     if not config.sharepoint.configured:
-        logger.info("SP_SHARE_URL/SP_USERNAME/SP_PASSWORD not set; using local Reviews/ files as-is")
+        logger.info("SharePoint is not configured (see SP_* in .env); using local Reviews/ "
+                    "files as-is")
         return None
-    logger.info("Syncing review files from SharePoint (%s)", config.sp_username)
+    if config.sharepoint.auth == "managed_identity":
+        logger.info("Syncing review files from SharePoint (%s, Azure managed identity)",
+                    config.sharepoint.site_url)
+    else:
+        logger.info("Syncing review files from SharePoint (%s)", config.sp_username)
     results = _build_syncer(config).sync_from_subfolders(
         config.sources.reviews_dir, sharepoint_source_specs(config))
     synced = sorted(k for k, r in results.items() if r.synced)
