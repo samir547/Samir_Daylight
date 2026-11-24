@@ -1,6 +1,7 @@
 """ReviewSource protocol + shared source plumbing (ISSUE-01/02)."""
 from __future__ import annotations
 
+import codecs
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
@@ -38,6 +39,39 @@ def resolve_source_file(pattern: FilePattern, directory: Path) -> Path:
         f"No file in {directory} matches {pattern.describe()}")
 
 
+def _read_csv(path: Path, dtype: Dict[str, Any]) -> pd.DataFrame:
+    """Read a CSV export whatever program saved it. Plain UTF-8 (with or
+    without Excel's byte-order mark) is the normal case. Two other ways of
+    saving a "CSV" are also accepted, because the person uploading it can't
+    be expected to know the difference:
+
+    * UTF-16 / UTF-32 ("Unicode Text" from Excel, some exports): recognised by
+      its byte-order mark; the separator (comma, tab, semicolon) is detected.
+    * Excel's plain "CSV (Comma delimited)" on Windows, which is Windows-1252
+      and not valid UTF-8: read as cp1252, with a warning.
+    """
+    head = path.read_bytes()[:4]
+    if head.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    else:
+        encoding = None
+    if encoding:
+        logger.warning("%s is saved as %s, not UTF-8; reading it as %s. Saving it "
+                       "as 'CSV UTF-8' avoids this.", path.name, encoding.upper(), encoding)
+        return pd.read_csv(path, dtype=dtype, encoding=encoding, sep=None, engine="python")
+    try:
+        # utf-8-sig: a byte-order mark (Excel's "CSV UTF-8") would otherwise
+        # become part of the first column name.
+        return pd.read_csv(path, dtype=dtype, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        logger.warning("%s is not valid UTF-8 (probably Excel's plain 'CSV' format); "
+                       "reading it as Windows-1252. Saving it as 'CSV UTF-8' avoids this.",
+                       path.name)
+        return pd.read_csv(path, dtype=dtype, encoding="cp1252")
+
+
 class MissingColumnsError(ValueError):
     """A review export lacks columns its loader reads. Raised instead of
     loading the rows with those fields silently empty."""
@@ -62,9 +96,7 @@ def read_table(path: Path, required: Sequence[str] = (),
     if suffix == ".xlsx":
         df = pd.read_excel(path, dtype=dtype)
     elif suffix == ".csv":
-        # utf-8-sig: a byte-order mark (Excel's "CSV UTF-8") would otherwise
-        # become part of the first column name.
-        df = pd.read_csv(path, dtype=dtype, encoding="utf-8-sig")
+        df = _read_csv(path, dtype)
     else:
         raise ValueError(f"{path}: unsupported review file type {path.suffix!r} "
                          f"(expected .xlsx or .csv)")

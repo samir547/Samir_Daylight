@@ -521,3 +521,43 @@ class TestLoadReviews:
         sources = build_default_sources(_sources_config(tmp_path))
         assert [s.name for s in sources] == [
             "trustpilot_product", "trustpilot_service", "amazon_brightdata"]
+
+
+class TestCsvEncodings:
+    """A "CSV" can be saved as UTF-16 or Windows-1252 by Excel and others."""
+
+    ROWS = "a,b\nCafé,1\nnaïve,2\n"
+    EXPECTED = [{"a": "Café", "b": 1}, {"a": "naïve", "b": 2}]
+
+    def test_utf8_with_and_without_bom(self, tmp_path):
+        for enc in ("utf-8", "utf-8-sig"):
+            p = tmp_path / f"{enc}.csv"
+            p.write_text(self.ROWS, encoding=enc)
+            assert read_table(p).to_dict("records") == self.EXPECTED
+
+    def test_utf16_comma_separated(self, tmp_path):
+        p = tmp_path / "u16.csv"
+        p.write_text(self.ROWS, encoding="utf-16")  # writes the byte-order mark
+        assert p.read_bytes()[:2] in (b"\xff\xfe", b"\xfe\xff")
+        assert read_table(p).to_dict("records") == self.EXPECTED
+
+    def test_utf16_tab_separated_unicode_text(self, tmp_path):
+        p = tmp_path / "u16tab.csv"
+        p.write_text(self.ROWS.replace(",", "\t"), encoding="utf-16")
+        assert read_table(p).to_dict("records") == self.EXPECTED
+
+    def test_utf16_review_text_with_commas_quotes_and_line_breaks(self, tmp_path):
+        p = tmp_path / "u16q.csv"
+        p.write_text('a,b\n"Great, really ""good""\nsecond line",1\n', encoding="utf-16")
+        assert read_table(p).to_dict("records") == [
+            {"a": 'Great, really "good"\nsecond line', "b": 1}]
+
+    def test_windows_1252_plain_excel_csv(self, tmp_path):
+        p = tmp_path / "cp1252.csv"
+        p.write_bytes(self.ROWS.encode("cp1252"))
+        assert read_table(p).to_dict("records") == self.EXPECTED
+
+    def test_text_columns_still_keep_leading_zeros_in_utf16(self, tmp_path):
+        p = tmp_path / "ids.csv"
+        p.write_text("id,b\n00123,1\n", encoding="utf-16")
+        assert read_table(p, text_columns=["id"]).to_dict("records") == [{"id": "00123", "b": 1}]
